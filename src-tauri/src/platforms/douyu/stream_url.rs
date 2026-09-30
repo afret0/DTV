@@ -207,7 +207,7 @@ impl DouYu {
         sign_data: &str,
     ) -> Result<DouyuPlayInfo, Box<dyn std::error::Error>> {
         let payload = format!(
-            "{}&cdn=&rate=-1&ver=Douyu_223061205&iar=1&ive=1&hevc=0&fa=0",
+            "{}&cdn=&rate=-1&ver=22011191&iar=1&ive=1&hevc=0&fa=0",
             sign_data
         );
         let url = format!("https://www.douyu.com/lapi/live/getH5Play/{}", room_id);

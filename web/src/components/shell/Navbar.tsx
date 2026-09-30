@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import ReactDOM from "react-dom";
 import { AnimatePresence, m } from "framer-motion";
 import { ChevronDown, ExternalLink, LayoutGrid, MonitorSmartphone, Moon, Search, Sun, ThumbsUp, X } from "lucide-react";
 import { usePathname } from "next/navigation";
@@ -809,7 +810,27 @@ export function Navbar({
         ) : null}
       </AnimatePresence>
 
-      <LanSyncModal open={lanSyncOpen} onClose={() => setLanSyncOpen(false)} appVersion={localVersion} />
+      <LanSyncModalPortal open={lanSyncOpen} onClose={() => setLanSyncOpen(false)} appVersion={localVersion} />
     </nav>
+  );
+}
+
+function LanSyncModalPortal({ open, ...props }: { open: boolean; onClose: () => void; appVersion?: string }) {
+  const [mounted, setMounted] = useState(false);
+
+  useEffect(() => {
+    if (open) {
+      setMounted(true);
+    } else {
+      const timer = setTimeout(() => setMounted(false), 300);
+      return () => clearTimeout(timer);
+    }
+  }, [open]);
+
+  if (!mounted) return null;
+
+  return ReactDOM.createPortal(
+    <LanSyncModal open={open} {...props} />,
+    document.body
   );
 }

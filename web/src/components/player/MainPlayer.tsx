@@ -224,6 +224,9 @@ export function MainPlayer({
   const qualityPluginRef = useRef<any>(null);
   const linePluginRef = useRef<any>(null);
   const hevcBrandPatchedRef = useRef(false);
+  const reconnectAttemptRef = useRef(0);
+  const MAX_AUTO_RECONNECT = 5;
+  const autoReconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const [isLoadingStream, setIsLoadingStream] = useState(false);
   const [streamError, setStreamError] = useState<string | null>(null);
@@ -580,6 +583,12 @@ export function MainPlayer({
   }, [follow, platform, roomId]);
 
   const destroyPlayer = useCallback(() => {
+    if (autoReconnectTimerRef.current) {
+      clearTimeout(autoReconnectTimerRef.current);
+      autoReconnectTimerRef.current = null;
+    }
+    reconnectAttemptRef.current = 0;
+
     try {
       unlistenRef.current?.();
     } catch {
@@ -923,6 +932,49 @@ export function MainPlayer({
         // ignore
       }
 
+      try {
+        player.on?.("error", () => {
+          if (!isSessionActive(sessionId)) return;
+          if (reconnectAttemptRef.current >= MAX_AUTO_RECONNECT) return;
+          reconnectAttemptRef.current++;
+          console.log(`[Player] Stream error detected, auto-reconnecting (attempt ${reconnectAttemptRef.current}/${MAX_AUTO_RECONNECT})`);
+          if (autoReconnectTimerRef.current) {
+            clearTimeout(autoReconnectTimerRef.current);
+          }
+          autoReconnectTimerRef.current = setTimeout(() => {
+            void reloadStreamRef.current?.("refresh");
+          }, 2000);
+        });
+
+        let waitingTimer: ReturnType<typeof setTimeout> | null = null;
+        player.on?.("waiting", () => {
+          if (!isSessionActive(sessionId)) return;
+          if (reconnectAttemptRef.current >= MAX_AUTO_RECONNECT) return;
+          if (waitingTimer) return;
+          waitingTimer = setTimeout(() => {
+            if (!isSessionActive(sessionId)) return;
+            if (reconnectAttemptRef.current >= MAX_AUTO_RECONNECT) return;
+            reconnectAttemptRef.current++;
+            console.log(`[Player] Stream stalled (waiting too long), auto-reconnecting (attempt ${reconnectAttemptRef.current}/${MAX_AUTO_RECONNECT})`);
+            void reloadStreamRef.current?.("refresh");
+          }, 15000);
+        });
+        player.on?.("playing", () => {
+          if (waitingTimer) {
+            clearTimeout(waitingTimer);
+            waitingTimer = null;
+          }
+        });
+        player.on?.("pause", () => {
+          if (waitingTimer) {
+            clearTimeout(waitingTimer);
+            waitingTimer = null;
+          }
+        });
+      } catch {
+        // ignore
+      }
+
       refreshPluginRef.current = player.registerPlugin?.(RefreshControl, {
         position: POSITIONS.CONTROLS_LEFT,
         index: 2,
@@ -1024,6 +1076,8 @@ export function MainPlayer({
       reloadInFlightRef.current = true;
       const sessionId = ++sessionSeqRef.current;
       activeSessionIdRef.current = sessionId;
+
+      let loadFailed = false;
 
       setIsLoadingStream(true);
       setStreamError(null);
@@ -1200,6 +1254,7 @@ export function MainPlayer({
         }
       } catch (e: any) {
         if (!isSessionActive(sessionId)) return;
+        loadFailed = true;
         // When the target room fails to load (e.g. offline), keep UI consistent by clearing any previous playback surface.
         destroyPlayer();
         const msg = e?.message ? String(e.message) : String(e);
@@ -1216,6 +1271,9 @@ export function MainPlayer({
         pendingReloadRef.current = null;
         if (pending) {
           void reloadStream(pending.trigger, pending.overrides);
+        }
+        if (isSessionActive(sessionId) && !loadFailed) {
+          reconnectAttemptRef.current = 0;
         }
       }
     },
