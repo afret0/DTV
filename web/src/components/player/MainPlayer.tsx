@@ -30,9 +30,9 @@ import { Platform } from "@/platforms/common/types";
 
 import { getDouyuStreamConfig, stopDouyuProxy } from "@/platforms/douyu/playerHelper";
 import { stopHuyaProxy } from "@/platforms/huya/playerHelper";
-import { fetchAndPrepareDouyinStreamConfig } from "@/platforms/douyin/playerHelper";
+import { fetchAndPrepareDouyinStreamConfig, stopDouyinProxy } from "@/platforms/douyin/playerHelper";
 import { getHuyaStreamConfig } from "@/platforms/huya/playerHelper";
-import { getBilibiliStreamConfig } from "@/platforms/bilibili/playerHelper";
+import { getBilibiliStreamConfig, stopBilibiliProxy } from "@/platforms/bilibili/playerHelper";
 import { useDlnaDiscovery } from "@/hooks/useDlnaDiscovery";
 import { CastDialog } from "@/components/player/CastDialog";
 import { useImageProxy } from "@/hooks/useImageProxy";
@@ -650,17 +650,10 @@ export function MainPlayer({
   }, []);
 
   const stopAllProxies = useCallback(async () => {
-    // Only one room at a time; stop both to avoid "switch platform" leaks.
-    try {
-      await stopDouyuProxy();
-    } catch {
-      // ignore
-    }
-    try {
-      await stopHuyaProxy();
-    } catch {
-      // ignore
-    }
+    try { await stopDouyuProxy(); } catch {}
+    try { await stopHuyaProxy(); } catch {}
+    try { await stopDouyinProxy(); } catch {}
+    try { await stopBilibiliProxy(); } catch {}
   }, []);
 
   const startDanmaku = useCallback(

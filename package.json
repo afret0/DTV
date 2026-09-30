@@ -1,7 +1,7 @@
 {
   "name": "dtv",
   "private": true,
-  "version": "3.1.7",
+  "version": "3.1.26",
   "type": "module",
   "scripts": {
     "dev": "pnpm -C web dev",

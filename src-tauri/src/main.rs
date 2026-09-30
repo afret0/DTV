@@ -37,6 +37,12 @@ use platforms::huya::{fetch_huya_live_list, start_huya_danmaku_listener};
 #[derive(Default, Clone)]
 pub struct StreamUrlStore {
     pub url: Arc<Mutex<String>>,
+    pub platform: Arc<Mutex<Option<String>>>,
+    pub room_id: Arc<Mutex<Option<String>>>,
+    pub quality: Arc<Mutex<Option<String>>>,
+    pub line: Arc<Mutex<Option<String>>>,
+    pub huya_follow_http: Arc<Mutex<Option<crate::platforms::common::FollowHttpClient>>>,
+    pub generation: Arc<std::sync::atomic::AtomicU64>,
 }
 
 // State for managing Douyu danmaku listener handles (stop signals)
@@ -79,14 +85,25 @@ async fn get_stream_url_with_quality_cmd(
 
 // Legacy Huya stream URL command removed in favor of unified command
 
-// This is the command that should be used for setting stream URL if it interacts with StreamUrlStore
+// This command sets the stream URL and optionally records the source so the
+// proxy can refresh expired signed URLs (Douyu) when the CDN drops the stream.
 #[tauri::command]
 async fn set_stream_url_cmd(
     url: String,
+    platform: Option<String>,
+    room_id: Option<String>,
+    quality: Option<String>,
+    line: Option<String>,
     state: tauri::State<'_, StreamUrlStore>,
 ) -> Result<(), String> {
-    let mut current_url = state.url.lock().unwrap();
-    *current_url = url;
+    eprintln!("[store] set_stream_url_cmd url={} platform={:?}", url, platform);
+    *state.url.lock().unwrap() = url;
+    state.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    crate::proxy::reset_pump_header();
+    *state.platform.lock().unwrap() = platform;
+    *state.room_id.lock().unwrap() = room_id;
+    *state.quality.lock().unwrap() = quality;
+    *state.line.lock().unwrap() = line;
     Ok(())
 }
 
@@ -218,12 +235,16 @@ fn main() {
                 Ok(())
             })
             .manage(client) // Manage the reqwest client
-            .manage(follow_http_client) // 专用关注刷新客户端，避免占用默认连接池
+            .manage(follow_http_client.clone()) // 专用关注刷新客户端，避免占用默认连接池
             .manage(DouyuDanmakuHandles::default()) // Manage new DouyuDanmakuHandles
             .manage(DouyinDanmakuState::default()) // Manage DouyinDanmakuState
             .manage(HuyaDanmakuState::default()) // Manage HuyaDanmakuState
             .manage(platforms::common::BilibiliDanmakuState::default()) // Manage BilibiliDanmakuState
-            .manage(StreamUrlStore::default())
+            .manage({
+                let s = StreamUrlStore::default();
+                *s.huya_follow_http.lock().unwrap() = Some(follow_http_client);
+                s
+            })
             .manage(proxy::ProxyServerHandle::default())
             .manage(platforms::bilibili::state::BilibiliState::default())
             .manage(lan_sync::LanSyncServerState::default())

@@ -33,15 +33,10 @@ pub async fn get_douyin_live_stream_url(
     .await
 }
 
-#[command]
-pub async fn get_douyin_live_stream_url_with_quality(
-    _app_handle: AppHandle,
-    _stream_url_store: State<'_, StreamUrlStore>,
-    _proxy_server_handle: State<'_, ProxyServerHandle>,
-    payload: GetStreamUrlPayload,
+pub async fn fetch_douyin_stream_core(
+    requested_id: String,
     quality: String,
 ) -> Result<CommonLiveStreamInfo, String> {
-    let requested_id = payload.args.room_id_str.trim().to_string();
     if requested_id.is_empty() {
         return Ok(CommonLiveStreamInfo {
             title: None,
@@ -145,6 +140,18 @@ pub async fn get_douyin_live_stream_url_with_quality(
         web_rid: Some(web_rid),
     })
 }
+
+#[command]
+pub async fn get_douyin_live_stream_url_with_quality(
+    _app_handle: AppHandle,
+    _stream_url_store: State<'_, StreamUrlStore>,
+    _proxy_server_handle: State<'_, ProxyServerHandle>,
+    payload: GetStreamUrlPayload,
+    quality: String,
+) -> Result<CommonLiveStreamInfo, String> {
+    fetch_douyin_stream_core(payload.args.room_id_str.trim().to_string(), quality).await
+}
+
 
 fn normalize_quality_tag(input: &str) -> &str {
     match input.trim().to_uppercase().as_str() {

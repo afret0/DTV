@@ -39,7 +39,7 @@ export async function getHuyaStreamConfig(
         // 对齐 pure_live：虎牙播放需要稳定的 UA/Referer/Origin；WebView 无法给 FLV 请求加自定义 Header，走本地 proxy 注入。
         let finalStreamUrl = sanitizedUpstream;
         try {
-          await invoke('set_stream_url_cmd', { url: sanitizedUpstream });
+          await invoke('set_stream_url_cmd', { url: sanitizedUpstream, platform: 'huya', roomId: roomId, quality: quality, line: line ?? null });
           const proxyUrl = await invoke<string>('start_proxy');
           if (proxyUrl) {
             finalStreamUrl = proxyUrl;

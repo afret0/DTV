@@ -125,17 +125,36 @@ export async function fetchAndPrepareDouyinStreamConfig(roomId: string, quality:
         streamType = 'flv';
       }
 
-      return {
-        streamUrl: sanitizedStreamUrl,
-        streamType,
-        title: result.title,
-        anchorName: result.anchor_name,
-        avatar: result.avatar,
-        isLive: true,
-        normalizedRoomId: result.normalized_room_id ?? null,
-        webRid: result.web_rid ?? null,
-        initialError: null,
-      };
+      try {
+        // Proxy is started for TV casting only; local playback uses the
+        // direct CDN URL (known-good behavior).
+        await setupStreamProxy(sanitizedStreamUrl);
+
+        return {
+          streamUrl: sanitizedStreamUrl,
+          streamType,
+          title: result.title,
+          anchorName: result.anchor_name,
+          avatar: result.avatar,
+          isLive: true,
+          normalizedRoomId: result.normalized_room_id ?? null,
+          webRid: result.web_rid ?? null,
+          initialError: null,
+        };
+      } catch (proxyErr) {
+        console.warn(`[DouyinPlayerHelper] Proxy setup failed, using direct URL:`, proxyErr);
+        return {
+          streamUrl: sanitizedStreamUrl,
+          streamType,
+          title: result.title,
+          anchorName: result.anchor_name,
+          avatar: result.avatar,
+          isLive: true,
+          normalizedRoomId: result.normalized_room_id ?? null,
+          webRid: result.web_rid ?? null,
+          initialError: null,
+        };
+      }
     } catch (e: any) {
       console.error(`[DouyinPlayerHelper] Exception while fetching Douyin stream details for ${roomId} (attempt ${attempt}/${MAX_ATTEMPTS}):`, e);
       if (attempt >= MAX_ATTEMPTS) {
@@ -248,14 +267,26 @@ export async function stopDouyinDanmaku(currentUnlistenFn: (() => void) | null):
 }
 
 function enforceHttps(url: string): string {
-  if (!url) {
-    return url;
-  }
-  if (url.startsWith('https://')) {
-    return url;
-  }
-  if (url.startsWith('http://')) {
-    return `https://${url.slice('http://'.length)}`;
-  }
+  if (!url) { return url; }
+  if (url.startsWith('https://')) { return url; }
+  if (url.startsWith('http://')) { return `https://${url.slice('http://'.length)}`; }
   return url;
+}
+
+let douyinProxyActive = false;
+
+async function setupStreamProxy(rawUrl: string): Promise<string> {
+  try {
+    await invoke('set_stream_url_cmd', { url: rawUrl });
+    const proxyUrl = await invoke<string>('start_proxy');
+    douyinProxyActive = true;
+    return proxyUrl;
+  } catch {
+    return rawUrl;
+  }
+}
+
+export async function stopDouyinProxy(): Promise<void> {
+  if (!douyinProxyActive) return;
+  try { await invoke('stop_proxy'); douyinProxyActive = false; } catch {}
 }

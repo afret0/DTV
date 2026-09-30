@@ -3,19 +3,21 @@ use serde_json::Value;
 use tauri::{command, AppHandle, State};
 
 use crate::platforms::common::types::StreamVariant;
-use crate::proxy::{start_proxy, ProxyServerHandle};
+use crate::proxy::ProxyServerHandle;
 use crate::StreamUrlStore;
 
-#[command]
-pub async fn get_bilibili_live_stream_url_with_quality(
-    app_handle: AppHandle,
-    stream_url_store: State<'_, StreamUrlStore>,
-    proxy_server_handle: State<'_, ProxyServerHandle>,
-    payload: crate::platforms::common::GetStreamUrlPayload,
+#[derive(Clone)]
+pub struct BiliProxyCtx {
+    pub store: crate::StreamUrlStore,
+    pub proxy_handle: std::sync::Arc<std::sync::Mutex<Option<crate::proxy::ServerHandleForStore>>>,
+}
+
+pub async fn fetch_bilibili_stream_core(
+    room_id: String,
     quality: String,
     cookie: Option<String>,
+    proxy_ctx: Option<BiliProxyCtx>,
 ) -> Result<crate::platforms::common::LiveStreamInfo, String> {
-    let room_id = payload.args.room_id_str.clone();
     if room_id.trim().is_empty() {
         return Ok(crate::platforms::common::LiveStreamInfo {
             title: None,
@@ -491,18 +493,21 @@ pub async fn get_bilibili_live_stream_url_with_quality(
     match selected_stream {
         SelectedStream::Flv(real_url) => {
             // FLV：写入到 Store 并启动代理
-            let proxied_url = {
-                {
-                    let mut current_url_in_store = stream_url_store.url.lock().unwrap();
-                    *current_url_in_store = real_url.clone();
-                }
-                match start_proxy(app_handle, proxy_server_handle, stream_url_store).await {
-                    Ok(proxy) => Some(proxy),
-                    Err(e) => {
-                        eprintln!("[Bilibili] Failed to start proxy: {}", e);
-                        None
+            let proxied_url = match proxy_ctx {
+                Some(ref ctx) => {
+                    *ctx.store.url.lock().unwrap() = real_url.clone();
+                    *ctx.store.platform.lock().unwrap() = Some("bilibili".into());
+                    *ctx.store.room_id.lock().unwrap() = Some(room_id.clone());
+                    *ctx.store.quality.lock().unwrap() = Some(quality.clone());
+                    match crate::proxy::start_proxy_inner(ctx.proxy_handle.clone(), ctx.store.clone()).await {
+                        Ok(proxy) => Some(proxy),
+                        Err(e) => {
+                            eprintln!("[Bilibili] Failed to start proxy: {}", e);
+                            None
+                        }
                     }
                 }
+                None => None,
             };
 
             let final_error_message = if proxied_url.is_none() {
@@ -526,16 +531,13 @@ pub async fn get_bilibili_live_stream_url_with_quality(
         }
         SelectedStream::Hls(real_url) => {
             // HLS：无需本地代理，若存在旧的 FLV 代理则关闭并清空存储
-            {
-                let handle_to_stop = { proxy_server_handle.0.lock().unwrap().take() };
+            if let Some(ref ctx) = proxy_ctx {
+                let handle_to_stop = { ctx.proxy_handle.lock().unwrap().take() };
                 if let Some(handle) = handle_to_stop {
                     handle.stop(false).await;
                     eprintln!("[Bilibili] Stopped existing FLV proxy before using HLS stream");
                 }
-            }
-            {
-                let mut current_url_in_store = stream_url_store.url.lock().unwrap();
-                *current_url_in_store = String::new();
+                *ctx.store.url.lock().unwrap() = String::new();
             }
 
             Ok(crate::platforms::common::LiveStreamInfo {
@@ -553,3 +555,26 @@ pub async fn get_bilibili_live_stream_url_with_quality(
         }
     }
 }
+
+#[command]
+pub async fn get_bilibili_live_stream_url_with_quality(
+    app_handle: AppHandle,
+    stream_url_store: State<'_, StreamUrlStore>,
+    proxy_server_handle: State<'_, ProxyServerHandle>,
+    payload: crate::platforms::common::GetStreamUrlPayload,
+    quality: String,
+    cookie: Option<String>,
+) -> Result<crate::platforms::common::LiveStreamInfo, String> {
+    let _ = &app_handle;
+    fetch_bilibili_stream_core(
+        payload.args.room_id_str.clone(),
+        quality,
+        cookie,
+        Some(BiliProxyCtx {
+            store: stream_url_store.inner().clone(),
+            proxy_handle: proxy_server_handle.0.clone(),
+        }),
+    )
+    .await
+}
+

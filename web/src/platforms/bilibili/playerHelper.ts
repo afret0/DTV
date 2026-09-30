@@ -135,6 +135,14 @@ export async function getBilibiliStreamConfig(
     streamType = 'flv';
   }
 
+  // The Rust command already stores the real upstream URL, starts the local
+  // proxy and returns the proxy URL for FLV (Referer is injected server-side).
+  // Writing the returned proxy URL back into the store would make the proxy
+  // pump connect to itself, so we must not touch the store here.
+  if (streamUrl.startsWith('http://127.0.0.1') || streamUrl.includes('/live.flv')) {
+    biliProxyActive = true;
+  }
+
   return { streamUrl, streamType };
 }
 
@@ -214,4 +222,11 @@ export async function stopBilibiliDanmaku(currentUnlistenFn: (() => void) | null
   try {
     await invoke('stop_bilibili_danmaku_listener');
   } catch {}
+}
+
+let biliProxyActive = false;
+
+export async function stopBilibiliProxy(): Promise<void> {
+  if (!biliProxyActive) return;
+  try { await invoke('stop_proxy'); biliProxyActive = false; } catch {}
 }

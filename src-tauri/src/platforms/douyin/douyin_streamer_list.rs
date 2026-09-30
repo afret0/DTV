@@ -91,14 +91,15 @@ pub struct DouyinLiveListResponse {
 }
 
 #[tauri::command]
-pub async fn fetch_douyin_partition_rooms(
-    _http_client: State<'_, reqwest::Client>,
+pub async fn fetch_douyin_partition_rooms_core(
     partition: String,
     partition_type: String,
-    offset: i32, // This is the offset for the current request (0, 15, 30...)
+    offset: i32,
     ms_token: String,
 ) -> Result<DouyinLiveListResponse, String> {
-    let count: i32 = 15; // Number of items requested per page, explicitly typed as i32
+    let _ = (&partition, &partition_type);
+    let count: i32 = 15;
+ // Number of items requested per page, explicitly typed as i32
 
     // 抖音接口在国内可以直接访问，使用直连方式，避免代理问题
     // 使用 new_direct_connection() 绕过系统代理设置
@@ -243,3 +244,15 @@ pub async fn fetch_douyin_partition_rooms(
         Err(e) => Err(format!("网络错误，无法获取抖音房间列表：{}", e)),
     }
 }
+
+#[tauri::command]
+pub async fn fetch_douyin_partition_rooms(
+    _http_client: State<'_, reqwest::Client>,
+    partition: String,
+    partition_type: String,
+    offset: i32,
+    ms_token: String,
+) -> Result<DouyinLiveListResponse, String> {
+    fetch_douyin_partition_rooms_core(partition, partition_type, offset, ms_token).await
+}
+

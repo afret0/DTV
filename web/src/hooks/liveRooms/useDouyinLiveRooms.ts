@@ -22,10 +22,15 @@ export function useDouyinLiveRooms(partitionId: string | null, partitionTypeId: 
       msTokenRef.current = token;
       return token;
     } catch (e) {
-      console.error("[useDouyinLiveRooms] Failed to fetch msToken:", e);
-      setError("Failed to initialize session token.");
-      msTokenRef.current = null;
-      return null;
+      console.error("[useDouyinLiveRooms] Failed to fetch msToken from backend, using local fallback:", e);
+      // msToken is just a random alphanumeric string; generate locally as fallback
+      const charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+      let token = "";
+      for (let i = 0; i < 107; i++) {
+        token += charset.charAt(Math.floor(Math.random() * charset.length));
+      }
+      msTokenRef.current = token;
+      return token;
     }
   }, []);
 

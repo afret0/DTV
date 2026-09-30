@@ -1037,3 +1037,48 @@ pub async fn get_huya_unified_cmd(
 }
 #[allow(dead_code)]
 const HEARTBEAT_BASE64: &str = "ABQdAAwsNgBM"; // same as Python
+
+/// Re-fetch a fresh signed FLV URL for the proxy pump (same pipeline as
+/// get_huya_unified_cmd, minus the response envelope).
+pub async fn fetch_huya_flv_url(
+    follow_http: &crate::platforms::common::FollowHttpClient,
+    room_id: &str,
+    quality: Option<&str>,
+    line: Option<&str>,
+) -> Result<String, String> {
+    let client = &follow_http.0.inner;
+    let profile = fetch_profile_room(client, room_id).await.map_err(|e| e.to_string())?;
+    let candidates = extract_stream_candidates(&profile)?;
+    if candidates.is_empty() {
+        return Err("huya: no candidates".to_string());
+    }
+    let available = extract_available_bitrates(&profile);
+    let hd = available.last().copied().unwrap_or(4000);
+    let sd = available.first().copied().unwrap_or(2000);
+    let ratio = match quality.map(|s| s.trim()).unwrap_or("") {
+        q if q.contains("标清") => Some(sd),
+        q if q.contains("高清") => Some(hd),
+        q if q.contains("原画") => None,
+        _ => resolve_ratio(quality),
+    };
+    let preferred_line = normalize_huya_line(line);
+    let selected_index = pick_stream_url(&candidates, ratio, preferred_line.as_deref())
+        .map(|(_, idx)| idx)
+        .ok_or_else(|| "huya: pick failed".to_string())?;
+    let candidate = candidates
+        .get(selected_index)
+        .ok_or_else(|| "huya: candidate missing".to_string())?;
+    let token = huya_get_cdn_token_info_ex(client, &candidate.flv_url, &candidate.stream_name)
+        .await?;
+    let anti = build_huya_anti_code(&candidate.stream_name, candidate.presenter_uid, &token)?;
+    let base_url = enforce_https(&format!(
+        "{}/{}.flv?{}&codec=264",
+        candidate.flv_url.trim_end_matches('/'),
+        candidate.stream_name,
+        anti
+    ));
+    Ok(match ratio {
+        Some(r) => format!("{}&ratio={}", base_url, r),
+        None => base_url,
+    })
+}

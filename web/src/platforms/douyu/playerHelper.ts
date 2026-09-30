@@ -57,7 +57,13 @@ export async function getDouyuStreamConfig(
   }
 
   try {
-    await invoke('set_stream_url_cmd', { url: finalStreamUrl });
+    await invoke('set_stream_url_cmd', {
+      url: finalStreamUrl,
+      platform: 'douyu',
+      roomId: roomId,
+      quality: quality,
+      line: line ?? null,
+    });
     const proxyUrl = await invoke<string>('start_proxy');
     douyuProxyActive = true;
     return { streamUrl: proxyUrl, streamType };

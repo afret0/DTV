@@ -1,6 +1,6 @@
 [package]
 name = "dtv"
-version = "3.1.7"
+version = "3.1.26"
 description = "A Tauri App"
 authors = ["c-zeong"]
 edition = "2021"
@@ -29,6 +29,7 @@ window-vibrancy = "0.7.1"
  deno_core = "0.288.0"
  regex = "1.10.4"
  tokio = { version = "1.37.0", features = ["full"] }
+ tokio-stream = { version = "0.1", features = ["sync"] }
  tokio-tungstenite = { version = "0.20", features = ["rustls-tls-webpki-roots"] }
  url = "2.4"
  rand = "0.8"
