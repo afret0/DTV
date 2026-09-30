@@ -11,7 +11,9 @@ use tokio::sync::oneshot;
 use tauri::Manager;
 use tauri_plugin_opener::OpenerExt;
 mod logging;
+mod cast;
 mod config_transfer;
+mod dlna;
 mod lan_sync;
 mod sync_transfer;
 mod platforms;
@@ -190,17 +192,18 @@ fn main() {
         .expect("Failed to create reqwest client");
     let follow_http_client = FollowHttpClient::new().expect("Failed to create follow http client");
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
             .plugin(tauri_plugin_os::init())
-            .plugin(tauri_plugin_opener::init())
-            .plugin(tauri_plugin_window_state::Builder::default()
+            .plugin(tauri_plugin_opener::init());
+            #[cfg(not(target_os = "android"))]
+            let builder = builder.plugin(tauri_plugin_window_state::Builder::default()
                 .with_state_flags(
                     tauri_plugin_window_state::StateFlags::SIZE
                         | tauri_plugin_window_state::StateFlags::POSITION
                         | tauri_plugin_window_state::StateFlags::MAXIMIZED
                 )
-                .build())
-            .setup(|_app| {
+                .build());
+            builder.setup(|_app| {
                 // Apply macOS vibrancy to the main window when running on macOS
                 #[cfg(target_os = "macos")]
                 {
@@ -252,6 +255,9 @@ fn main() {
                 proxy::start_proxy,
                 proxy::stop_proxy,
                 proxy::start_static_proxy_server,
+                cast::get_cast_info,
+                dlna::discover_dlna_devices,
+                dlna::push_to_dlna,
                 fetch_categories,
                 fetch_live_list,
                 fetch_live_list_for_cate3,

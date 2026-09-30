@@ -716,3 +716,48 @@ export class LineControl extends Plugin {
     root.style.display = options.length === 0 ? 'none' : '';
   }
 }
+
+export class CastControl extends Plugin {
+  static override pluginName = 'castControl';
+  static override defaultConfig = {
+    position: POSITIONS.CONTROLS_RIGHT,
+    index: 6,
+    disable: false,
+    onClick: null as (() => void) | null,
+  };
+
+  private handleClick: ((event: Event) => void) | null = null;
+
+  override afterCreate() {
+    if (this.config.disable) {
+      return;
+    }
+    this.handleClick = (event: Event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (typeof this.config.onClick === 'function') {
+        this.config.onClick();
+      }
+    };
+    this.bind(['click', 'touchend'], this.handleClick);
+  }
+
+  override destroy() {
+    if (this.handleClick) {
+      this.unbind(['click', 'touchend'], this.handleClick);
+      this.handleClick = null;
+    }
+  }
+
+  override render() {
+    if (this.config.disable) {
+      return '';
+    }
+    return `<xg-icon class="xgplayer-cast-control" title="投屏">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18">
+        <rect x="2" y="7" width="20" height="15" rx="2" ry="2"/>
+        <polyline points="17 2 12 7 7 2"/>
+      </svg>
+    </xg-icon>`;
+  }
+}

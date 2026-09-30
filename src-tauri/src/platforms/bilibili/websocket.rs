@@ -1,9 +1,9 @@
 // src/websocket.rs
-use native_tls::TlsStream;
+use rustls::pki_types::ServerName;
 use serde_json::Value;
 use std::collections::VecDeque;
 use std::net::TcpStream;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tungstenite::{client, Message, WebSocket};
 use url::Url;
@@ -30,7 +30,7 @@ macro_rules! ws_debug {
 }
 
 pub struct BiliLiveClient {
-    ws: WebSocket<TlsStream<TcpStream>>,
+    ws: WebSocket<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>,
     auth_msg: String,
     // Keep server host list for reconnection
     host_list: Value,
@@ -315,14 +315,23 @@ fn find_server(vd: Vec<DanmuServer>) -> (String, String, String) {
     )
 }
 
-pub fn connect(v: Value) -> WebSocket<TlsStream<TcpStream>> {
+pub fn connect(v: Value) -> WebSocket<rustls::StreamOwned<rustls::ClientConnection, TcpStream>> {
     let danmu_server = gen_damu_list(&v);
     let (host, url, ws_url) = find_server(danmu_server);
     ws_debug!("[websocket] connecting tcp {} and ws {}", url, ws_url);
-    let connector: native_tls::TlsConnector = native_tls::TlsConnector::new().unwrap();
-    let stream: TcpStream = TcpStream::connect(url).unwrap();
-    let stream: native_tls::TlsStream<TcpStream> =
-        connector.connect(host.as_str(), stream).unwrap();
+
+    let root_store = rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    let server_name: ServerName<'static> = ServerName::try_from(host.clone())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid hostname"))
+        .unwrap();
+    let conn = rustls::ClientConnection::new(Arc::new(config), server_name).unwrap();
+    let stream = TcpStream::connect(url).unwrap();
+    let stream = rustls::StreamOwned::new(conn, stream);
     let (socket, _resp) =
         client(Url::parse(ws_url.as_str()).unwrap(), stream).expect("Can't connect");
     ws_debug!("[websocket] websocket handshake complete");

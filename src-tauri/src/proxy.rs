@@ -256,7 +256,7 @@ pub async fn start_proxy(
             .route("/image", web::get().to(image_proxy_handler))
     })
     .keep_alive(Duration::from_secs(120))
-    .bind(("127.0.0.1", port))
+    .bind(("0.0.0.0", port))
     {
         Ok(srv) => srv,
         Err(e) => {

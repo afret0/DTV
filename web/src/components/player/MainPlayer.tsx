@@ -27,11 +27,13 @@ import {
 } from "@/components/player/constants";
 import { arrangeControlClusters } from "@/components/player/controlLayout";
 import { Platform } from "@/platforms/common/types";
+
 import { getDouyuStreamConfig, stopDouyuProxy } from "@/platforms/douyu/playerHelper";
 import { stopHuyaProxy } from "@/platforms/huya/playerHelper";
 import { fetchAndPrepareDouyinStreamConfig } from "@/platforms/douyin/playerHelper";
 import { getHuyaStreamConfig } from "@/platforms/huya/playerHelper";
 import { getBilibiliStreamConfig } from "@/platforms/bilibili/playerHelper";
+import { CastDialog } from "@/components/player/CastDialog";
 import { useImageProxy } from "@/hooks/useImageProxy";
 import { useFollow, type FollowedStreamer, type Platform as FollowPlatform } from "@/state/follow/FollowProvider";
 import { usePlayerUi } from "@/state/playerUi/PlayerUiProvider";
@@ -239,6 +241,8 @@ export function MainPlayer({
   const [playerIsLive, setPlayerIsLive] = useState<boolean | null>(null);
   const [isWindows, setIsWindows] = useState(false);
   const [isMaximized, setIsMaximized] = useState(false);
+  const [castOpen, setCastOpen] = useState(false);
+  const [cachedDlnaDevices, setCachedDlnaDevices] = useState<any[] | null>(null);
 
   const lineOptions: LineOption[] = useMemo(() => lineOptionsByPlatform[platform] ?? [], [platform]);
   const [currentQuality, setCurrentQuality] = useState<string>(() =>
@@ -791,7 +795,7 @@ export function MainPlayer({
       const FlvPlugin: any = (flvMod as any).default ?? flvMod;
       const HlsPlugin: any = (hlsMod as any).default ?? hlsMod;
       const { applyDanmuOverlayPreferences, createDanmuOverlay, syncDanmuEnabledState } = overlayMod as any;
-      const { DanmuKeywordBlockControl, DanmuSettingsControl, DanmuToggleControl, LineControl, QualityControl, RefreshControl, VolumeControl } =
+      const { DanmuKeywordBlockControl, DanmuSettingsControl, DanmuToggleControl, LineControl, QualityControl, RefreshControl, VolumeControl, CastControl } =
         pluginsMod as any;
 
       const playerOptions: any = {
@@ -1047,6 +1051,12 @@ export function MainPlayer({
         }
       });
 
+      player.registerPlugin?.(CastControl, {
+        position: POSITIONS.CONTROLS_RIGHT,
+        index: 6,
+        onClick: () => setCastOpen(true)
+      });
+
       arrangeControlClusters(player);
 
       // danmu overlay
@@ -1274,6 +1284,12 @@ export function MainPlayer({
         }
         if (isSessionActive(sessionId) && !loadFailed) {
           reconnectAttemptRef.current = 0;
+          // Pre-discover DLNA devices in background
+          invoke<any[]>("discover_dlna_devices").then(devices => {
+            if (isSessionActive(sessionId)) {
+              setCachedDlnaDevices(devices);
+            }
+          }).catch(() => {});
         }
       }
     },
@@ -1530,6 +1546,7 @@ export function MainPlayer({
           </div>
         </div>
       </div>
+      <CastDialog open={castOpen} onClose={() => setCastOpen(false)} platform={platform} roomId={roomId} onCastSuccess={() => { playerRef.current?.pause?.(); setCastOpen(false); }} cachedDevices={cachedDlnaDevices} />
     </div>
   );
 }

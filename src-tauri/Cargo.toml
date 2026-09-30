@@ -1,6 +1,6 @@
 [package]
 name = "dtv"
-version = "3.0.3"
+version = "3.1.6"
 description = "A Tauri App"
 authors = ["c-zeong"]
 edition = "2021"
@@ -29,16 +29,14 @@ window-vibrancy = "0.7.1"
  deno_core = "0.288.0"
  regex = "1.10.4"
  tokio = { version = "1.37.0", features = ["full"] }
- tokio-tungstenite = { version = "0.20", features = ["native-tls"] }
+ tokio-tungstenite = { version = "0.20", features = ["rustls-tls-webpki-roots"] }
  url = "2.4"
- openssl-sys = { version = "0.9", features = ["vendored"] }
- native-tls = "0.2"
  rand = "0.8"
  futures-util = "0.3"
  urlencoding = "2.1.0"
  percent-encoding = "2.1"
  serde_urlencoded = "0.7"
- reqwest = { version = "0.11", features = ["json", "stream", "cookies", "brotli", "gzip", "blocking"] }
+ reqwest = { version = "0.11", default-features = false, features = ["json", "stream", "cookies", "brotli", "gzip", "blocking", "rustls-tls"] }
  actix-web = "4"
  actix-cors = "0.7"
  awc = { version = "3.4.0", features = ["tls-rustls-0_22"] }
@@ -65,13 +63,17 @@ anyhow = "1.0"
  
  specta = { version = "2.0.0-rc.9", features = ["serde", "derive", "function"] }
  tauri-plugin-os = "2.3.0"
- tungstenite = { version = "0.21", features = ["native-tls"] }
+ tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
+ rustls = "0.23"
+ webpki-roots = "0.26"
  brotlic = "0.8"
  cookie = "0.18"
  html-escape = "0.2"
+ local-ip-address = "0.6"
+ mdns-sd = "0.13"
+
+[target.'cfg(not(any(target_os = "android")))'.dependencies]
 rfd = "0.15"
-local-ip-address = "0.6"
-mdns-sd = "0.13"
 
 [profile.release]
 panic = "unwind"

@@ -13,12 +13,13 @@ pub fn run() {
     std::panic::set_hook(Box::new(|info| {
         eprintln!("[panic] {}", info);
     }));
-    tauri::Builder::default()
-        .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_window_state::Builder::default()
+    let builder = tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init());
+        #[cfg(not(target_os = "android"))]
+        let builder = builder.plugin(tauri_plugin_window_state::Builder::default()
             .with_state_flags(tauri_plugin_window_state::StateFlags::SIZE)
-            .build())
-        .invoke_handler(tauri::generate_handler![greet])
+            .build());
+        builder.invoke_handler(tauri::generate_handler![greet])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

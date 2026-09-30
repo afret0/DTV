@@ -2431,3 +2431,23 @@ video.xgplayer-video {
 :root[data-theme="light"] .streamer-info-offline {
   border-bottom: 1px solid var(--border-color-light, #e0e0e0);
 }
+
+/* Cast control button */
+.xgplayer-cast-control {
+  cursor: pointer;
+  opacity: 0.85;
+  transition: opacity 0.18s ease, color 0.18s ease;
+}
+.xgplayer-cast-control:hover {
+  opacity: 1;
+  color: var(--player-accent, #6c8cff);
+}
+
+/* Spin animation for loading states */
+@keyframes dtv-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+.spin {
+  animation: dtv-spin 1s linear infinite;
+}
