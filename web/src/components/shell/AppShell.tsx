@@ -12,6 +12,7 @@ import { useTheme } from "@/state/theme/ThemeProvider";
 import { usePlayerUi } from "@/state/playerUi/PlayerUiProvider";
 import { useCustomCategories } from "@/state/customCategories/CustomCategoriesProvider";
 import { PlayerOverlayHost, PlayerOverlayProvider, usePlayerOverlay } from "@/state/playerOverlay/PlayerOverlayProvider";
+import { useDlnaDiscovery } from "@/hooks/useDlnaDiscovery";
 
 type UiPlatform = "douyu" | "douyin" | "huya" | "bilibili" | "custom";
 
@@ -58,6 +59,7 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
   const [optimisticPlatform, setOptimisticPlatform] = useState<UiPlatform>(activePlatform);
 
   const playerActive = isPlayerPath(normalizedPathname) || playerOverlay.isOpen;
+  useDlnaDiscovery(); // Start DLNA device discovery on app launch
   const shouldHidePlayerChrome = playerActive && isPlayerFullscreen;
   const playerRoute = isPlayerPath(normalizedPathname);
   // 避免 `/huya` vs `/huya/` 这种规范化抖动导致的重复挂载/重复请求

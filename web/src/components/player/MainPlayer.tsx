@@ -33,6 +33,7 @@ import { stopHuyaProxy } from "@/platforms/huya/playerHelper";
 import { fetchAndPrepareDouyinStreamConfig } from "@/platforms/douyin/playerHelper";
 import { getHuyaStreamConfig } from "@/platforms/huya/playerHelper";
 import { getBilibiliStreamConfig } from "@/platforms/bilibili/playerHelper";
+import { useDlnaDiscovery } from "@/hooks/useDlnaDiscovery";
 import { CastDialog } from "@/components/player/CastDialog";
 import { useImageProxy } from "@/hooks/useImageProxy";
 import { useFollow, type FollowedStreamer, type Platform as FollowPlatform } from "@/state/follow/FollowProvider";
@@ -242,8 +243,6 @@ export function MainPlayer({
   const [isWindows, setIsWindows] = useState(false);
   const [isMaximized, setIsMaximized] = useState(false);
   const [castOpen, setCastOpen] = useState(false);
-  const [cachedDlnaDevices, setCachedDlnaDevices] = useState<any[] | null>(null);
-
   const lineOptions: LineOption[] = useMemo(() => lineOptionsByPlatform[platform] ?? [], [platform]);
   const [currentQuality, setCurrentQuality] = useState<string>(() =>
     typeof window === "undefined" ? "原画" : resolveStoredQuality(platform)
@@ -1284,12 +1283,6 @@ export function MainPlayer({
         }
         if (isSessionActive(sessionId) && !loadFailed) {
           reconnectAttemptRef.current = 0;
-          // Pre-discover DLNA devices in background
-          invoke<any[]>("discover_dlna_devices").then(devices => {
-            if (isSessionActive(sessionId)) {
-              setCachedDlnaDevices(devices);
-            }
-          }).catch(() => {});
         }
       }
     },
@@ -1546,7 +1539,7 @@ export function MainPlayer({
           </div>
         </div>
       </div>
-      <CastDialog open={castOpen} onClose={() => setCastOpen(false)} platform={platform} roomId={roomId} onCastSuccess={() => { playerRef.current?.pause?.(); setCastOpen(false); }} cachedDevices={cachedDlnaDevices} />
+      <CastDialog open={castOpen} onClose={() => setCastOpen(false)} platform={platform} roomId={roomId} onCastSuccess={() => { playerRef.current?.pause?.(); setCastOpen(false); }} />
     </div>
   );
 }
