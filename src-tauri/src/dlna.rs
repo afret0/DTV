@@ -8,21 +8,13 @@ pub struct DlnaDevice {
     pub control_url: String,
 }
 
-// ---- Desktop implementation ----
-#[cfg(not(target_os = "android"))]
 use std::collections::HashMap;
-#[cfg(not(target_os = "android"))]
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
-#[cfg(not(target_os = "android"))]
 use std::time::Duration;
 
-#[cfg(not(target_os = "android"))]
 const SSDP_MULTICAST_IP: Ipv4Addr = Ipv4Addr::new(239, 255, 255, 250);
-#[cfg(not(target_os = "android"))]
 const SSDP_PORT: u16 = 1900;
-#[cfg(not(target_os = "android"))]
 const DLNA_PORTS: &[u16] = &[49152, 49494, 5000, 8200, 38520, 2869, 9080];
-#[cfg(not(target_os = "android"))]
 const SSDP_DISCOVER_MSG: &str = "\
 M-SEARCH * HTTP/1.1\r\n\
 HOST: 239.255.255.250:1900\r\n\
@@ -31,7 +23,6 @@ MX: 2\r\n\
 ST: urn:schemas-upnp-org:device:MediaRenderer:1\r\n\
 \r\n";
 
-#[cfg(not(target_os = "android"))]
 fn discover_ssdp(local_ip: Ipv4Addr) -> Vec<DlnaDevice> {
     let bind_addr = SocketAddrV4::new(local_ip, 0);
     let socket = match UdpSocket::bind(bind_addr) {
@@ -62,7 +53,6 @@ fn discover_ssdp(local_ip: Ipv4Addr) -> Vec<DlnaDevice> {
     devices.into_values().collect()
 }
 
-#[cfg(not(target_os = "android"))]
 async fn scan_subnet_for_dlna(ifaces: &[(String, IpAddr)]) -> Vec<DlnaDevice> {
     let mut devices = HashMap::new();
     for (_name, ip) in ifaces {
@@ -96,7 +86,6 @@ async fn scan_subnet_for_dlna(ifaces: &[(String, IpAddr)]) -> Vec<DlnaDevice> {
     devices.into_values().collect()
 }
 
-#[cfg(not(target_os = "android"))]
 fn parse_ssdp_response(data: &str) -> Option<DlnaDevice> {
     let headers: HashMap<String, String> = data.lines().skip(1)
         .filter_map(|line| {
@@ -110,7 +99,6 @@ fn parse_ssdp_response(data: &str) -> Option<DlnaDevice> {
     Some(DlnaDevice { name: String::new(), location: loc, host, control_url: String::new() })
 }
 
-#[cfg(not(target_os = "android"))]
 async fn fetch_dlna_description(location: &str) -> Option<String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
@@ -118,7 +106,6 @@ async fn fetch_dlna_description(location: &str) -> Option<String> {
     client.get(location).send().await.ok()?.text().await.ok()
 }
 
-#[cfg(not(target_os = "android"))]
 fn extract_device_name(xml: &str, fallback: &str) -> String {
     for pat in &[r#"<friendlyName[^>]*>([^<]*)</friendlyName>"#, r"<modelName>([^<]*)</modelName>"] {
         if let Ok(re) = regex::Regex::new(pat) {
@@ -131,15 +118,13 @@ fn extract_device_name(xml: &str, fallback: &str) -> String {
     fallback.to_string()
 }
 
-#[cfg(not(target_os = "android"))]
 fn extract_avtransport_url(xml: &str, base_url: &str) -> Option<String> {
     let re = regex::Regex::new(r"(?s)<serviceType>urn:schemas-upnp-org:service:AVTransport:\d</serviceType>.*?<controlURL>([^<]*)</controlURL>").ok()?;
     let path = re.captures(xml)?.get(1)?.as_str().to_string();
     url::Url::parse(base_url).ok()?.join(&path).ok().map(|u| u.to_string())
 }
 
-#[cfg_attr(not(target_os = "android"), tauri::command)]
-#[cfg(not(target_os = "android"))]
+#[tauri::command]
 pub async fn discover_dlna_devices() -> Result<Vec<DlnaDevice>, String> {
     let ifaces = local_ip_address::list_afinet_netifas()
         .map_err(|e| format!("无法获取网络接口: {}", e))?;
@@ -177,8 +162,7 @@ pub async fn discover_dlna_devices() -> Result<Vec<DlnaDevice>, String> {
     Ok(resolved)
 }
 
-#[cfg_attr(not(target_os = "android"), tauri::command)]
-#[cfg(not(target_os = "android"))]
+#[tauri::command]
 pub async fn push_to_dlna(device_location: &str, stream_url: &str) -> Result<(), String> {
     let xml = fetch_dlna_description(device_location).await.ok_or("无法获取设备XML")?;
     let control_url = extract_avtransport_url(&xml, device_location).ok_or("设备不支持AVTransport")?;
@@ -189,17 +173,4 @@ pub async fn push_to_dlna(device_location: &str, stream_url: &str) -> Result<(),
     tokio::time::sleep(Duration::from_millis(500)).await;
     client.post(&control_url).header("SOAPAction", "\"urn:schemas-upnp-org:service:AVTransport:1#Play\"").header("Content-Type", "text/xml; charset=utf-8").body(r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><u:Play xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"><InstanceID>0</InstanceID><Speed>1</Speed></u:Play></s:Body></s:Envelope>"#).send().await.map_err(|e| format!("Play失败: {}", e))?;
     Ok(())
-}
-
-// ---- Android stubs ----
-#[cfg_attr(target_os = "android", tauri::command)]
-#[cfg(target_os = "android")]
-pub async fn discover_dlna_devices() -> Result<Vec<DlnaDevice>, String> {
-    Ok(vec![])
-}
-
-#[cfg_attr(target_os = "android", tauri::command)]
-#[cfg(target_os = "android")]
-pub async fn push_to_dlna(_device_location: &str, _stream_url: &str) -> Result<(), String> {
-    Err("投屏功能在移动端不可用".to_string())
 }

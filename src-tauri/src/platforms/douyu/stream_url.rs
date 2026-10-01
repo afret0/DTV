@@ -1,3 +1,4 @@
+#[cfg(not(target_os = "android"))]
 use deno_core::{JsRuntime, RuntimeOptions};
 use html_escape::decode_html_entities;
 use reqwest::{
@@ -9,6 +10,7 @@ use serde::Deserialize;
 use serde_json::Value;
 #[cfg(target_os = "linux")]
 use std::sync::Once;
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Deserialize, Debug)]
@@ -60,12 +62,52 @@ struct DouYu {
 const DEFAULT_DOUYU_CDN: &str = "ws-h5";
 const DEFAULT_DOUYU_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36";
 const DEFAULT_DOUYU_DID: &str = "10000000000000000000000000001501";
-const CRYPTO_JS: &str = include_str!("cryptojs.min.js");
 
-#[cfg(target_os = "linux")]
+/// Douyu keys CDN sessions by (client IP, did). A fixed did means two DTV
+/// instances behind one NAT (e.g. desktop app + phone) kill each other's
+/// streams. Use a random per-process device id instead.
+fn process_did() -> String {
+    static DID: OnceLock<String> = OnceLock::new();
+    DID.get_or_init(|| {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        (0..32).map(|_| char::from(b'0' + rng.gen_range(0..10))).collect()
+    })
+    .clone()
+}
+const CRYPTO_JS: &str = include_str!("cryptojs.min.js");
+const BOA_PRELUDE: &str = r#"
+if (typeof globalThis.unescape !== "function") {
+  globalThis.unescape = function (s) {
+    return decodeURIComponent(String(s).replace(/\+/g, "%2B"));
+  };
+}
+if (typeof globalThis.escape !== "function") {
+  globalThis.escape = function (s) {
+    return encodeURIComponent(String(s))
+      .replace(/%20/g, "+")
+      .replace(/[!'()*\-._~]/g, function (c) { return c; });
+  };
+}
+"#;
+
+const BOA_POSTLUDE: &str = r#"
+if (typeof globalThis.md5 !== "function" && typeof CryptoJS !== "undefined" && CryptoJS.MD5) {
+  globalThis.md5 = function (s) { return CryptoJS.MD5(String(s)).toString(); };
+}
+if (typeof globalThis.hex_md5 !== "function" && typeof globalThis.md5 === "function") {
+  globalThis.hex_md5 = globalThis.md5;
+}
+"#;
+
+
+#[cfg(any(target_os = "linux"))]
 static JS_RUNTIME_INIT: Once = Once::new();
 
+#[cfg(not(target_os = "android"))]
 fn ensure_js_runtime_platform_initialized() {
+    // V8 requires platform initialization exactly once per process; without it
+    // creating a JsRuntime segfaults on Android/Linux.
     #[cfg(target_os = "linux")]
     JS_RUNTIME_INIT.call_once(|| {
         JsRuntime::init_platform(None);
@@ -105,12 +147,48 @@ impl DouYu {
             .build()?;
 
         Ok(Self {
-            did: DEFAULT_DOUYU_DID.to_string(),
+            did: process_did(),
             rid: rid.to_string(),
             client,
         })
     }
 
+    #[cfg(target_os = "android")]
+    async fn execute_js_sign(
+        &self,
+        script: &str,
+        rid: &str,
+        did: &str,
+        ts: i64,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        // V8 cannot run inside Android app processes (W^X). QuickJS is a pure
+        // interpreter: no JIT, no executable-memory requirement, full eval.
+        let code = format!(
+            "{}\n{}\nub98484234({:?},{:?},{});",
+            CRYPTO_JS,
+            script,
+            rid,
+            did,
+            ts
+        );
+        let out = tokio::task::spawn_blocking(move || {
+            let result = (|| -> Result<String, String> {
+                let rt = rquickjs::Runtime::new().map_err(|e| e.to_string())?;
+                let ctx = rquickjs::Context::full(&rt).map_err(|e| e.to_string())?;
+                ctx.with(|ctx| -> Result<String, String> {
+                    let v: String = ctx.eval(code.as_str()).map_err(|e| e.to_string())?;
+                    Ok(v)
+                })
+            })();
+            result
+        })
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error> { Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())) })?
+        .map_err(|e| -> Box<dyn std::error::Error> { Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) })?;
+        Ok(out)
+    }
+
+    #[cfg(not(target_os = "android"))]
     async fn execute_js_sign(
         &self,
         script: &str,

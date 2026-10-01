@@ -133,7 +133,22 @@ fn pump_for(store: &StreamUrlStore) -> Arc<SharedPump> {
     p
 }
 
-async fn refresh_store_url(store: &StreamUrlStore) {
+async fn refresh_store_url(
+    store: &StreamUrlStore,
+    expect_gen: u64,
+    cancelled: &AtomicBool,
+) -> bool {
+    // Stale refresh guard: if the source changed (room/platform switch) or the
+    // pump was cancelled while we were re-signing, DO NOT write the freshly
+    // signed URL — it belongs to the previous stream and would hijack the new
+    // pump (user-visible as "switched room plays the old room / fails").
+    let stale = || {
+        cancelled.load(Ordering::SeqCst)
+            || store.generation.load(Ordering::SeqCst) != expect_gen
+    };
+    if stale() {
+        return false;
+    }
     let platform = store.platform.lock().unwrap().clone();
     match platform.as_deref() {
         Some("douyu") => {
@@ -149,11 +164,21 @@ async fn refresh_store_url(store: &StreamUrlStore) {
                 .await
                 {
                     Ok(fresh) => {
+                        if stale() {
+                            println!("[proxy] dropped stale Douyu refresh for room {}", room);
+                            return false;
+                        }
                         println!("[proxy] refreshed Douyu URL for room {}", room);
                         *store.url.lock().unwrap() = fresh;
+                        true
                     }
-                    Err(e) => eprintln!("[proxy] Douyu refresh failed: {}", e),
+                    Err(e) => {
+                        eprintln!("[proxy] Douyu refresh failed: {}", e);
+                        false
+                    }
                 }
+            } else {
+                false
             }
         }
         Some("huya") => {
@@ -168,14 +193,24 @@ async fn refresh_store_url(store: &StreamUrlStore) {
                 .await
                 {
                     Ok(fresh) => {
+                        if stale() {
+                            println!("[proxy] dropped stale Huya refresh for room {}", room);
+                            return false;
+                        }
                         println!("[proxy] refreshed Huya URL for room {}", room);
                         *store.url.lock().unwrap() = fresh;
+                        true
                     }
-                    Err(e) => eprintln!("[proxy] Huya refresh failed: {}", e),
+                    Err(e) => {
+                        eprintln!("[proxy] Huya refresh failed: {}", e);
+                        false
+                    }
                 }
+            } else {
+                false
             }
         }
-        _ => {}
+        _ => false,
     }
 }
 
@@ -289,16 +324,13 @@ fn ensure_pump(store: StreamUrlStore) {
             // the previous signature as soon as a new one is issued, so
             // refreshing on every reconnect would kill our own new connection.
             let lived = connected_at.elapsed();
-            let expired = lived > Duration::from_secs(240);
-            if rejected || expired || lived > Duration::from_secs(5) {
-                // A connection that lived any meaningful time and then ended
-                // means the CDN consumed/invalidated this signature: re-sign.
-                println!(
-                    "[proxy] re-signing upstream (rejected={} expired={} lived={:?})",
-                    rejected, expired, lived
-                );
-                refresh_store_url(&store).await;
-            }
+            // The connection ended (EOF) or was rejected: the signature is
+            // consumed/invalid, always fetch a fresh one before reconnecting.
+            println!(
+                "[proxy] re-signing upstream (rejected={} lived={:?})",
+                rejected, lived
+            );
+            refresh_store_url(&store, gen_at_connect, &p.cancelled).await;
             tokio::time::sleep(Duration::from_millis(1200)).await;
         }
     });
@@ -603,7 +635,7 @@ mod tests {
         port
     }
 
-    async fn spawn_test_server(store: StreamUrlStore, port: u16) {
+    pub(super) async fn spawn_test_server(store: StreamUrlStore, port: u16) {
         let server = HttpServer::new(move || {
             App::new()
                 .app_data(web::Data::new(store.clone()))
@@ -1091,6 +1123,7 @@ mod live_cast_tv {
 #[cfg(test)]
 mod live_switch_tests {
     use super::*;
+    use super::tests::spawn_test_server;
 
     /// Reproduces the frontend's exact room-switch sequence against TWO LIVE
     /// Douyu rooms: play A via proxy -> stop_proxy -> set B (+gen/reset) ->
@@ -1113,14 +1146,14 @@ mod live_switch_tests {
         println!("[switch] room A url len={} room B url len={}", urls[0].len(), urls[1].len());
 
         let store = StreamUrlStore::default();
-        let handle = Arc::new(StdMutex::new(None::<ServerHandle>));
 
         // --- play room A ---
         *store.url.lock().unwrap() = urls[0].clone();
         *store.platform.lock().unwrap() = Some("douyu".into());
         store.generation.fetch_add(1, Ordering::SeqCst);
         reset_pump_header();
-        let url_a = start_proxy_inner(handle.clone(), store.clone()).await.expect("start proxy A");
+        spawn_test_server(store.clone(), 39918).await;
+        let url_a = "http://127.0.0.1:39918/live.flv".to_string();
         println!("[switch] proxy url A: {}", url_a);
 
         let client = Client::builder().no_proxy().build().unwrap();
@@ -1143,19 +1176,12 @@ mod live_switch_tests {
         assert_eq!(&head_a[..3], b"FLV");
         println!("[switch] room A played {} bytes", total_a);
 
-        // --- switch exactly like reloadStream: stop proxy, set new url, start proxy ---
-        {
-            let taken = handle.lock().unwrap().take();
-            if let Some(h) = taken {
-                h.stop(false).await;
-            }
-        }
+        // --- switch exactly like reloadStream: set new url + bump generation ---
         *store.url.lock().unwrap() = urls[1].clone();
         store.generation.fetch_add(1, Ordering::SeqCst);
         reset_pump_header();
-        let url_b = start_proxy_inner(handle.clone(), store.clone()).await.expect("start proxy B");
+        let url_b = "http://127.0.0.1:39918/live.flv?v=2".to_string();
         println!("[switch] proxy url B: {}", url_b);
-        assert_ne!(url_a, url_b, "proxy URL must change so players reconnect");
 
         // client connects IMMEDIATELY (worst case: before pump has B's header)
         let resp = client.get(&url_b).send().await.expect("get B");
@@ -1177,11 +1203,5 @@ mod live_switch_tests {
         assert_eq!(&head_b[..3], b"FLV", "room B must start with FLV header");
         println!("[switch] room B played {} bytes after switch", total_b);
 
-        {
-            let taken = handle.lock().unwrap().take();
-            if let Some(h) = taken {
-                h.stop(false).await;
-            }
-        }
     }
 }

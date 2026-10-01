@@ -13,6 +13,7 @@ import { usePlayerUi } from "@/state/playerUi/PlayerUiProvider";
 import { useCustomCategories } from "@/state/customCategories/CustomCategoriesProvider";
 import { PlayerOverlayHost, PlayerOverlayProvider, usePlayerOverlay } from "@/state/playerOverlay/PlayerOverlayProvider";
 import { useDlnaDiscovery } from "@/hooks/useDlnaDiscovery";
+import { RectReporter } from "@/components/app/RectReporter";
 
 type UiPlatform = "douyu" | "douyin" | "huya" | "bilibili" | "custom";
 
@@ -38,6 +39,7 @@ function isPlayerPath(pathname: string) {
 export function AppShell({ children }: { children: React.ReactNode }) {
   return (
     <PlayerOverlayProvider>
+      <RectReporter />
       <AppShellInner>{children}</AppShellInner>
     </PlayerOverlayProvider>
   );

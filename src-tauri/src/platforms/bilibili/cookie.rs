@@ -134,6 +134,7 @@ pub async fn get_bilibili_cookie(
 }
 
 #[tauri::command]
+#[cfg(not(target_os = "android"))]
 pub async fn bootstrap_bilibili_cookie(
     app_handle: AppHandle,
 ) -> Result<BilibiliCookieResult, String> {
@@ -169,4 +170,12 @@ pub async fn bootstrap_bilibili_cookie(
     }
 
     Ok(result)
+}
+
+#[tauri::command]
+#[cfg(target_os = "android")]
+pub async fn bootstrap_bilibili_cookie(
+    _app_handle: AppHandle,
+) -> Result<BilibiliCookieResult, String> {
+    Err("该功能仅在桌面端可用".to_string())
 }

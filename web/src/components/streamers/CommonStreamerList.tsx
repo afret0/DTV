@@ -39,6 +39,7 @@ export function CommonStreamerList({
   const bottomSentinelRef = useRef<HTMLDivElement | null>(null);
   const scrollRafRef = useRef(0);
   const lastScrollAtRef = useRef(0);
+  const lastScrollTopRef = useRef(0);
   const scrollEndTimerRef = useRef<number | null>(null);
   const [isScrolling, setIsScrolling] = React.useState(false);
   const loadMoreGateRef = useRef<{ key: string; lastLen: number; lastAt: number }>({ key: "", lastLen: -1, lastAt: 0 });
@@ -165,10 +166,36 @@ export function CommonStreamerList({
     return now - lastScrollAtRef.current < 140;
   }, []);
 
-  const onCardClick = useCallback(
+  const lastNavRef = useRef<{ id: string; at: number }>({ id: "", at: 0 });
+
+  const navigateOnce = useCallback(
     (roomId: string) => {
       if (shouldIgnoreClick()) return;
+      const now = Date.now();
+      if (lastNavRef.current.id === roomId && now - lastNavRef.current.at < 600) return;
+      lastNavRef.current = { id: roomId, at: now };
       goToPlayer(roomId);
+    },
+    [goToPlayer, shouldIgnoreClick]
+  );
+
+  // Native click listener: on some WebViews (old Android System WebView) the
+  // synthetic click never reaches React's delegated root handler, so cards
+  // would be untappable. A native listener on the element always works.
+  const nativeCardRef = useCallback(
+    (roomId: string) => (node: HTMLElement | null) => {
+      if (!node) return;
+      node.onclick = (e) => {
+        e.stopPropagation();
+        navigateOnce(roomId);
+      };
+    },
+    [navigateOnce]
+  );
+
+  const onCardClick = useCallback(
+    (roomId: string) => {
+      navigateOnce(roomId);
     },
     [goToPlayer, shouldIgnoreClick]
   );
@@ -177,7 +204,15 @@ export function CommonStreamerList({
     (e: React.UIEvent<HTMLDivElement>) => {
       const target = e.currentTarget;
       markScrolling();
-      lastScrollAtRef.current = typeof window !== "undefined" && window.performance?.now ? window.performance.now() : Date.now();
+      // Touch devices emit micro scroll events on plain taps; only treat a
+      // scroll as "user is scrolling" when the position actually moved,
+      // otherwise every tap on the list would be swallowed as a misclick.
+      const top = target.scrollTop;
+      const moved = Math.abs(top - lastScrollTopRef.current) >= 8;
+      lastScrollTopRef.current = top;
+      if (moved) {
+        lastScrollAtRef.current = typeof window !== "undefined" && window.performance?.now ? window.performance.now() : Date.now();
+      }
 
       if (scrollRafRef.current) return;
       scrollRafRef.current = window.requestAnimationFrame(() => {
@@ -368,7 +403,9 @@ export function CommonStreamerList({
                 className={styles.cardOuter}
                 role="button"
                 tabIndex={0}
+                ref={nativeCardRef(room.room_id)}
                 onClick={() => onCardClick(room.room_id)}
+                onTap={() => onCardClick(room.room_id)}
                 onKeyDown={(e) => onCardKeyDown(e, room.room_id)}
                 initial="rest"
                 animate="rest"

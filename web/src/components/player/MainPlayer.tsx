@@ -211,6 +211,12 @@ export function MainPlayer({
   const playerContainerRef = useRef<HTMLDivElement | null>(null);
   const playerRef = useRef<any>(null);
   const playbackKindRef = useRef<null | "hls" | "flv">(null);
+  // Player events can outlive the closure that created them (room switch
+  // without rebuild); keep the current label fresh for diagnostics.
+  const streamLabelRef = useRef({ platform, roomId });
+  useEffect(() => {
+    streamLabelRef.current = { platform, roomId };
+  }, [platform, roomId]);
   const danmuOverlayRef = useRef<DanmuOverlayInstance | null>(null);
   const unlistenRef = useRef<null | (() => void)>(null);
 
@@ -228,6 +234,9 @@ export function MainPlayer({
   const linePluginRef = useRef<any>(null);
   const hevcBrandPatchedRef = useRef(false);
   const reconnectAttemptRef = useRef(0);
+  // One-shot per player mount: WebViews without HEVC/MSE support (older
+  // Android Chrome) reject Douyin 原画; fall back to 高清 (H.264) once.
+  const codecFallbackDoneRef = useRef(false);
   const MAX_AUTO_RECONNECT = 5;
   const autoReconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -591,6 +600,7 @@ export function MainPlayer({
       autoReconnectTimerRef.current = null;
     }
     reconnectAttemptRef.current = 0;
+    codecFallbackDoneRef.current = false;
 
     try {
       unlistenRef.current?.();
@@ -929,8 +939,28 @@ export function MainPlayer({
       }
 
       try {
-        player.on?.("error", () => {
+        player.on?.("playing", () => {
+          const { platform: p, roomId: r } = streamLabelRef.current;
+          invoke("frontend_log", { msg: `player PLAYING [${p}/${r}] kind=${playbackKindRef.current}` }).catch(() => {});
+        });
+        player.on?.("error", (err: any) => {
+          invoke("frontend_log", { msg: `player error event: ${JSON.stringify(err)?.slice(0, 300)}` }).catch(() => {});
           if (!isSessionActive(sessionId)) return;
+          const errMsg = `${err?.message ?? ""}`;
+          if (
+            errMsg.includes("addSourceBuffer") &&
+            !codecFallbackDoneRef.current &&
+            (currentQualityRef.current === "原画" || currentQualityRef.current.startsWith("原画"))
+          ) {
+            codecFallbackDoneRef.current = true;
+            invoke("frontend_log", { msg: `codec fallback: ${currentQualityRef.current} -> 高清 (MediaSource rejected codec)` }).catch(() => {});
+            setCurrentQuality("高清");
+            if (autoReconnectTimerRef.current) clearTimeout(autoReconnectTimerRef.current);
+            autoReconnectTimerRef.current = setTimeout(() => {
+              void reloadStreamRef.current?.("quality", { quality: "高清" });
+            }, 400);
+            return;
+          }
           if (reconnectAttemptRef.current >= MAX_AUTO_RECONNECT) return;
           reconnectAttemptRef.current++;
           console.log(`[Player] Stream error detected, auto-reconnecting (attempt ${reconnectAttemptRef.current}/${MAX_AUTO_RECONNECT})`);
@@ -1257,6 +1287,7 @@ export function MainPlayer({
       } catch (e: any) {
         if (!isSessionActive(sessionId)) return;
         loadFailed = true;
+        try { await invoke("frontend_log", { msg: `reloadStream failed [${platform}/${roomId}]: ${e?.message ?? e}` }); } catch {}
         // When the target room fails to load (e.g. offline), keep UI consistent by clearing any previous playback surface.
         destroyPlayer();
         const msg = e?.message ? String(e.message) : String(e);

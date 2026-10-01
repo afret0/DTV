@@ -70,6 +70,7 @@ fn unique_path(mut path: PathBuf) -> PathBuf {
     path
 }
 
+#[cfg(not(target_os = "android"))]
 #[tauri::command]
 pub fn export_lan_sync_json_to_desktop(
     app: tauri::AppHandle,
@@ -90,6 +91,7 @@ pub fn export_lan_sync_json_to_desktop(
     Ok(path.to_string_lossy().into_owned())
 }
 
+#[cfg(not(target_os = "android"))]
 #[tauri::command]
 pub fn pick_lan_sync_json_import(app: tauri::AppHandle) -> Result<Option<ImportedJsonFile>, String> {
     let desktop = app.path().desktop_dir().ok();
@@ -109,6 +111,7 @@ pub fn pick_lan_sync_json_import(app: tauri::AppHandle) -> Result<Option<Importe
     }))
 }
 
+#[cfg(not(target_os = "android"))]
 #[tauri::command]
 pub fn import_latest_lan_sync_json_from_desktop(app: tauri::AppHandle) -> Result<Option<ImportedJsonFile>, String> {
     let desktop = app
@@ -147,4 +150,31 @@ pub fn import_latest_lan_sync_json_from_desktop(app: tauri::AppHandle) -> Result
         path: path.to_string_lossy().into_owned(),
         content,
     }))
+}
+
+
+#[cfg(target_os = "android")]
+#[tauri::command]
+pub fn export_lan_sync_json_to_desktop(
+    _app: tauri::AppHandle,
+    _contents: String,
+    _default_file_name: Option<String>,
+) -> Result<String, String> {
+    Err("该功能仅在桌面端可用".to_string())
+}
+
+#[cfg(target_os = "android")]
+#[tauri::command]
+pub fn pick_lan_sync_json_import(
+    _app: tauri::AppHandle,
+) -> Result<Option<ImportedJsonFile>, String> {
+    Err("该功能仅在桌面端可用".to_string())
+}
+
+#[cfg(target_os = "android")]
+#[tauri::command]
+pub fn import_latest_lan_sync_json_from_desktop(
+    _app: tauri::AppHandle,
+) -> Result<Option<ImportedJsonFile>, String> {
+    Err("该功能仅在桌面端可用".to_string())
 }

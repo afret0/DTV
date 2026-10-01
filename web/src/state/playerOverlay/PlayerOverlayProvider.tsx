@@ -45,6 +45,23 @@ export function PlayerOverlayHost() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [closePlayer, isOpen]);
 
+  // Android hardware BACK (and browser back) should close the player overlay
+  // instead of leaving/exiting the app: push a history entry while open and
+  // treat its pop as a close request.
+  useEffect(() => {
+    if (!isOpen) return;
+    window.history.pushState({ dtvPlayerOverlay: true }, "");
+    const onPopState = () => {
+      closePlayer();
+    };
+    window.addEventListener("popstate", onPopState);
+    return () => {
+      window.removeEventListener("popstate", onPopState);
+      const st = window.history.state as { dtvPlayerOverlay?: boolean } | null;
+      if (st && st.dtvPlayerOverlay) window.history.back();
+    };
+  }, [isOpen, closePlayer]);
+
   // NOTE:
   // - Avoid transforms while playing video (WebView2 may black-screen with transformed ancestors).
   // - Only apply the "drop" transform on exit, when the user is closing the player anyway.
