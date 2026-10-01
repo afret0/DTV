@@ -252,6 +252,31 @@ export function MainPlayer({
   const [isWindows, setIsWindows] = useState(false);
   const [isMaximized, setIsMaximized] = useState(false);
   const [castOpen, setCastOpen] = useState(false);
+  // Diagnostics only (debug builds / DTV_CAST_AUTO_OPEN): keep the cast dialog
+  // open so discovery and pushing can be verified end to end without a
+  // synthetic click on the auto-hiding player control bar.
+  useEffect(() => {
+    let cancelled = false;
+    let id: number | undefined;
+    (async () => {
+      try {
+        const on = await invoke<boolean>("cast_auto_open");
+        if (!on || cancelled) return;
+        invoke("frontend_log", { msg: "[cast] auto-opening dialog (diagnostics)" }).catch(() => {});
+        setCastOpen(true);
+        id = window.setInterval(() => {
+          if (!cancelled) setCastOpen(true);
+        }, 4000);
+      } catch {
+        // diagnostics unavailable: ignore
+      }
+    })();
+    return () => {
+      cancelled = true;
+      if (id) window.clearInterval(id);
+    };
+  }, []);
+
   const lineOptions: LineOption[] = useMemo(() => lineOptionsByPlatform[platform] ?? [], [platform]);
   const [currentQuality, setCurrentQuality] = useState<string>(() =>
     typeof window === "undefined" ? "原画" : resolveStoredQuality(platform)

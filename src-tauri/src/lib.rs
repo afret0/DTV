@@ -55,11 +55,56 @@ async fn frontend_log(msg: String) -> Result<(), String> {
     Ok(())
 }
 
-/// Diagnostic aid for automated UI testing: enable the frontend rect reporter
-/// only when the app is launched with DTV_RECT_DEBUG set.
+/// True when UI diagnostics are enabled for this process. Android cannot pass
+/// env vars to an app process, so a settable system property is honoured there
+/// (`adb shell setprop debug.dtv.diag 1`); everywhere else use DTV_RECT_DEBUG.
+fn diagnostics_enabled() -> bool {
+    if std::env::var("DTV_RECT_DEBUG").is_ok() {
+        return true;
+    }
+    if cfg!(debug_assertions) {
+        return true;
+    }
+    #[cfg(target_os = "android")]
+    {
+        if let Ok(out) = std::process::Command::new("getprop")
+            .arg("debug.dtv.diag")
+            .output()
+        {
+            return String::from_utf8_lossy(&out.stdout).trim() == "1";
+        }
+    }
+    false
+}
+
+/// Diagnostic aid for automated UI testing: report element rects so a synthetic
+/// click can drive the real UI.
 #[tauri::command]
 fn rect_debug_enabled() -> bool {
-    std::env::var("DTV_RECT_DEBUG").is_ok()
+    diagnostics_enabled()
+}
+
+/// Diagnostic aid: open the cast dialog automatically so cast discovery and
+/// pushing can be verified end to end without a synthetic click on the
+/// auto-hiding player control bar. Kept SEPARATE from `rect_debug_enabled`:
+/// the cast dialog is a modal that blocks every other tap, so it must not
+/// switch on just because coordinate reporting was requested (that alone once
+/// wedged a whole test run behind an invisible-to-the-script modal).
+#[tauri::command]
+fn cast_auto_open() -> bool {
+    if std::env::var("DTV_CAST_AUTO_OPEN").is_ok() {
+        return true;
+    }
+    #[cfg(target_os = "android")]
+    {
+        if let Ok(out) = std::process::Command::new("getprop")
+            .arg("debug.dtv.cast")
+            .output()
+        {
+            return String::from_utf8_lossy(&out.stdout).trim() == "1";
+        }
+    }
+    false
 }
 
 #[tauri::command]
@@ -266,6 +311,7 @@ pub fn run_app() {
                 get_stream_url_cmd,
                 frontend_log,
                 rect_debug_enabled,
+                cast_auto_open,
                 get_stream_url_with_quality_cmd,
                 set_stream_url_cmd,
                 search_anchor,

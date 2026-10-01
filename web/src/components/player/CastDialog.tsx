@@ -13,7 +13,7 @@ interface DlnaDevice { name: string; location: string; host: string; control_url
 export function CastDialog({ open, onClose, platform, roomId, onCastSuccess }: {
   open: boolean; onClose: () => void; platform: string; roomId: string; onCastSuccess?: () => void;
 }) {
-  const { devices: globalDevices, discovering, refresh: discover } = useDlnaDiscovery();
+  const { devices: globalDevices, error: discoverError, discovering, refresh: discover, REFRESH_INTERVAL_MS } = useDlnaDiscovery();
   const [castInfo, setCastInfo] = useState<CastInfo | null>(null);
   const [dlnaDevices, setDlnaDevices] = useState<DlnaDevice[]>([]);
   const [manualIP, setManualIP] = useState("");
@@ -23,28 +23,62 @@ export function CastDialog({ open, onClose, platform, roomId, onCastSuccess }: {
   const [copied, setCopied] = useState(false);
   const [showManual, setShowManual] = useState(false);
 
-  const loadCastInfo = useCallback(async () => {
-    try { setError(null); setCastInfo(await invoke<CastInfo>("get_cast_info")); }
-    catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+  const loadCastInfo = useCallback(async (): Promise<boolean> => {
+    try {
+      const info = await invoke<CastInfo>("get_cast_info");
+      setCastInfo(info);
+      setError(null);
+      invoke("frontend_log", { msg: `[cast] cast info ok: ${info.lan_url}` }).catch(() => {});
+      return true;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      invoke("frontend_log", { msg: `[cast] cast info unavailable: ${msg}` }).catch(() => {});
+      setError(msg);
+      return false;
+    }
   }, []);
 
   const doPush = useCallback(async (device: { name: string; location: string; host: string }, useManualLocation?: boolean) => {
-    if (!castInfo) return;
     setPushingDevice(device.host);
     setPushResult(null);
+    // Always read the cast info fresh: the player may have finished preparing
+    // its stream after the dialog opened, and a stale copy silently did nothing.
+    let info = castInfo;
     try {
-      let location = device.location;
-      if (useManualLocation) {
-        const ip = device.host.trim();
-        location = `http://${ip}:49494/description.xml`;
-      }
-      await invoke("push_to_dlna", { deviceLocation: location, streamUrl: castInfo.lan_url });
+      info = await invoke<CastInfo>("get_cast_info");
+      setCastInfo(info);
+      setError(null);
+    } catch {
+      setPushingDevice(null);
+      const msg = "投屏地址还没准备好，请先开始播放一个直播";
+      invoke("frontend_log", { msg: `[cast] push blocked (${device.name}): no cast info` }).catch(() => {});
+      setPushResult({ success: false, message: msg });
+      return;
+    }
+    const lanUrl = info.lan_url;
+    try {
+      // The Rust side resolves description.xml itself; for a manually typed IP
+      // any port works because it probes the common renderer ports.
+      const location = useManualLocation
+        ? `http://${device.host.trim()}/description.xml`
+        : device.location;
+      invoke("frontend_log", { msg: `[cast] push to ${device.name} @ ${location} stream=${lanUrl}` }).catch(() => {});
+      // The renderer aborts playback on non-ASCII DIDL titles, so the Rust side
+      // sanitises; pass the room/streamer for a recognizable TV display name.
+      await invoke("push_to_dlna", {
+        deviceLocation: location,
+        streamUrl: lanUrl,
+        title: `${platform} ${roomId}`.trim(),
+      });
+      invoke("frontend_log", { msg: `[cast] push OK: ${device.name}` }).catch(() => {});
       setPushResult({ success: true, message: `已推送到 ${device.name}` });
       onCastSuccess?.();
     } catch (e) {
-      setPushResult({ success: false, message: e instanceof Error ? e.message : String(e) });
+      const message = e instanceof Error ? e.message : String(e);
+      invoke("frontend_log", { msg: `[cast] push FAILED (${device.name}): ${message}` }).catch(() => {});
+      setPushResult({ success: false, message });
     } finally { setPushingDevice(null); }
-  }, [castInfo, onCastSuccess]);
+  }, [castInfo, loadCastInfo, onCastSuccess]);
 
   const copyUrl = useCallback(() => {
     if (!castInfo) return;
@@ -59,10 +93,16 @@ export function CastDialog({ open, onClose, platform, roomId, onCastSuccess }: {
   useEffect(() => { if (open) { setDlnaDevices(globalDevices ?? []); } }, [open, globalDevices]);
   useEffect(() => {
     if (!open) return;
-    loadCastInfo();
+    void loadCastInfo();
     setPushResult(null); setError(null);
-    discover();
-  }, [open]);
+    void discover();
+    // The player may still be fetching its stream when the dialog opens, and the
+    // subnet sweep can take a few seconds longer than SSDP; keep polling while
+    // the dialog is open so neither blocks the other.
+    const infoId = window.setInterval(() => { void loadCastInfo(); }, 2000);
+    const id = window.setInterval(() => { void discover(); }, REFRESH_INTERVAL_MS);
+    return () => { window.clearInterval(infoId); window.clearInterval(id); };
+  }, [open, discover, loadCastInfo, REFRESH_INTERVAL_MS]);
 
   if (!open) return null;
 
@@ -75,7 +115,10 @@ export function CastDialog({ open, onClose, platform, roomId, onCastSuccess }: {
           <div style={s.qrSection}><div style={s.qrWrap}><QRCodeCanvas value={castInfo.lan_url} size={180} includeMargin level="M" bgColor="#ffffff" fgColor="#111827" /></div><p style={s.qrHint}>电视/手机浏览器扫码播放</p></div>
           <div style={s.urlSection}><div style={s.urlLabel}>投屏地址</div><div style={s.urlRow}><code style={s.urlText}>{castInfo.lan_url}</code><button style={s.copyBtn} onClick={copyUrl}>{copied ? <CheckCircle size={14} color="#22c55e" /> : "复制"}</button></div></div>
           <div style={s.divider} />
-          <div style={s.dlnaSection}>
+        </>) : (<div style={s.pendingBox}><Loader2 size={14} className="spin" /><span>{error ? `${error}（正在重试…）` : "正在获取投屏地址…设备列表仍可点击，推送时会自动使用最新地址"}</span></div>)}
+        {/* Devices are always listed: hiding them behind the cast-info fetch made
+            casting look broken whenever the stream wasn't ready yet. */}
+        <div style={s.dlnaSection}>
             <div style={s.dlnaHeader}>
               <span style={s.dlnaTitle}>DLNA 设备</span>
               <div style={{ display: "flex", gap: 6 }}>
@@ -88,10 +131,17 @@ export function CastDialog({ open, onClose, platform, roomId, onCastSuccess }: {
               <button onClick={pushManual} disabled={!manualIP.trim() || !!pushingDevice} style={{ ...s.smallBtn, background: "var(--accent)", color: "#fff" }} type="button">{pushingDevice ? <Loader2 size={12} className="spin" /> : "推送"}</button>
             </div>) : null}
             {pushResult ? (<div style={{ ...s.resultBox, background: pushResult.success ? "rgba(34,197,94,0.1)" : "rgba(239,68,68,0.1)", borderColor: pushResult.success ? "rgba(34,197,94,0.3)" : "rgba(239,68,68,0.3)" }}>{pushResult.success ? <CheckCircle size={14} color="#22c55e" /> : <AlertCircle size={14} color="#ef4444" />}<span style={{ color: pushResult.success ? "#22c55e" : "#ef4444" }}>{pushResult.message}</span></div>) : null}
-            {dlnaDevices.length === 0 && !discovering ? (<p style={s.emptyHint}><Tv size={14} />{showManual ? "上方输入电视IP手动推送" : "点击搜索或在下方输入电视IP"}</p>) : null}
+            {dlnaDevices.length === 0 ? (
+              <p style={s.emptyHint}><Tv size={14} />
+                {discovering
+                  ? "正在搜索局域网设备…"
+                  : discoverError
+                    ? `${discoverError}（可手动输入电视IP）`
+                    : (showManual ? "上方输入电视IP手动推送" : "未发现设备，点击搜索或手动输入电视IP")}
+              </p>
+            ) : null}
             {dlnaDevices.map(d => (<button key={d.location} style={s.deviceBtn} onClick={(e) => { e.preventDefault(); e.stopPropagation(); doPush(d); }} disabled={pushingDevice === d.host} type="button"><Tv size={16} /><span style={s.deviceName}>{d.name}</span>{pushingDevice === d.host ? <Loader2 size={14} className="spin" /> : <Smartphone size={14} opacity={0.5} />}</button>))}
-          </div>
-        </>) : (<div style={s.loadingBox}><Loader2 size={20} className="spin" /><span>获取投屏信息...</span></div>)}
+        </div>
       </div>
     </m.div>
   </m.div></AnimatePresence>);
@@ -120,4 +170,5 @@ const s: Record<string, React.CSSProperties> = {
   errorBox: { display: "flex", alignItems: "center", gap: 8, padding: "10px 12px", borderRadius: 10, background: "rgba(239,68,68,0.1)", border: "1px solid rgba(239,68,68,0.3)", color: "#ef4444", fontSize: 12, fontWeight: 600, marginBottom: 12 },
   resultBox: { display: "flex", alignItems: "center", gap: 8, padding: "10px 12px", borderRadius: 10, border: "1px solid", fontSize: 12, fontWeight: 600, marginBottom: 10 },
   loadingBox: { display: "flex", alignItems: "center", justifyContent: "center", gap: 8, padding: 40, color: "var(--secondary-text)", fontSize: 13, fontWeight: 600 },
+  pendingBox: { display: "flex", alignItems: "center", gap: 8, padding: "10px 12px", borderRadius: 10, background: "rgba(59,130,246,0.08)", border: "1px solid rgba(59,130,246,0.25)", color: "var(--secondary-text)", fontSize: 12, fontWeight: 600, marginBottom: 12, lineHeight: 1.5 },
 };

@@ -61,7 +61,6 @@ struct DouYu {
 
 const DEFAULT_DOUYU_CDN: &str = "ws-h5";
 const DEFAULT_DOUYU_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36";
-const DEFAULT_DOUYU_DID: &str = "10000000000000000000000000001501";
 
 /// Douyu keys CDN sessions by (client IP, did). A fixed did means two DTV
 /// instances behind one NAT (e.g. desktop app + phone) kill each other's
@@ -76,29 +75,6 @@ fn process_did() -> String {
     .clone()
 }
 const CRYPTO_JS: &str = include_str!("cryptojs.min.js");
-const BOA_PRELUDE: &str = r#"
-if (typeof globalThis.unescape !== "function") {
-  globalThis.unescape = function (s) {
-    return decodeURIComponent(String(s).replace(/\+/g, "%2B"));
-  };
-}
-if (typeof globalThis.escape !== "function") {
-  globalThis.escape = function (s) {
-    return encodeURIComponent(String(s))
-      .replace(/%20/g, "+")
-      .replace(/[!'()*\-._~]/g, function (c) { return c; });
-  };
-}
-"#;
-
-const BOA_POSTLUDE: &str = r#"
-if (typeof globalThis.md5 !== "function" && typeof CryptoJS !== "undefined" && CryptoJS.MD5) {
-  globalThis.md5 = function (s) { return CryptoJS.MD5(String(s)).toString(); };
-}
-if (typeof globalThis.hex_md5 !== "function" && typeof globalThis.md5 === "function") {
-  globalThis.hex_md5 = globalThis.md5;
-}
-"#;
 
 
 #[cfg(any(target_os = "linux"))]
