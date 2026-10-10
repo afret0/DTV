@@ -197,6 +197,29 @@ impl DouYu {
     }
 
     async fn fetch_room_detail(&self) -> Result<(String, bool), Box<dyn std::error::Error>> {
+        // betard occasionally serves a degraded/anti-crawl payload (missing
+        // room or status). Treating that as "offline" made live rooms pop
+        // "主播未开播" until the user manually refreshed, so: retry once, and
+        // only an explicit non-1 show_status counts as truly offline.
+        // Keep only the String across await points (a boxed Error here would
+        // make the future !Send and break the tauri command).
+        let mut last_err = String::from("betard failed");
+        for attempt in 0..2 {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+            }
+            match self.fetch_room_detail_once().await {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    eprintln!("[Douyu] betard attempt {} failed for {}: {}", attempt + 1, self.rid, e);
+                    last_err = e.to_string();
+                }
+            }
+        }
+        Err(last_err.into())
+    }
+
+    async fn fetch_room_detail_once(&self) -> Result<(String, bool), Box<dyn std::error::Error>> {
         let url = format!("https://www.douyu.com/betard/{}", self.rid);
         let json = self
             .client
@@ -207,14 +230,15 @@ impl DouYu {
             .json::<BetardResponse>()
             .await?;
 
-        let room = json.room.ok_or("Missing room data")?;
-        let room_id_value = room.room_id.ok_or("Missing room_id")?;
+        let room = json.room.ok_or("betard 响应缺少 room 数据（可重试）")?;
+        let room_id_value = room.room_id.ok_or("betard 响应缺少 room_id（可重试）")?;
         let room_id = value_to_string(&room_id_value).ok_or("Invalid room_id")?;
+        // A missing/garbled status is a degraded response, NOT an offline room.
         let show_status = room
             .show_status
             .as_ref()
             .and_then(value_to_i32)
-            .unwrap_or(0);
+            .ok_or("betard 响应缺少 show_status（可重试）")?;
         Ok((room_id, show_status == 1))
     }
 

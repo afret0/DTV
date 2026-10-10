@@ -239,6 +239,12 @@ export function MainPlayer({
   const codecFallbackDoneRef = useRef(false);
   const MAX_AUTO_RECONNECT = 5;
   const autoReconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Auto-retry for TRANSIENT stream-load failures (signing throttled, network
+  // blip). Without this a single transient failure forced the user to click
+  // "再试一次" even though the room was live.
+  const loadRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const loadFailureCountRef = useRef(0);
+  const lastLoadKeyRef = useRef<string | null>(null);
 
   const [isLoadingStream, setIsLoadingStream] = useState(false);
   const [streamError, setStreamError] = useState<string | null>(null);
@@ -623,6 +629,10 @@ export function MainPlayer({
     if (autoReconnectTimerRef.current) {
       clearTimeout(autoReconnectTimerRef.current);
       autoReconnectTimerRef.current = null;
+    }
+    if (loadRetryTimerRef.current) {
+      clearTimeout(loadRetryTimerRef.current);
+      loadRetryTimerRef.current = null;
     }
     reconnectAttemptRef.current = 0;
     codecFallbackDoneRef.current = false;
@@ -1011,6 +1021,10 @@ export function MainPlayer({
           }, 15000);
         });
         player.on?.("playing", () => {
+          // Healthy playback resets both reconnect budgets: a long session with
+          // occasional blips must never exhaust them and stop auto-recovering.
+          reconnectAttemptRef.current = 0;
+          loadFailureCountRef.current = 0;
           if (waitingTimer) {
             clearTimeout(waitingTimer);
             waitingTimer = null;
@@ -1133,6 +1147,14 @@ export function MainPlayer({
       reloadInFlightRef.current = true;
       const sessionId = ++sessionSeqRef.current;
       activeSessionIdRef.current = sessionId;
+
+      // Fresh room => fresh transient-failure budget; retries of the SAME room
+      // keep escalating the backoff instead of restarting at 2.5s every time.
+      const loadKey = `${platform}/${roomId}`;
+      if (lastLoadKeyRef.current !== loadKey) {
+        lastLoadKeyRef.current = loadKey;
+        loadFailureCountRef.current = 0;
+      }
 
       let loadFailed = false;
 
@@ -1317,9 +1339,32 @@ export function MainPlayer({
         destroyPlayer();
         const msg = e?.message ? String(e.message) : String(e);
         setStreamError(maybeAppendHevcInstallHint(msg));
-        // Per product decision: stream load failure => treat as "not live" (最多重试一次后仍失败则认为主播不在线)
-        setIsOfflineError(true);
-        setPlayerIsLive(false);
+        // Only a platform-confirmed offline state may show "主播未开播".
+        // Mislabelling transient failures (throttled sign API, DNS blip) as
+        // offline was what forced users to refresh rooms that were actually live.
+        const offline = isOfflineMessage(msg);
+        setIsOfflineError(offline);
+        setPlayerIsLive(offline ? false : null);
+        if (!offline) {
+          // Transient failure: keep retrying in the background with backoff.
+          // True offline rooms are excluded (they'd poll forever for nothing).
+          const n = loadFailureCountRef.current++;
+          if (!disposedRef.current) {
+            // Fast ladder first (2.5s..30s), then a gentle 30s poll until the
+            // room loads, switches, or the player closes.
+            const delay = Math.min(30000, 2500 * 2 ** Math.min(n, 4));
+            if (loadRetryTimerRef.current) clearTimeout(loadRetryTimerRef.current);
+            loadRetryTimerRef.current = setTimeout(() => {
+              loadRetryTimerRef.current = null;
+              // Bail out if a newer reload superseded this session or the
+              // player went away.
+              if (disposedRef.current || activeSessionIdRef.current !== sessionId) return;
+              try { invoke("frontend_log", { msg: `[player] load auto-retry #${n + 1} for [${platform}/${roomId}] after ${delay}ms` }).catch(() => {}); } catch {}
+              void reloadStreamRef.current?.("refresh");
+            }, delay);
+            try { invoke("frontend_log", { msg: `[player] transient load failure, auto-retry #${n + 1} scheduled in ${delay}ms: ${msg.slice(0, 160)}` }).catch(() => {}); } catch {}
+          }
+        }
       } finally {
         if (isSessionActive(sessionId)) {
           setIsLoadingStream(false);
@@ -1332,6 +1377,7 @@ export function MainPlayer({
         }
         if (isSessionActive(sessionId) && !loadFailed) {
           reconnectAttemptRef.current = 0;
+          loadFailureCountRef.current = 0;
         }
       }
     },
@@ -1574,7 +1620,7 @@ export function MainPlayer({
               {streamError ? (
                 <div className={isOfflineError ? "offline-player" : "error-player"} style={{ position: "absolute", inset: 0, zIndex: 20 }}>
                   <div style={{ padding: 18, width: "min(520px, 92vw)", margin: "0 auto", textAlign: "left" }}>
-                    <div style={{ fontSize: 14, fontWeight: 800, marginBottom: 10 }}>{isOfflineError ? "主播未开播" : "加载失败"}</div>
+                    <div style={{ fontSize: 14, fontWeight: 800, marginBottom: 10 }}>{isOfflineError ? "主播未开播" : "加载失败（正在自动重试）"}</div>
                     <div style={{ color: "var(--secondary-text)", fontWeight: 600, whiteSpace: "pre-wrap" }}>{streamError}</div>
                     <div style={{ display: "flex", gap: 10, marginTop: 14, justifyContent: "flex-start" }}>
                       <button className="retry-btn" onClick={() => void reloadStream("refresh")}>

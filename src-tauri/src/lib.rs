@@ -157,8 +157,9 @@ async fn set_stream_url_cmd(
 ) -> Result<(), String> {
     eprintln!("[store] set_stream_url_cmd url={} platform={:?}", url, platform);
     *state.url.lock().unwrap() = url;
-    state.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    crate::proxy::reset_pump_header();
+    // Single entry point for "the source changed": bumps the generation so the
+    // pump switches immediately, stamps the sign time and invalidates the primer.
+    crate::proxy::commit_new_source(&state);
     *state.platform.lock().unwrap() = platform;
     *state.room_id.lock().unwrap() = room_id;
     *state.quality.lock().unwrap() = quality;

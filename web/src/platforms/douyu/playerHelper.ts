@@ -9,7 +9,8 @@ export async function getDouyuStreamConfig(
 ): Promise<{ streamUrl: string, streamType: string | undefined }> {
   let finalStreamUrl: string | null = null;
   let streamType: string | undefined = undefined;
-  const MAX_STREAM_FETCH_ATTEMPTS = 2;
+  const MAX_STREAM_FETCH_ATTEMPTS = 3;
+  let offlineHits = 0;
 
   for (let attempt = 1; attempt <= MAX_STREAM_FETCH_ATTEMPTS; attempt++) {
     try {
@@ -27,28 +28,36 @@ export async function getDouyuStreamConfig(
         throw new Error('斗鱼直播流地址获取为空。');
       }
     } catch (e: any) {
-      console.error(`[DouyuPlayerHelper] 获取斗鱼直播流失败 (尝试 ${attempt}/${MAX_STREAM_FETCH_ATTEMPTS}):`, e.message);
-      const offlineOrInvalidRoomMessages = [
-        '主播未开播',
-        '房间不存在',
-        'error: 1',
-        'error: 102',
-        'error code 1',
-        'error code 102',
-      ];
+      // Tauri rejects a failed command with the Rust Err(String) payload itself,
+      // so `e` is usually a plain string -- `e.message` would be undefined and
+      // the real cause (and offline detection) silently lost.
+      const raw = typeof e === 'string' ? e : (e?.message ? String(e.message) : String(e ?? ''));
+      console.error(`[DouyuPlayerHelper] 获取斗鱼直播流失败 (尝试 ${attempt}/${MAX_STREAM_FETCH_ATTEMPTS}):`, raw);
 
-      const errorMessageLowerCase = e.message?.toLowerCase() || '';
-      const isDefinitivelyOffline = offlineOrInvalidRoomMessages.some(msg => errorMessageLowerCase.includes(msg.toLowerCase()));
+      const lower = raw.toLowerCase();
+      // Exact code matches only: a loose "error: 1" prefix also matches codes
+      // like 10/12/123 and mislabels transient API failures as offline.
+      const exactOfflinePatterns = [/error:\s*1(?![0-9])/, /error:\s*102(?![0-9])/, /error\s+code\s*1(?![0-9])/, /error\s+code\s*102(?![0-9])/];
+      const isDefinitivelyOffline =
+        lower.includes('主播未开播') || lower.includes('房间不存在') ||
+        exactOfflinePatterns.some((re) => re.test(lower));
 
       if (isDefinitivelyOffline) {
-        console.warn(`[DouyuPlayerHelper] Streamer for room ${roomId} is definitively offline or room is invalid. Aborting retries.`);
-        throw e;
+        offlineHits += 1;
+        // betard/接口偶发误报未开播：再确认一次后才当真，避免把在线房间
+        // 弹成“主播未开播”逼用户手动刷新。
+        if (offlineHits >= 2 || attempt >= MAX_STREAM_FETCH_ATTEMPTS) {
+          console.warn(`[DouyuPlayerHelper] Streamer for room ${roomId} confirmed offline (${offlineHits} hit(s)).`);
+          throw new Error(raw.includes('主播未开播') || raw.includes('房间不存在') ? raw : '主播未开播');
+        }
+        await new Promise(resolve => setTimeout(resolve, 800));
+        continue;
       }
 
-      if (attempt === MAX_STREAM_FETCH_ATTEMPTS) {
-        throw new Error(`获取斗鱼直播流失败 (尝试 ${MAX_STREAM_FETCH_ATTEMPTS} 次后): ${e.message}`);
+      if (attempt >= MAX_STREAM_FETCH_ATTEMPTS) {
+        throw new Error(`获取斗鱼直播流失败 (尝试 ${MAX_STREAM_FETCH_ATTEMPTS} 次后): ${raw}`);
       }
-      await new Promise(resolve => setTimeout(resolve, 1000 * attempt)); 
+      await new Promise(resolve => setTimeout(resolve, 800 * attempt)); 
     }
   }
 
@@ -68,7 +77,7 @@ export async function getDouyuStreamConfig(
     douyuProxyActive = true;
     return { streamUrl: proxyUrl, streamType };
   } catch (e: any) {
-    throw new Error(`设置斗鱼代理失败: ${e.message}`);
+    throw new Error(`设置斗鱼代理失败: ${typeof e === 'string' ? e : (e?.message ?? String(e ?? ''))}`);
   }
 }
 

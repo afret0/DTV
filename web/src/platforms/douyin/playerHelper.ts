@@ -55,7 +55,10 @@ export async function fetchAndPrepareDouyinStreamConfig(roomId: string, quality:
       const errorMsg = (result.error_message || '').trim();
       if (errorMsg) {
         console.error(`[DouyinPlayerHelper] Error from backend for room ${roomId}: ${errorMsg}`);
-        const definitelyOffline = errorMsg.includes('未开播') || errorMsg.includes('不存在') || result.status !== 2;
+        // Only an explicit offline phrase is definitive. A non-2 status on its
+        // own is often douyin rate-limiting/anti-crawl noise for a live room,
+        // so it must stay retryable instead of popping "主播未开播".
+        const definitelyOffline = errorMsg.includes('未开播') || errorMsg.includes('不存在');
         if (definitelyOffline || attempt >= MAX_ATTEMPTS) {
           return {
             streamUrl: null,
@@ -76,8 +79,13 @@ export async function fetchAndPrepareDouyinStreamConfig(roomId: string, quality:
       const streamAvailable = result.status === 2 && !!result.stream_url;
       const rawStreamUrl = result.stream_url ?? null;
 
-      // 未开播：不重试
+      // status != 2：可能是真离线，也可能是接口风控/限流的瞬时结果。
+      // 先重试一次，仍非 2 才判定未开播，避免"看着在线却弹未开播"。
       if (result.status !== 2) {
+        if (attempt < MAX_ATTEMPTS) {
+          await new Promise((resolve) => setTimeout(resolve, 700));
+          continue;
+        }
         return {
           streamUrl: null,
           streamType: undefined,

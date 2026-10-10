@@ -49,39 +49,6 @@ fn build_upstream_request(client: &Client, url: &str) -> reqwest::RequestBuilder
 
 /// Keeps the Douyu signed URL in the store fresh (signatures expire in ~300s),
 /// so reconnects after a CDN cut always use a valid URL.
-static REFRESHER_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-fn spawn_url_refresher(store: StreamUrlStore) {
-    if REFRESHER_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        return;
-    }
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("refresher runtime");
-        rt.block_on(async move {
-        loop {
-            tokio::time::sleep(Duration::from_secs(200)).await;
-            if store.platform.lock().unwrap().as_deref() != Some("douyu") {
-                continue;
-            }
-            let room = store.room_id.lock().unwrap().clone();
-            let quality = store.quality.lock().unwrap().clone();
-            let line = store.line.lock().unwrap().clone();
-            if let (Some(room), Some(quality)) = (room, quality) {
-                match crate::platforms::douyu::get_stream_url_with_quality(&room, &quality, line.as_deref()).await {
-                    Ok(fresh) => {
-                        println!("[proxy] refresher: renewed Douyu URL for room {}", room);
-                        *store.url.lock().unwrap() = fresh;
-                    }
-                    Err(e) => eprintln!("[proxy] refresher: renew failed: {}", e),
-                }
-            }
-        }
-        });
-    });
-}
 
 // ---------------------------------------------------------------------------
 // Single shared upstream pump. Douyu/Huya CDNs allow only ONE connection per
@@ -456,10 +423,56 @@ async fn refresh_store_url(
                         }
                         println!("[proxy] refreshed Douyu URL for room {}", room);
                         *store.url.lock().unwrap() = fresh;
+                        note_store_sign_now();
                         true
                     }
                     Err(e) => {
                         eprintln!("[proxy] Douyu refresh failed: {}", e);
+                        false
+                    }
+                }
+            } else {
+                false
+            }
+        }
+        Some("bilibili") => {
+            let room = store.room_id.lock().unwrap().clone();
+            let quality = store.quality.lock().unwrap().clone();
+            if let Some(room) = room {
+                // proxy_ctx=None: pure playurl refresh, no store writes inside.
+                match crate::platforms::bilibili::stream_url::fetch_bilibili_stream_core(
+                    room.clone(),
+                    quality.unwrap_or_else(|| "原画".to_string()),
+                    None,
+                    None,
+                )
+                .await
+                {
+                    Ok(info) => {
+                        let fresh = info
+                            .upstream_url
+                            .clone()
+                            .or(info.stream_url.clone())
+                            .filter(|u| !u.contains(":34719/"));
+                        match fresh {
+                            Some(url) => {
+                                if stale() {
+                                    println!("[proxy] dropped stale Bilibili refresh for room {}", room);
+                                    return false;
+                                }
+                                println!("[proxy] refreshed Bilibili URL for room {}", room);
+                                *store.url.lock().unwrap() = url;
+                                note_store_sign_now();
+                                true
+                            }
+                            None => {
+                                eprintln!("[proxy] Bilibili refresh produced no upstream url");
+                                false
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[proxy] Bilibili refresh failed: {}", e);
                         false
                     }
                 }
@@ -485,6 +498,7 @@ async fn refresh_store_url(
                         }
                         println!("[proxy] refreshed Huya URL for room {}", room);
                         *store.url.lock().unwrap() = fresh;
+                        note_store_sign_now();
                         true
                     }
                     Err(e) => {
@@ -498,6 +512,23 @@ async fn refresh_store_url(
         }
         _ => false,
     }
+}
+
+/// Commit a freshly written stream source (url/platform/room already set on the
+/// store) so the running pump switches over IMMEDIATELY: bump the generation
+/// (pump breaks out of the old upstream session, attached clients re-attach to
+/// the new one), stamp the sign time and invalidate the primer.
+///
+/// Every store-URL writer MUST call this. Skipping it (as the bilibili path
+/// once did) leaves the pump streaming the PREVIOUS platform until a natural
+/// EOF (~5 min for Douyu): switching platforms appeared to "take forever" and,
+/// when the switch finally happened mid-session, the FLV header and codec
+/// sequence headers were dropped as "duplicates" -> players showed 解码错误
+/// until refreshed.
+pub fn commit_new_source(store: &StreamUrlStore) {
+    store.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    note_store_sign_now();
+    reset_pump_header();
 }
 
 /// Called when the stream source changes (room/quality/platform switch) so no
@@ -704,23 +735,69 @@ fn ensure_pump(store: StreamUrlStore) {
                 continue;
             }
             attempts += 1;
-            // Only re-sign when the URL is actually unusable: Douyu invalidates
-            // the previous signature as soon as a new one is issued, so
-            // refreshing on every reconnect would kill our own new connection.
             let lived = connected_at.elapsed();
-            // The connection ended (EOF) or was rejected: the signature is
-            // consumed/invalid, always fetch a fresh one before reconnecting.
-            println!(
-                "[proxy] pump #{} re-signing upstream (rejected={} lived={:?} cancelled={})",
-                pump_id, rejected, lived, p.cancelled.load(Ordering::SeqCst)
-            );
-            refresh_store_url(&store, gen_at_connect, &p.cancelled).await;
-            tokio::time::sleep(Duration::from_millis(1200)).await;
+            // Douyu signatures stay valid ~300s from ISSUE time and a cut
+            // session does not burn the URL. If the store already holds a
+            // recently signed URL (the frontend just loaded the room, or the
+            // cut happened well before the signature expired), reconnect with
+            // it directly: no extra signing
+            // latency for viewers, no extra throttle risk. Re-sign only when the
+            // stored URL is old or the CDN actively rejected it.
+            let age = sign_age_ms();
+            let natural_expiry = lived >= Duration::from_secs(240);
+            if rejected || natural_expiry || age >= 240_000 {
+                println!(
+                    "[proxy] pump #{} re-signing upstream (rejected={} lived={:?} url_age_ms={})",
+                    pump_id, rejected, lived, age
+                );
+                refresh_store_url(&store, gen_at_connect, &p.cancelled).await;
+            } else {
+                println!(
+                    "[proxy] pump #{} reconnecting with fresh stored URL (age={}ms lived={:?})",
+                    pump_id, age, lived
+                );
+            }
+            // Healthy long session ending (normal expiry): reconnect fast so the
+            // stall stays short. Repeated quick failures: back off instead of
+            // hammering the CDN and the signing API.
+            let backoff_ms = if lived >= Duration::from_secs(60) {
+                300
+            } else {
+                (1200u64 * attempts as u64).min(10_000)
+            };
+            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
         }
     });
 }
 
 pub static CLIENT_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Epoch-ms when the store URL was last signed (by the frontend or the pump's
+/// re-sign). Douyu signatures live ~300s; knowing
+/// the age lets the pump reuse a still-fresh URL on EOF instead of issuing yet
+/// another sign request at the worst moment (extra latency for viewers and
+/// extra throttle risk from hammering betard/h5enc/playUrl).
+static LAST_SIGN_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn note_store_sign_now() {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    LAST_SIGN_MS.store(ms, Ordering::SeqCst);
+}
+
+fn sign_age_ms() -> u64 {
+    let last = LAST_SIGN_MS.load(Ordering::SeqCst);
+    if last == 0 {
+        return u64::MAX;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    now.saturating_sub(last)
+}
 
 struct ClientStream {
     inner: tokio_stream::wrappers::BroadcastStream<(u64, u64, bytes::Bytes)>,
@@ -915,8 +992,6 @@ pub async fn start_proxy_inner(
     if current_stream_url.is_empty() {
         return Err("Stream URL is not set in store. Cannot start proxy.".to_string());
     }
-
-    spawn_url_refresher(stream_url_store.clone());
 
     let stream_url_data_for_actix = web::Data::new(stream_url_store.clone());
 
@@ -1459,6 +1534,74 @@ mod tests {
         println!("[primer] late client got {} bytes, {} validated as continuous FLV", late.len(), ok);
     }
 
+    /// Bilibili-style source swap: the platform code writes the store directly
+    /// (no set_stream_url_cmd) and must call commit_new_source; without the
+    /// generation bump the pump would keep streaming the PREVIOUS platform until
+    /// its natural EOF (~5 min) and then drop the new FLV header as a
+    /// "duplicate" -> players showed 解码错误. The mock CDNs never EOF, so only
+    /// an immediate, correct switch can pass.
+    #[actix_web::test]
+    async fn direct_store_write_with_commit_switches_pump_immediately() {
+        let cdn_a = mock_cdn_tagged(0xA1).await;
+        let cdn_b = mock_cdn_tagged(0xB2).await;
+        let port = 39936;
+        let store = StreamUrlStore::default();
+        *store.url.lock().unwrap() = format!("http://127.0.0.1:{}/live.flv", cdn_a);
+        *store.platform.lock().unwrap() = Some("douyu".into());
+        let gen_before = store.generation.load(Ordering::SeqCst);
+
+        let srv = build_test_proxy(store.clone(), port);
+        actix_web::rt::spawn(srv);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let client = Client::builder().no_proxy().build().unwrap();
+        // Read from source A.
+        let ra = client.get(format!("http://127.0.0.1:{}/live.flv", port)).send().await.unwrap();
+        let mut sa = ra.bytes_stream();
+        let mut got_a = Vec::new();
+        let dl = tokio::time::Instant::now() + Duration::from_secs(6);
+        while got_a.len() < 40_000 && tokio::time::Instant::now() < dl {
+            match tokio::time::timeout(Duration::from_millis(600), sa.next()).await {
+                Ok(Some(Ok(b))) => got_a.extend_from_slice(&b),
+                _ => break,
+            }
+        }
+        assert!(got_a.contains(&0xA1), "source A payload missing");
+        assert!(!got_a.contains(&0xB2), "source B leaked into A");
+
+        // Bilibili path: direct store write + commit_new_source.
+        *store.url.lock().unwrap() = format!("http://127.0.0.1:{}/live.flv", cdn_b);
+        *store.platform.lock().unwrap() = Some("bilibili".into());
+        commit_new_source(&store);
+        assert_eq!(
+            store.generation.load(Ordering::SeqCst),
+            gen_before + 1,
+            "commit_new_source must bump the generation"
+        );
+
+        // A brand-new client must land on B (with a proper FLV start) quickly.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut got_b = Vec::new();
+        while tokio::time::Instant::now() < deadline {
+            let rb = client.get(format!("http://127.0.0.1:{}/live.flv", port)).send().await.unwrap();
+            let mut sb = rb.bytes_stream();
+            got_b.clear();
+            let dl2 = tokio::time::Instant::now() + Duration::from_secs(4);
+            while got_b.len() < 40_000 && tokio::time::Instant::now() < dl2 {
+                match tokio::time::timeout(Duration::from_millis(500), sb.next()).await {
+                    Ok(Some(Ok(b))) => got_b.extend_from_slice(&b),
+                    _ => break,
+                }
+            }
+            if got_b.contains(&0xB2) { break; }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        assert!(got_b.starts_with(b"FLV"), "source B client must start with an FLV header");
+        assert!(got_b.contains(&0xB2), "pump did not switch to the new source within 10s");
+        assert!(!got_b.contains(&0xA1), "old source payload leaked after switch");
+        println!("[switch-direct] A->B via commit_new_source ok ({} bytes)", got_b.len());
+    }
+
     /// The exact production failure this guards: a signed URL expires (~every
     /// 300s for Douyu), the CDN drops the connection mid-FLV-tag, and the pump
     /// re-signs and reconnects to a *fresh* session that does not necessarily
@@ -1850,10 +1993,11 @@ mod live_tests {
         *store.platform.lock().unwrap() = Some("douyu".into());
         *store.room_id.lock().unwrap() = Some(room.clone());
         *store.quality.lock().unwrap() = Some(quality);
-        let server_handle = Arc::new(StdMutex::new(None));
-        let local_url = start_proxy_inner(server_handle.clone(), store.clone())
-            .await
-            .expect("proxy start");
+        // Dedicated test port: 34719 belongs to the real app instance, which may
+        // be running while this test executes.
+        const LONGRUN_PORT: u16 = 39935;
+        super::tests::spawn_test_server(store.clone(), LONGRUN_PORT).await;
+        let local_url = format!("http://127.0.0.1:{}/live.flv", LONGRUN_PORT);
         println!("[longrun] proxy ready at {}", local_url);
 
         let client = Client::builder()
@@ -2307,6 +2451,105 @@ mod live_cast_tv {
 mod live_switch_tests {
     use super::*;
     use super::tests::spawn_test_server;
+
+    /// Live reproduction of the reported bilibili symptom: while a Douyu stream
+    /// is playing, switch to bilibili exactly like the app does
+    /// (fetch_bilibili_stream_core with proxy ctx). The pump MUST switch source
+    /// within seconds (a commit_new_source generation bump), and the new client
+    /// MUST start from a real FLV header -- before the fix the pump kept
+    /// streaming Douyu until its natural ~300s EOF and then dropped the
+    /// bilibili header as a "duplicate", producing 解码错误 panels.
+    ///
+    /// Lenient skip when the bilibili test room happens to be offline.
+    /// Room override: DTV_TEST_BILI_ROOM.
+    #[actix_web::test]
+    #[ignore]
+    async fn live_douyu_to_bilibili_switch_is_immediate() {
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        // 1) Douyu playing through the proxy.
+        let douyu_url = crate::platforms::douyu::get_stream_url("9999", None)
+            .await
+            .expect("douyu url");
+        let store = StreamUrlStore::default();
+        *store.url.lock().unwrap() = douyu_url;
+        *store.platform.lock().unwrap() = Some("douyu".into());
+        *store.room_id.lock().unwrap() = Some("9999".into());
+        *store.quality.lock().unwrap() = Some("原画".into());
+        store.generation.fetch_add(1, Ordering::SeqCst);
+        reset_pump_header();
+        spawn_test_server(store.clone(), 39937).await;
+
+        let client = Client::builder().no_proxy().build().unwrap();
+        let ra = client.get("http://127.0.0.1:39937/live.flv").send().await.expect("get douyu");
+        let mut sa = ra.bytes_stream();
+        let mut head = Vec::new();
+        let dl = tokio::time::Instant::now() + Duration::from_secs(10);
+        while head.len() < 100_000 && tokio::time::Instant::now() < dl {
+            match tokio::time::timeout(Duration::from_millis(600), sa.next()).await {
+                Ok(Some(Ok(b))) => head.extend_from_slice(&b),
+                _ => break,
+            }
+        }
+        assert!(head.starts_with(b"FLV") && head.len() >= 100_000,
+            "douyu baseline playback failed ({} bytes)", head.len());
+        println!("[bili-switch] douyu baseline flowing ({} bytes)", head.len());
+
+        // 2) Switch to bilibili exactly like the frontend/Rust command does.
+        let bili_room = std::env::var("DTV_TEST_BILI_ROOM").unwrap_or_else(|_| "3860590".to_string());
+        let gen_before = store.generation.load(Ordering::SeqCst);
+        let ctx = crate::platforms::bilibili::stream_url::BiliProxyCtx {
+            store: store.clone(),
+            proxy_handle: Arc::new(StdMutex::new(None)),
+        };
+        let started = std::time::Instant::now();
+        let info = crate::platforms::bilibili::stream_url::fetch_bilibili_stream_core(
+            bili_room.clone(),
+            "原画".to_string(),
+            None,
+            Some(ctx),
+        )
+        .await
+        .expect("bilibili core");
+        if info.status != Some(1) || info.stream_url.is_none() {
+            println!("[bili-switch] SKIP: room {} not live/usable now ({:?} {:?})",
+                bili_room, info.status, info.error_message);
+            return;
+        }
+        let proxy_url = info.stream_url.clone().unwrap();
+        println!("[bili-switch] switched to {} in {:.1}s", proxy_url, started.elapsed().as_secs_f32());
+
+        assert_eq!(store.generation.load(Ordering::SeqCst), gen_before + 1,
+            "bilibili path must bump the generation (commit_new_source)");
+        let up = store.url.lock().unwrap().clone();
+        assert!(up.contains("bilivideo") || up.contains("hdslb") || up.contains("bili"),
+            "store should hold a bilibili upstream, got: {}", &up[..up.len().min(80)]);
+
+        // 3) The new client must get a real FLV header + bilibili data FAST.
+        let mut got = Vec::new();
+        let switch_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let rb = client.get(&proxy_url).send().await.expect("get bili proxy");
+        let mut sb = rb.bytes_stream();
+        while got.len() < 300_000 && tokio::time::Instant::now() < switch_deadline {
+            match tokio::time::timeout(Duration::from_millis(700), sb.next()).await {
+                Ok(Some(Ok(b))) => got.extend_from_slice(&b),
+                Ok(Some(Err(e))) => panic!("bili proxy stream error: {:#}", e),
+                Ok(None) => break,
+                Err(_) => {
+                    if got.len() > 0 { break; }
+                    continue;
+                }
+            }
+        }
+        let elapsed = started.elapsed().as_secs_f32();
+        println!("[bili-switch] client got {} bytes in {:.1}s after switch", got.len(), elapsed);
+        assert!(got.starts_with(b"FLV"),
+            "bilibili client MUST receive the FLV header (not be treated as duplicate): first bytes = {:?}",
+            &got[..got.len().min(8)]);
+        assert!(got.len() >= 200_000, "bilibili stream not flowing ({} bytes)", got.len());
+        assert!(elapsed < 60.0, "switch took too long: {:.1}s", elapsed);
+        println!("[bili-switch] PASS: douyu->bilibili immediate switch with intact FLV header");
+    }
 
     /// Reproduces the frontend's exact room-switch sequence against TWO LIVE
     /// Douyu rooms: play A via proxy -> stop_proxy -> set B (+gen/reset) ->

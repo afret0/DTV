@@ -13,19 +13,16 @@ function report() {
       const r = b.getBoundingClientRect();
       return { name: (b.textContent || "").trim(), x: r.x + r.width / 2, y: r.y + r.height / 2 };
     });
-    // RectReporter's job is to hand a synthetic-click harness real coordinates
-    // for the MAIN room grid, not for the sidebar's small list items (which
-    // also match a generic `[role="button"]` query). Match live-room cards by
-    // the same viewer-count text the desktop AX path uses, and require card-like
-    // dimensions.
-    const cards = Array.from(document.querySelectorAll('[role="button"], button, div'))
+    // Hand a synthetic-click harness real coordinates for the MAIN room grid.
+    // Structural filter (size + below the tab bar) instead of viewer-count
+    // text: the mobile layout uses compact cards without "观看人数" labels,
+    // while desktop sidebar rows are 41-48px tall and get excluded by height.
+    const cards = Array.from(document.querySelectorAll('[role="button"]'))
       .filter((el) => {
         const r = (el as HTMLElement).getBoundingClientRect();
-        if (r.width < 60 || r.height < 60) return false;
-        const t = (el.textContent || "");
-        return /观看人数|人气|在线人数|人正在看/.test(t);
+        return r.width >= 100 && r.width <= 520 && r.height >= 80 && r.height <= 520 && r.y >= 60;
       })
-      .slice(0, 4);
+      .slice(0, 6);
     out.cards = cards.map((c, i) => {
       const r = (c as HTMLElement).getBoundingClientRect();
       return { i, x: r.x + r.width / 2, y: r.y + r.height / 2, w: r.width, h: r.height };

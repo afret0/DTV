@@ -31,7 +31,13 @@ export async function getHuyaStreamConfig(
 
       if (result && result.flv_tx_urls && Array.isArray(result.flv_tx_urls)) {
         const upstreamStreamUrl = pickHuyaUrlByQuality(result.flv_tx_urls, quality) || result.flv_tx_urls[0]?.url;
-        if (!upstreamStreamUrl) throw new Error('主播未开播或无法获取直播流');
+        if (!upstreamStreamUrl) {
+          // Rust returns empty urls both for "room profile loaded but offline"
+          // (title/nick present) and for a failed/anti-crawled profile request
+          // (nothing present). Only the former is a real offline state.
+          const roomDetailLoaded = !!(result?.title || result?.nick || result?.avatar);
+          throw new Error(roomDetailLoaded ? '主播未开播' : '获取虎牙房间详情失败(EMPTY_RESULT)');
+        }
 
         const sanitizedUpstream = enforceHttps(upstreamStreamUrl);
         const streamType = inferStreamType(sanitizedUpstream);
@@ -60,32 +66,33 @@ export async function getHuyaStreamConfig(
         };
       }
 
-      // 数据异常或为空，一般意味着未开播或房间详情获取失败
-      throw new Error('主播未开播或获取虎牙房间详情失败');
+      // result 结构异常：既可能是房间离线，也可能只是接口瞬时失败，
+      // 交给 catch 走重试，用中性文案（不含"未开播"）避免被当成离线终态。
+      throw new Error('获取虎牙房间详情失败(EMPTY_RESULT)');
     } catch (error: any) {
-      const msg = (error?.message || '').trim();
-      const looksOffline = msg.includes('未开播') || msg.includes('房间') || msg.includes('不存在');
-
-      // 未开播属于正常业务分支：避免刷 error 日志
-      if (looksOffline) {
-        logger.debug(`[HuyaPlayerHelper] getHuyaStreamConfig offline (attempt ${attempt}/${MAX_ATTEMPTS}): ${msg || 'offline'}`);
-      } else {
-        logger.error(`[HuyaPlayerHelper] getHuyaStreamConfig error (attempt ${attempt}/${MAX_ATTEMPTS}):`, error);
-      }
+      // Tauri invoke 失败时 reject 的是 Rust 的 Err(String) 字符串本身，
+      // error.message 是 undefined —— 直接读字符串才能拿到真实原因。
+      const msg = (typeof error === 'string' ? error : (error?.message ? String(error.message) : String(error ?? ''))).trim();
+      // 只有明确的离线信号才算未开播；"房间"二字太宽泛（如"获取房间详情失败"）会误判。
+      const looksOffline = msg.includes('未开播') || msg.includes('房间不存在');
 
       if (looksOffline) {
-        throw new Error(msg.includes('未开播') ? msg : '主播未开播或无法获取直播流');
+        logger.debug(`[HuyaPlayerHelper] getHuyaStreamConfig offline (attempt ${attempt}/${MAX_ATTEMPTS}): ${msg}`);
+        throw new Error(msg.includes('未开播') ? msg : '主播未开播');
       }
+
+      logger.error(`[HuyaPlayerHelper] getHuyaStreamConfig error (attempt ${attempt}/${MAX_ATTEMPTS}): ${msg}`);
 
       if (attempt >= MAX_ATTEMPTS) {
-        throw new Error('主播未开播或无法获取直播流');
+        // 瞬时失败：文案不能带"未开播"，否则前端会展示离线面板且不再自动重试。
+        throw new Error(`获取虎牙直播流失败（网络或服务端繁忙）: ${msg.slice(0, 120)}`);
       }
 
-      await new Promise((resolve) => setTimeout(resolve, 450));
+      await new Promise((resolve) => setTimeout(resolve, 600 * attempt));
     }
   }
 
-  throw new Error('主播未开播或无法获取直播流');
+  throw new Error('获取虎牙直播流失败（网络或服务端繁忙）');
 }
 
 export async function stopHuyaProxy(): Promise<void> {

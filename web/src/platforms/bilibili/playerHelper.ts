@@ -29,13 +29,15 @@ export async function getBilibiliStreamConfig(
       });
       result = fetched;
 
-      // 若后端返回错误，统一按“未开播”处理（除非明确包含未开播字样）
+      // 后端返回错误：只有明确写了"未开播"才算离线；其余（风控 -352、
+      // cookie 失效、网络抖动等）是可重试的瞬时失败，文案不能带"未开播"，
+      // 否则前端会停止自动重试并把在线房间展示成离线。
       if (result.error_message) {
         const msg = result.error_message.trim();
         if (msg.includes('未开播')) {
           throw new Error(msg);
         }
-        throw new Error('主播未开播或无法获取直播流');
+        throw new Error(`BILIBILI_TRANSIENT:${msg.slice(0, 160)}`);
       }
 
       // 根据返回的状态判断是否在线（B 站约定 status === 1 为在线）
@@ -43,27 +45,29 @@ export async function getBilibiliStreamConfig(
         throw new Error('主播未开播');
       }
 
-      // 无播放地址也按未开播处理
+      // status 显示在线却没有播放地址：视为瞬时失败重试
       if (!result.stream_url) {
-        throw new Error('主播未开播或无法获取直播流');
+        throw new Error('BILIBILI_TRANSIENT:直播流地址为空');
       }
 
       break;
     } catch (e: any) {
-      const msg = (e?.message || '').trim();
-      const looksOffline = msg.includes('未开播') || msg.includes('房间不存在') || msg.includes('不存在');
+      // Tauri invoke 失败时 reject 的是字符串本身，e.message 为 undefined
+      const msg = (typeof e === 'string' ? e : (e?.message ? String(e.message) : String(e ?? ''))).trim();
+      const looksOffline = msg.includes('未开播') || msg.includes('房间不存在');
       if (looksOffline) {
-        throw new Error(msg || '主播未开播或无法获取直播流');
+        throw new Error(msg || '主播未开播');
       }
       if (attempt >= MAX_ATTEMPTS) {
-        throw new Error(msg || '主播未开播或无法获取直播流');
+        const detail = msg.startsWith('BILIBILI_TRANSIENT:') ? msg.slice('BILIBILI_TRANSIENT:'.length) : msg;
+        throw new Error(`获取B站直播流失败（网络或服务端繁忙）${detail ? ': ' + detail.slice(0, 120) : ''}`);
       }
-      await new Promise((resolve) => setTimeout(resolve, 450));
+      await new Promise((resolve) => setTimeout(resolve, 600 * attempt));
     }
   }
 
   if (!result) {
-    throw new Error('主播未开播或无法获取直播流');
+    throw new Error('获取B站直播流失败（网络或服务端繁忙）');
   }
 
   // 调试输出：真实上游地址与所有可用地址
@@ -80,7 +84,7 @@ export async function getBilibiliStreamConfig(
 
   const streamUrl = result.stream_url;
   if (!streamUrl) {
-    throw new Error('主播未开播或无法获取直播流');
+    throw new Error('获取B站直播流失败（网络或服务端繁忙）');
   }
 
   let streamType: string | undefined;

@@ -499,6 +499,11 @@ pub async fn fetch_bilibili_stream_core(
                     *ctx.store.platform.lock().unwrap() = Some("bilibili".into());
                     *ctx.store.room_id.lock().unwrap() = Some(room_id.clone());
                     *ctx.store.quality.lock().unwrap() = Some(quality.clone());
+                    // MUST commit like set_stream_url_cmd does: without the
+                    // generation bump the pump keeps streaming the previous
+                    // platform (slow switch) and, when it finally reconnects,
+                    // treats the new FLV header as a duplicate -> 解码错误.
+                    crate::proxy::commit_new_source(&ctx.store);
                     match crate::proxy::start_proxy_inner(ctx.proxy_handle.clone(), ctx.store.clone()).await {
                         Ok(proxy) => Some(proxy),
                         Err(e) => {
@@ -538,6 +543,8 @@ pub async fn fetch_bilibili_stream_core(
                     eprintln!("[Bilibili] Stopped existing FLV proxy before using HLS stream");
                 }
                 *ctx.store.url.lock().unwrap() = String::new();
+                // Detach the pump from any previous upstream right away.
+                crate::proxy::commit_new_source(&ctx.store);
             }
 
             Ok(crate::platforms::common::LiveStreamInfo {
