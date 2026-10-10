@@ -1,5 +1,6 @@
 // App library: shared by desktop binary and mobile entry point.
 mod logging;
+pub mod telemetry;
 mod cast;
 mod config_transfer;
 mod dlna;
@@ -50,9 +51,18 @@ pub struct StreamUrlStore {
 #[derive(Default, Clone)]
 pub struct DouyuDanmakuHandles(Arc<Mutex<Option<oneshot::Sender<()>>>>);
 
+/// Signed CDN URLs are long and full of one-shot secrets; keep the log readable
+/// by truncating them (the host + first path segment is what identifies a line).
+fn truncate_url(u: &str) -> String {
+    if u.len() <= 110 {
+        return u.to_string();
+    }
+    format!("{}…(len={})", &u[..107], u.len())
+}
+
 #[tauri::command]
 async fn frontend_log(msg: String) -> Result<(), String> {
-    eprintln!("[frontend] {}", msg);
+    crate::telemetry::record("web", &msg);
     Ok(())
 }
 
@@ -156,7 +166,15 @@ async fn set_stream_url_cmd(
     line: Option<String>,
     state: tauri::State<'_, StreamUrlStore>,
 ) -> Result<(), String> {
-    eprintln!("[store] set_stream_url_cmd url={} platform={:?}", url, platform);
+    crate::tl!(
+        "store",
+        "set_stream_url_cmd platform={:?} room={:?} quality={:?} line={:?} url={}",
+        platform,
+        room_id,
+        quality,
+        line,
+        truncate_url(&url)
+    );
     *state.url.lock().unwrap() = url;
     // Single entry point for "the source changed": bumps the generation so the
     // pump switches immediately, stamps the sign time and invalidates the primer.
@@ -256,6 +274,10 @@ fn open_in_default_browser(app: tauri::AppHandle, url: String) -> Result<(), Str
 // Main function corrected
 pub fn run_app() {
     logging::init();
+    // Always on: the GUI app's stdout is discarded when launched by double
+    // click, and field failures ("看着看着就停了") can only be diagnosed from a
+    // persisted log the user can send back.
+    telemetry::init_session(env!("CARGO_PKG_VERSION"));
     panic::set_hook(Box::new(|info| {
         eprintln!("[panic] {}", info);
     }));

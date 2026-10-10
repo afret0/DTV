@@ -57,7 +57,7 @@ async fn discover_ssdp(local_ip: Ipv4Addr) -> Vec<DlnaDevice> {
     let socket = match UdpSocket::bind(bind_addr).await {
         Ok(s) => s,
         Err(e) => {
-            println!("[DLNA] ssdp bind {} failed: {}", bind_addr, e);
+            crate::tl!("dlna", "[DLNA] ssdp bind {} failed: {}", bind_addr, e);
             return vec![];
         }
     };
@@ -66,7 +66,7 @@ async fn discover_ssdp(local_ip: Ipv4Addr) -> Vec<DlnaDevice> {
     // Join so renderers that answer via multicast are received too; binding to
     // the interface address already selects it as the egress interface.
     if let Err(e) = socket.join_multicast_v4(SSDP_MULTICAST_IP, local_ip) {
-        println!("[DLNA] join_multicast_v4 on {} failed: {}", local_ip, e);
+        crate::tl!("dlna", "[DLNA] join_multicast_v4 on {} failed: {}", local_ip, e);
     }
 
     let mcast = SocketAddr::V4(SocketAddrV4::new(SSDP_MULTICAST_IP, SSDP_PORT));
@@ -75,12 +75,12 @@ async fn discover_ssdp(local_ip: Ipv4Addr) -> Vec<DlnaDevice> {
     for st in SSDP_SEARCH_TARGETS {
         let msg = ssdp_discover_msg(st);
         if let Err(e) = socket.send_to(msg.as_bytes(), mcast).await {
-            println!("[DLNA] ssdp multicast send ST={} from {} failed: {}", st, local_ip, e);
+            crate::tl!("dlna", "[DLNA] ssdp multicast send ST={} from {} failed: {}", st, local_ip, e);
         }
         // Subnet broadcast too: some renderers only listen on broadcast.
         let _ = socket.send_to(msg.as_bytes(), bcast).await;
     }
-    println!("[DLNA] ssdp probe sent from {} (st={:?})", local_ip, SSDP_SEARCH_TARGETS.len());
+    crate::tl!("dlna", "[DLNA] ssdp probe sent from {} (st={:?})", local_ip, SSDP_SEARCH_TARGETS.len());
 
     let mut devices: HashMap<String, DlnaDevice> = HashMap::new();
     let mut buf = vec![0u8; 8192];
@@ -95,18 +95,18 @@ async fn discover_ssdp(local_ip: Ipv4Addr) -> Vec<DlnaDevice> {
                 if !data.contains("200 OK") { continue; }
                 match parse_ssdp_response(&data) {
                     Some(mut dev) => {
-                        println!("[DLNA] ssdp reply from {} -> {} (ST={})", peer.ip(), dev.location, dev.name);
+                        crate::tl!("dlna", "[DLNA] ssdp reply from {} -> {} (ST={})", peer.ip(), dev.location, dev.name);
                         if dev.host.is_empty() { dev.host = peer.ip().to_string(); }
                         devices.entry(dev.location.clone()).or_insert(dev);
                     }
-                    None => println!("[DLNA] ssdp reply from {} without usable LOCATION", peer.ip()),
+                    None => crate::tl!("dlna", "[DLNA] ssdp reply from {} without usable LOCATION", peer.ip()),
                 }
             }
-            Ok(Err(e)) => { println!("[DLNA] ssdp recv error: {}", e); break; }
+            Ok(Err(e)) => { crate::tl!("dlna", "[DLNA] ssdp recv error: {}", e); break; }
             Err(_) => break,
         }
     }
-    println!("[DLNA] ssdp done on {}: {} device(s) in {:.1}s",
+    crate::tl!("dlna", "[DLNA] ssdp done on {}: {} device(s) in {:.1}s",
         local_ip, devices.len(), started.elapsed().as_secs_f32());
     devices.into_values().collect()
 }
@@ -172,7 +172,7 @@ async fn scan_subnet_for_dlna(
                             let Some(xml) = fetch_dlna_description(&client, &desc_url).await else { continue };
                             let Some(cu) = extract_avtransport_url(&xml, &desc_url) else { continue };
                             let nm = extract_device_name(&xml, "DLNA");
-                            println!("[DLNA] scan hit {} -> {}", desc_url, nm);
+                            crate::tl!("dlna", "[DLNA] scan hit {} -> {}", desc_url, nm);
                             return Some(DlnaDevice {
                                 name: nm,
                                 location: desc_url,
@@ -189,13 +189,13 @@ async fn scan_subnet_for_dlna(
             .collect()
             .await;
 
-        println!("[DLNA] scan {}:{}:0/24 ({} ports) done in {:.1}s -> {} hit(s)",
+        crate::tl!("dlna", "[DLNA] scan {}:{}:0/24 ({} ports) done in {:.1}s -> {} hit(s)",
             name, base, ports.len(), started.elapsed().as_secs_f32(), hits.len());
         for d in hits {
             devices.entry(d.location.clone()).or_insert(d);
         }
     }
-    println!("[DLNA] scan total: {} subnet(s), {} device(s)", scanned_subnets, devices.len());
+    crate::tl!("dlna", "[DLNA] scan total: {} subnet(s), {} device(s)", scanned_subnets, devices.len());
     devices.into_values().collect()
 }
 
@@ -245,7 +245,7 @@ fn spawn_background_scan(client: Arc<reqwest::Client>, ifaces: Vec<(String, IpAd
             }
         }
         SCAN_RUNNING.store(false, Ordering::SeqCst);
-        println!("[DLNA] background scan finished, cache={}", cached_renderers().len());
+        crate::tl!("dlna", "[DLNA] background scan finished, cache={}", cached_renderers().len());
     });
 }
 
@@ -263,11 +263,11 @@ async fn resolve_cache(client: &reqwest::Client) {
         let client = client.clone();
         tokio::spawn(async move {
             let Some(xml) = fetch_dlna_description(&client, &dev.location).await else {
-                println!("[DLNA] could not fetch {}", dev.location);
+                crate::tl!("dlna", "[DLNA] could not fetch {}", dev.location);
                 return;
             };
             let Some(cu) = extract_avtransport_url(&xml, &dev.location) else {
-                println!("[DLNA] {} has no AVTransport service (not a renderer)", dev.location);
+                crate::tl!("dlna", "[DLNA] {} has no AVTransport service (not a renderer)", dev.location);
                 return;
             };
             let name = extract_device_name(&xml, &dev.name);
@@ -356,7 +356,7 @@ pub async fn discover_dlna_devices() -> Result<Vec<DlnaDevice>, String> {
             } else { None }
         })
         .collect();
-    println!("[DLNA] discover start: {} iface(s), ipv4={:?}", ifaces.len(), local_ips);
+    crate::tl!("dlna", "[DLNA] discover start: {} iface(s), ipv4={:?}", ifaces.len(), local_ips);
     if local_ips.is_empty() {
         return Err("未检测到可用网络".to_string());
     }
@@ -378,7 +378,7 @@ pub async fn discover_dlna_devices() -> Result<Vec<DlnaDevice>, String> {
     if found.is_empty() {
         // SSDP got nothing (typical for Android without a multicast lock): wait
         // for the sweep instead of returning an empty list immediately.
-        println!("[DLNA] ssdp found nothing, waiting for subnet sweep");
+        crate::tl!("dlna", "[DLNA] ssdp found nothing, waiting for subnet sweep");
         let deadline = std::time::Instant::now() + Duration::from_secs(16);
         while std::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -387,7 +387,7 @@ pub async fn discover_dlna_devices() -> Result<Vec<DlnaDevice>, String> {
             if !found.is_empty() || !SCAN_RUNNING.load(Ordering::SeqCst) { break; }
         }
     }
-    println!("[DLNA] discover returning {} renderer(s) in {:.1}s",
+    crate::tl!("dlna", "[DLNA] discover returning {} renderer(s) in {:.1}s",
         found.len(), started.elapsed().as_secs_f32());
     if found.is_empty() {
         return Err(format!("未发现DLNA设备 (已搜索 {})", local_ips_summary));
@@ -487,7 +487,7 @@ pub async fn push_to_dlna(
     title: Option<String>,
 ) -> Result<(), String> {
     let cast_title = ascii_cast_title(title.as_deref());
-    println!("[DLNA] push location={} stream={} title={:?}", device_location, stream_url, cast_title);
+    crate::tl!("dlna", "[DLNA] push location={} stream={} title={:?}", device_location, stream_url, cast_title);
     // Description fetch is quick, but slow TVs can take several seconds to
     // accept SetAVTransportURI, so use a longer timeout for the SOAP calls.
     let client = http_client().ok_or("无法创建HTTP客户端")?;
@@ -513,7 +513,7 @@ pub async fn push_to_dlna(
             }
         }
     };
-    println!("[DLNA] push desc={} control_url={}", description_url, control_url);
+    crate::tl!("dlna", "[DLNA] push desc={} control_url={}", description_url, control_url);
 
     // Keep real DIDL-Lite metadata: this renderer rejects NOT_IMPLEMENTED.
     let metadata = format!(r#"<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/"><item id="dtv-live" parentID="0" restricted="1"><dc:title>{}</dc:title><upnp:class>object.item.videoItem</upnp:class><res protocolInfo="http-get:*:video/x-flv:*">{}</res></item></DIDL-Lite>"#, html_escape::encode_safe(&cast_title), stream_url);
@@ -535,11 +535,11 @@ pub async fn push_to_dlna(
         tokio::time::sleep(Duration::from_millis(2000)).await;
         match query_transport_state(&soap_client, &control_url).await {
             Some(state) => {
-                println!("[DLNA] transport state after push ({}): {}", attempt, state);
+                crate::tl!("dlna", "[DLNA] transport state after push ({}): {}", attempt, state);
                 last_state = state.clone();
                 if state == "PLAYING" { return Ok(()); }
             }
-            None => println!("[DLNA] transport state query failed (try {})", attempt),
+            None => crate::tl!("dlna", "[DLNA] transport state query failed (try {})", attempt),
         }
         if attempt >= attempts - 4 && (last_state == "STOPPED" || last_state == "NO_MEDIA_PRESENT") {
             return Err(format!(
@@ -548,7 +548,7 @@ pub async fn push_to_dlna(
             ));
         }
     }
-    println!("[DLNA] push sent; renderer did not confirm PLAYING within window");
+    crate::tl!("dlna", "[DLNA] push sent; renderer did not confirm PLAYING within window");
     Ok(())
 }
 

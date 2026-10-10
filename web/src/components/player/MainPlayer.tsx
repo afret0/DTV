@@ -626,6 +626,9 @@ export function MainPlayer({
   }, [follow, platform, roomId]);
 
   const destroyPlayer = useCallback(() => {
+    // Teardown must never be silent: a stopped stream looks identical to the
+    // user whether it was an error, a room switch, or an unmount.
+    invoke("frontend_log", { msg: `[player] destroyPlayer [${streamLabelRef.current.platform}/${streamLabelRef.current.roomId}] mounted=${!disposedRef.current}` }).catch(() => {});
     if (autoReconnectTimerRef.current) {
       clearTimeout(autoReconnectTimerRef.current);
       autoReconnectTimerRef.current = null;
@@ -1387,6 +1390,93 @@ export function MainPlayer({
   useEffect(() => {
     reloadStreamRef.current = reloadStream;
   }, [reloadStream]);
+  // ---------------------------------------------------------------------------
+  // Stall watchdog.
+  //
+  // On a LIVE stream a gap in the appended data (e.g. around a CDN re-sign
+  // splice) never gets filled, so the <video> element simply freezes: no
+  // `error` event, no `ended`, just a stuck currentTime. Users see a frozen
+  // frame or a "refresh" prompt ("看着看着就停了") even though the proxy keeps
+  // serving bytes. Detect it by watching currentTime progress and force a
+  // reload, which rebuilds the player against the still-running proxy.
+  // ---------------------------------------------------------------------------
+  useEffect(() => {
+    let lastTime = -1;
+    let staleSamples = 0;
+    let stallRecoveries = 0;
+    let lastHeartbeat = Date.now();
+
+    const id = window.setInterval(() => {
+      const player: any = playerRef.current;
+      const video: HTMLVideoElement | null =
+        player?.video ??
+        (document.querySelector(".xgplayer video") as HTMLVideoElement | null);
+      if (!video || video.paused || video.ended) {
+        lastTime = -1;
+        staleSamples = 0;
+        return;
+      }
+      const cur = video.currentTime || 0;
+      if (lastTime >= 0 && Math.abs(cur - lastTime) < 0.15) {
+        staleSamples++;
+      } else {
+        staleSamples = 0;
+      }
+      lastTime = cur;
+
+      if (staleSamples >= 3 && stallRecoveries < 3) {
+        // Three consecutive frozen samples (~15s): describe the buffered state
+        // first - this is the evidence that distinguishes "proxy stopped
+        // feeding" from "player has a hole it cannot play through".
+        let buf = "";
+        try {
+          const b = video.buffered;
+          const parts: string[] = [];
+          for (let i = 0; i < b.length && i < 6; i++) {
+            parts.push(`${b.start(i).toFixed(1)}-${b.end(i).toFixed(1)}`);
+          }
+          buf = parts.join(",");
+        } catch {
+          buf = "n/a";
+        }
+        stallRecoveries++;
+        staleSamples = 0;
+        const holeAhead = (() => {
+          try {
+            const b = video.buffered;
+            for (let i = 0; i < b.length; i++) {
+              if (b.start(i) <= cur && cur < b.end(i)) {
+                const next = i + 1 < b.length ? b.start(i + 1) : null;
+                return next === null ? "none" : `${(next - b.end(i)).toFixed(1)}s`;
+              }
+            }
+            return "outside";
+          } catch {
+            return "n/a";
+          }
+        })();
+        invoke("frontend_log", {
+          msg: `[player] STALL detected [${platform}/${roomId}] time=${cur.toFixed(1)} buffered=[${buf}] holeAhead=${holeAhead} readyState=${video.readyState} networkState=${video.networkState} recovery=${stallRecoveries}/3 -> reloading`
+        }).catch(() => {});
+        void reloadStreamRef.current?.("refresh");
+        return;
+      }
+
+      if (Date.now() - lastHeartbeat >= 60000) {
+        lastHeartbeat = Date.now();
+        let end = 0;
+        try {
+          const b = video.buffered;
+          if (b.length) end = b.end(b.length - 1);
+        } catch {}
+        invoke("frontend_log", {
+          msg: `[player] alive [${platform}/${roomId}] time=${cur.toFixed(1)} bufferedEnd=${end.toFixed(1)} ahead=${(end - cur).toFixed(1)}s readyState=${video.readyState}`
+        }).catch(() => {});
+      }
+    }, 5000);
+    return () => window.clearInterval(id);
+  }, [platform, roomId]);
+
 
   useEffect(() => {
     // Create a per-mount generation id to guard delayed stop against StrictMode(dev) remounts.

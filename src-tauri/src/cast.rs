@@ -22,7 +22,7 @@ pub fn best_lan_ip() -> Option<IpAddr> {
             || (o[0] == 192 && o[1] == 168)
             || (o[0] == 172 && (16..=31).contains(&o[1]));
         if private {
-            println!("[cast] lan ip {} via {}", v4, n);
+            crate::tl!("cast", "[cast] lan ip {} via {}", v4, n);
             return Some(IpAddr::V4(*v4));
         }
         if fallback.is_none() { fallback = Some(IpAddr::V4(*v4)); }
@@ -51,7 +51,7 @@ pub async fn get_cast_info(
     }
     let ip = best_lan_ip().ok_or_else(|| "无法获取本机IP".to_string())?;
     let lan_url = format!("http://{}:{}/live.flv", ip, CAST_PORT);
-    println!("[cast] cast info: local_ip={} lan_url={}", ip, lan_url);
+    crate::tl!("cast", "[cast] cast info: local_ip={} lan_url={}", ip, lan_url);
     Ok(CastInfo {
         stream_url,
         local_ip: ip.to_string(),

@@ -385,10 +385,10 @@ fn pump_for(store: &StreamUrlStore) -> Arc<SharedPump> {
     });
     let mut slot = pump_slot().lock().unwrap();
     if let Some((_, old)) = slot.take() {
-        println!("[proxy] pump #{} created; cancelling previous pump #{}", id, old.id);
+        crate::tl!("proxy", "[proxy] pump #{} created; cancelling previous pump #{}", id, old.id);
         old.cancelled.store(true, Ordering::SeqCst);
     } else {
-        println!("[proxy] pump #{} created", id);
+        crate::tl!("proxy", "[proxy] pump #{} created", id);
     }
     *slot = Some((Arc::downgrade(&store.url), p.clone()));
     p
@@ -426,16 +426,16 @@ async fn refresh_store_url(
                 {
                     Ok(fresh) => {
                         if stale() {
-                            println!("[proxy] dropped stale Douyu refresh for room {}", room);
+                            crate::tl!("proxy", "[proxy] dropped stale Douyu refresh for room {}", room);
                             return false;
                         }
-                        println!("[proxy] refreshed Douyu URL for room {}", room);
+                        crate::tl!("proxy", "[proxy] refreshed Douyu URL for room {}", room);
                         *store.url.lock().unwrap() = fresh;
                         note_store_sign_now();
                         true
                     }
                     Err(e) => {
-                        eprintln!("[proxy] Douyu refresh failed: {}", e);
+                        crate::tl!("proxy", "[proxy] Douyu refresh failed: {}", e);
                         false
                     }
                 }
@@ -465,22 +465,22 @@ async fn refresh_store_url(
                         match fresh {
                             Some(url) => {
                                 if stale() {
-                                    println!("[proxy] dropped stale Bilibili refresh for room {}", room);
+                                    crate::tl!("proxy", "[proxy] dropped stale Bilibili refresh for room {}", room);
                                     return false;
                                 }
-                                println!("[proxy] refreshed Bilibili URL for room {}", room);
+                                crate::tl!("proxy", "[proxy] refreshed Bilibili URL for room {}", room);
                                 *store.url.lock().unwrap() = url;
                                 note_store_sign_now();
                                 true
                             }
                             None => {
-                                eprintln!("[proxy] Bilibili refresh produced no upstream url");
+                                crate::tl!("proxy", "[proxy] Bilibili refresh produced no upstream url");
                                 false
                             }
                         }
                     }
                     Err(e) => {
-                        eprintln!("[proxy] Bilibili refresh failed: {}", e);
+                        crate::tl!("proxy", "[proxy] Bilibili refresh failed: {}", e);
                         false
                     }
                 }
@@ -501,16 +501,16 @@ async fn refresh_store_url(
                 {
                     Ok(fresh) => {
                         if stale() {
-                            println!("[proxy] dropped stale Huya refresh for room {}", room);
+                            crate::tl!("proxy", "[proxy] dropped stale Huya refresh for room {}", room);
                             return false;
                         }
-                        println!("[proxy] refreshed Huya URL for room {}", room);
+                        crate::tl!("proxy", "[proxy] refreshed Huya URL for room {}", room);
                         *store.url.lock().unwrap() = fresh;
                         note_store_sign_now();
                         true
                     }
                     Err(e) => {
-                        eprintln!("[proxy] Huya refresh failed: {}", e);
+                        crate::tl!("proxy", "[proxy] Huya refresh failed: {}", e);
                         false
                     }
                 }
@@ -560,6 +560,23 @@ pub fn reset_pump_header() {
 /// Upper bound on pump task respawns for a single pump.
 const MAX_PUMP_RESPAWNS: usize = 40;
 
+/// Best-effort audio gap estimate at splice time (audio usually re-syncs within a
+/// frame too, but it is worth logging because an audio hole also stalls playback).
+fn audio_gap_for(
+    timeline: &crate::flv_relay::Timeline,
+    first_video_ts: u32,
+) -> i64 {
+    match timeline.last_audio() {
+        Some(a) => first_video_ts as i64 - a as i64,
+        None => 0,
+    }
+}
+
+/// 续流接续时允许的最大时间戳空洞。同一次推流会话里，两段直链的 GOP 边界一致，
+/// 只要空洞小于一帧/一小段，说明新段正好接在旧段之后，可以立刻续上（解码器已持有
+/// 该 GOP 的关键帧）。空洞比这更大才需要等下一个关键帧，避免花屏。
+const MAX_GAPLESS_RESUME_MS: u32 = 1500;
+
 /// 斗鱼直链固定 300s 到期。登记续流上下文后 pump 会在到期前预取下一条并做
 /// tag 级无缝接续；其他平台返回 None，保持原有一次性直通 + 断线重签路径。
 fn douyu_renew_context(store: &StreamUrlStore) -> Option<flv_relay::StreamRenewContext> {
@@ -589,11 +606,11 @@ fn ensure_pump(store: StreamUrlStore) {
     }
     let spawns = p.task_spawns.fetch_add(1, Ordering::SeqCst);
     if spawns >= MAX_PUMP_RESPAWNS {
-        eprintln!("[proxy] pump #{} hit the {} respawn cap; not restarting", p.id, MAX_PUMP_RESPAWNS);
+        crate::tl!("proxy", "[proxy] pump #{} hit the {} respawn cap; not restarting", p.id, MAX_PUMP_RESPAWNS);
         return;
     }
     if spawns > 0 {
-        println!("[proxy] restarting pump #{} (respawn {})", p.id, spawns);
+        crate::tl!("proxy", "[proxy] restarting pump #{} (respawn {})", p.id, spawns);
     }
 
     let client = Client::builder()
@@ -617,7 +634,7 @@ fn ensure_pump(store: StreamUrlStore) {
         // Monotonic byte offset of the broadcast stream; primers reference it so
         // a joining client can skip chunks it already received.
         let mut offset_total: u64 = p.primer.lock().unwrap().offset;
-        println!("[proxy] pump #{} task started", pump_id);
+        crate::tl!("proxy", "[proxy] pump #{} task started", pump_id);
         // The actix server that hosts this task is recreated on every room
         // switch, which tears the task down; flag it so the next request
         // restarts the pump instead of serving an empty stream forever.
@@ -635,7 +652,7 @@ fn ensure_pump(store: StreamUrlStore) {
                 continue;
             }
             if url.contains(":34719/live.flv") || url.contains(":34721/live.flv") {
-                eprintln!("[proxy] pump refused self-referential URL");
+                crate::tl!("proxy", "[proxy] pump refused self-referential URL");
                 break;
             }
 
@@ -644,6 +661,8 @@ fn ensure_pump(store: StreamUrlStore) {
             let mut rejected = false;
             let mut session_bytes: u64 = 0;
             let mut session_chunks: u64 = 0;
+            let mut beat_at = std::time::Instant::now();
+            let mut last_beat: u64 = 0;
             match build_upstream_request(&client, &url).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     attempts = 0;
@@ -689,18 +708,35 @@ fn ensure_pump(store: StreamUrlStore) {
                     'segments: loop {
                         while let Some(chunk) = stream.next().await {
                             if store.generation.load(Ordering::SeqCst) != gen_at_connect {
-                                println!("[proxy] stream source changed -> switch upstream");
+                                crate::tl!("proxy", "[proxy] stream source changed -> switch upstream");
                                 break 'segments;
                             }
                             let bytes = match chunk {
                                 Ok(b) => b,
                                 Err(e) => {
-                                    eprintln!("[proxy] pump chunk error: {} (after {} chunks/{} bytes) -> reconnect", e, session_chunks, session_bytes);
+                                    crate::tl!("proxy", "[proxy] pump chunk error: {} (after {} chunks/{} bytes) -> reconnect", e, session_chunks, session_bytes);
                                     break;
                                 }
                             };
                             session_bytes += bytes.len() as u64;
                             session_chunks += 1;
+                            last_beat += bytes.len() as u64;
+                            if beat_at.elapsed() >= Duration::from_secs(60) {
+                                crate::tl!(
+                                    "proxy",
+                                    "pump #{} heartbeat: {} clients, +{} bytes/60s, total {} bytes/{} chunks, lived {:.0}s, url_age_ms={}, renewals={}",
+                                    pump_id,
+                                    CLIENT_COUNT.load(Ordering::Relaxed),
+                                    last_beat,
+                                    session_bytes,
+                                    session_chunks,
+                                    connected_at.elapsed().as_secs_f32(),
+                                    sign_age_ms(),
+                                    segment_swaps
+                                );
+                                beat_at = std::time::Instant::now();
+                                last_beat = 0;
+                            }
                             if session_bytes > 200_000
                                 && !p.session_healthy.swap(true, Ordering::SeqCst)
                             {
@@ -716,7 +752,7 @@ fn ensure_pump(store: StreamUrlStore) {
                                     prefetch = Some(tokio::spawn(async move {
                                         flv_relay::acquire_douyu_stream(&ctx, &c).await
                                     }));
-                                    println!("[proxy] pump #{} prefetching next douyu segment", pump_id);
+                                    crate::tl!("proxy", "[proxy] pump #{} prefetching next douyu segment", pump_id);
                                 }
                             }
 
@@ -729,7 +765,7 @@ fn ensure_pump(store: StreamUrlStore) {
                                     timeline.observe(&tag);
                                 }
                                 if demuxer.is_desynced() {
-                                    eprintln!("[proxy] upstream is not parsable FLV; disabling seamless renewal");
+                                    crate::tl!("proxy", "[proxy] upstream is not parsable FLV; disabling seamless renewal");
                                     renewal = false;
                                     demuxer.reset();
                                 }
@@ -743,22 +779,48 @@ fn ensure_pump(store: StreamUrlStore) {
                                 let mut out = bytes::BytesMut::new();
                                 while let Some(tag) = demuxer.next_tag() {
                                     if waiting_keyframe {
-                                        // 丢掉元数据与初始化 tag：播放器已经初始化过了。
+                                        // 元数据与初始化 tag 一律丢掉：播放器已经初始化过了，
+                                        // 重发一份 onMetaData / sequence header 会让部分播放器
+                                        // 直接报解码错误。
                                         if tag.tag_type == flv_relay::TAG_TYPE_SCRIPT
                                             || tag.is_sequence_header
                                         {
                                             continue;
                                         }
-                                        if !(tag.tag_type == flv_relay::TAG_TYPE_VIDEO
-                                            && tag.is_keyframe
-                                            && timeline.is_ahead(&tag))
-                                        {
+                                        let is_video = tag.tag_type == flv_relay::TAG_TYPE_VIDEO;
+                                        let prev = if is_video {
+                                            timeline.last_video().unwrap_or(0)
+                                        } else {
+                                            timeline.last_audio().unwrap_or(0)
+                                        };
+                                        // CDN 回吐的历史 GOP：时间戳没越过已转发位置，必须丢，
+                                        // 否则播放器看到时间戳倒退就会报错/卡住。
+                                        if tag.timestamp <= prev {
                                             continue;
                                         }
-                                        waiting_keyframe = false;
-                                        println!(
-                                            "[proxy] pump #{} spliced renewal at keyframe ts={}",
-                                            pump_id, tag.timestamp
+                                        let hole = tag.timestamp.saturating_sub(prev);
+                                        // 关键：新旧两段是同一次推流会话（同编码器、同 GOP 边界、
+                                        // 绝对时间戳），所以「刚好接上」的那一帧所属 GOP 的关键帧
+                                        // 旧段已经转发过 -> 直接续上既没有空洞也可解码。
+                                        // 只有真的存在内容空洞时才退回到「等下一个关键帧」，
+                                        // 用一次轻微花屏换取不断流。
+                                        let gapless = hole <= MAX_GAPLESS_RESUME_MS;
+                                        if is_video && !gapless && !tag.is_keyframe {
+                                            continue;
+                                        }
+                                        if is_video {
+                                            waiting_keyframe = false;
+                                        }
+                                        crate::tl!(
+                                            "proxy",
+                                            "pump #{} SPLICED renewal: {} ts {} <- {} (gap {}ms, keyframe={}, audio_prev={:?})",
+                                            pump_id,
+                                            if is_video { "video" } else { "audio" },
+                                            tag.timestamp,
+                                            prev,
+                                            hole,
+                                            tag.is_keyframe,
+                                            timeline.last_audio()
                                         );
                                     } else if tag.tag_type != flv_relay::TAG_TYPE_SCRIPT
                                         && !timeline.is_ahead(&tag)
@@ -799,7 +861,7 @@ fn ensure_pump(store: StreamUrlStore) {
                                         if await_keyframe {
                                             if is_keyframe {
                                                 await_keyframe = false;
-                                                println!("[proxy] pump #{} resumed at keyframe after reconnect", pump_id);
+                                                crate::tl!("proxy", "[proxy] pump #{} resumed at keyframe after reconnect", pump_id);
                                                 Some(bytes)
                                             } else {
                                                 // Drop mid-GOP tags until the first keyframe.
@@ -856,7 +918,7 @@ fn ensure_pump(store: StreamUrlStore) {
                                 note_store_sign_now();
                                 renew_failures = 0;
                                 segment_swaps += 1;
-                                println!(
+                                crate::tl!("proxy", 
                                     "[proxy] pump #{} seamlessly renewed douyu stream (swap #{}, {} clients)",
                                     pump_id,
                                     segment_swaps,
@@ -874,7 +936,7 @@ fn ensure_pump(store: StreamUrlStore) {
                             }
                             Err(e) => {
                                 renew_failures += 1;
-                                eprintln!(
+                                crate::tl!("proxy", 
                                     "[proxy] pump #{} renewal failed {}/{}: {}",
                                     pump_id, renew_failures, flv_relay::MAX_CONSECUTIVE_FAILURES, e
                                 );
@@ -887,7 +949,7 @@ fn ensure_pump(store: StreamUrlStore) {
                             }
                         }
                     }
-                    println!(
+                    crate::tl!("proxy", 
                         "[proxy] pump #{} upstream EOF after {} chunks/{} bytes, {} clients, lived {:?}, renewals={} -> reconnect",
                         pump_id,
                         session_chunks,
@@ -898,10 +960,10 @@ fn ensure_pump(store: StreamUrlStore) {
                     );
                 }
                 Ok(resp) => {
-                    eprintln!("[proxy] pump upstream status {} -> retry", resp.status());
+                    crate::tl!("proxy", "[proxy] pump upstream status {} -> retry", resp.status());
                     rejected = true;
                 }
-                Err(e) => eprintln!("[proxy] pump connect error: {} -> retry", e),
+                Err(e) => crate::tl!("proxy", "[proxy] pump connect error: {} -> retry", e),
             }
 
             // If the source changed (room/quality switch), drop the primer and
@@ -927,13 +989,13 @@ fn ensure_pump(store: StreamUrlStore) {
             let age = sign_age_ms();
             let natural_expiry = lived >= Duration::from_secs(240);
             if rejected || natural_expiry || age >= 240_000 {
-                println!(
+                crate::tl!("proxy", 
                     "[proxy] pump #{} re-signing upstream (rejected={} lived={:?} url_age_ms={})",
                     pump_id, rejected, lived, age
                 );
                 refresh_store_url(&store, gen_at_connect, &p.cancelled).await;
             } else {
-                println!(
+                crate::tl!("proxy", 
                     "[proxy] pump #{} reconnecting with fresh stored URL (age={}ms lived={:?})",
                     pump_id, age, lived
                 );
@@ -1058,7 +1120,7 @@ async fn flv_proxy_handler(
             if matches!(name, "host" | "connection" | "accept-encoding") { continue; }
             parts.push(format!("{}={}", name, v.to_str().unwrap_or("?")));
         }
-        println!(
+        crate::tl!("proxy", 
             "[proxy] client request from {:?} method={} headers: {}",
             req.peer_addr(),
             req.method(),
@@ -1069,7 +1131,7 @@ async fn flv_proxy_handler(
     if url.is_empty() {
         return HttpResponse::NotFound().body("Stream URL is not set or empty.");
     }
-    println!("[Rust/proxy.rs handler] Incoming FLV proxy request -> {}", url);
+    crate::tl!("proxy", "[Rust/proxy.rs handler] Incoming FLV proxy request -> {}", url);
 
     let store: StreamUrlStore = (**stream_url_store).clone();
     ensure_pump(store.clone());
@@ -1088,19 +1150,19 @@ async fn flv_proxy_handler(
             if pr.gen == current_gen {
                 match pr.snapshot() {
                 Some((b, off)) => {
-                    println!(
+                    crate::tl!("proxy", 
                         "[proxy] client #{} late join (gen={}, pump #{}): primer {} bytes @ offset {}",
                         n, current_gen, p.id, b.len(), off
                     );
                     (Some(b), off)
                 }
                 None => {
-                    println!("[proxy] client #{} joined (gen={}, pump #{}): stream from start", n, current_gen, p.id);
+                    crate::tl!("proxy", "[proxy] client #{} joined (gen={}, pump #{}): stream from start", n, current_gen, p.id);
                     (None, 0)
                 }
             }
             } else {
-                println!("[proxy] client #{} joined (gen={}, pump #{}): primer gen mismatch", n, current_gen, p.id);
+                crate::tl!("proxy", "[proxy] client #{} joined (gen={}, pump #{}): primer gen mismatch", n, current_gen, p.id);
                 (None, 0)
             }
         }
@@ -1219,7 +1281,7 @@ pub async fn start_proxy_inner(
 
     tauri::async_runtime::spawn(async move {
         if let Err(e) = server.await {
-            eprintln!("[Rust/proxy.rs] Proxy server run error: {}", e);
+            crate::tl!("proxy", "[Rust/proxy.rs] Proxy server run error: {}", e);
         }
     });
 
@@ -1241,6 +1303,7 @@ pub async fn stop_proxy(
     server_handle_state: State<'_, ProxyServerHandle>,
 ) -> Result<(), String> {
     let handle = { server_handle_state.0.lock().unwrap().take() };
+    crate::tl!("proxy", "stop_proxy called (had_server={})", handle.is_some());
     if let Some(handle) = handle {
         handle.stop(false).await;
     }
@@ -1297,7 +1360,7 @@ pub async fn start_static_proxy_server(
 
     tauri::async_runtime::spawn(async move {
         if let Err(e) = server.await {
-            eprintln!("[Rust/proxy.rs] static proxy error: {}", e);
+            crate::tl!("proxy", "[Rust/proxy.rs] static proxy error: {}", e);
         }
     });
 
