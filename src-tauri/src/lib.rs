@@ -3,6 +3,7 @@ mod logging;
 mod cast;
 mod config_transfer;
 mod dlna;
+pub mod flv_relay;
 mod lan_sync;
 mod sync_transfer;
 pub mod platforms;

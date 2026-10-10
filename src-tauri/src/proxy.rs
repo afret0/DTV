@@ -7,6 +7,7 @@ use std::io::ErrorKind;
 use std::net::TcpStream;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use crate::flv_relay;
 use tokio::sync::broadcast;
 use std::time::Duration;
 use tauri::{AppHandle, State};
@@ -21,7 +22,7 @@ const HUYA_HYSDK_UA: &str =
 
 async fn find_free_port() -> u16 { 34719 }
 
-fn build_upstream_request(client: &Client, url: &str) -> reqwest::RequestBuilder {
+pub fn build_upstream_request(client: &Client, url: &str) -> reqwest::RequestBuilder {
     let mut req = client
         .get(url)
         .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
@@ -342,23 +343,30 @@ impl Primer {
     }
 }
 
-static PUMP: OnceLock<StdMutex<Option<(usize, Arc<SharedPump>)>>> = OnceLock::new();
+static PUMP: OnceLock<StdMutex<Option<(std::sync::Weak<StdMutex<String>>, Arc<SharedPump>)>>> =
+    OnceLock::new();
 static PUMP_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-fn pump_slot() -> &'static StdMutex<Option<(usize, Arc<SharedPump>)>> {
+fn pump_slot() -> &'static StdMutex<Option<(std::sync::Weak<StdMutex<String>>, Arc<SharedPump>)>> {
     PUMP.get_or_init(|| StdMutex::new(None))
 }
 
 /// Returns the pump bound to this store; a different store (room/platform
 /// switch) replaces the previous pump and cancels it.
 fn pump_for(store: &StreamUrlStore) -> Arc<SharedPump> {
-    // Key on the shared url Arc: stable across Data clones and mutations,
-    // unique per stream source (and per test).
-    let key = Arc::as_ptr(&store.url) as usize;
+    // Identity is the shared `url` Arc: stable across Data clones and mutations,
+    // unique per stream source. It is compared through a Weak upgrade rather than
+    // a raw pointer value -- a dropped store frees that address and the allocator
+    // can hand the same address to the next test/room, which would resurrect a
+    // stale pump still bound to the dead store (no data ever reaching clients).
     let slot = pump_slot().lock().unwrap();
-    if let Some((k, p)) = slot.as_ref() {
-        if *k == key && !p.cancelled.load(Ordering::SeqCst) {
-            return p.clone();
+    if let Some((weak_url, p)) = slot.as_ref() {
+        if !p.cancelled.load(Ordering::SeqCst) {
+            if let Some(strong) = weak_url.upgrade() {
+                if Arc::ptr_eq(&strong, &store.url) {
+                    return p.clone();
+                }
+            }
         }
     }
     drop(slot);
@@ -376,13 +384,13 @@ fn pump_for(store: &StreamUrlStore) -> Arc<SharedPump> {
         id,
     });
     let mut slot = pump_slot().lock().unwrap();
-    if let Some((old_key, old)) = slot.take() {
-        println!("[proxy] pump #{} created (key={:#x}); cancelling pump #{} (key={:#x})", id, key, old.id, old_key);
+    if let Some((_, old)) = slot.take() {
+        println!("[proxy] pump #{} created; cancelling previous pump #{}", id, old.id);
         old.cancelled.store(true, Ordering::SeqCst);
     } else {
-        println!("[proxy] pump #{} created (key={:#x})", id, key);
+        println!("[proxy] pump #{} created", id);
     }
-    *slot = Some((key, p.clone()));
+    *slot = Some((Arc::downgrade(&store.url), p.clone()));
     p
 }
 
@@ -552,6 +560,21 @@ pub fn reset_pump_header() {
 /// Upper bound on pump task respawns for a single pump.
 const MAX_PUMP_RESPAWNS: usize = 40;
 
+/// 斗鱼直链固定 300s 到期。登记续流上下文后 pump 会在到期前预取下一条并做
+/// tag 级无缝接续；其他平台返回 None，保持原有一次性直通 + 断线重签路径。
+fn douyu_renew_context(store: &StreamUrlStore) -> Option<flv_relay::StreamRenewContext> {
+    if store.platform.lock().unwrap().as_deref() != Some("douyu") {
+        return None;
+    }
+    let room_id = store.room_id.lock().unwrap().clone()?;
+    let quality = store.quality.lock().unwrap().clone()?;
+    let line = store.line.lock().unwrap().clone();
+    if room_id.is_empty() || quality.is_empty() {
+        return None;
+    }
+    Some(flv_relay::StreamRenewContext { room_id, quality, line })
+}
+
 fn ensure_pump(store: StreamUrlStore) {
     let p = pump_for(&store);
     if p.cancelled.load(Ordering::SeqCst) {
@@ -624,7 +647,7 @@ fn ensure_pump(store: StreamUrlStore) {
             match build_upstream_request(&client, &url).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     attempts = 0;
-                    let mut stream = resp.bytes_stream();
+                    let mut stream: flv_relay::UpstreamBody = Box::pin(resp.bytes_stream());
                     p.session_healthy.store(false, Ordering::SeqCst);
                     // Is this a brand new source (room/quality switch) or a
                     // reconnect of the same stream after a signature expired?
@@ -641,79 +664,237 @@ fn ensure_pump(store: StreamUrlStore) {
                         // late joiners stay primed across the reconnect gap.
                         p.primer.lock().unwrap().clear_pending();
                     }
-                    let mut framer = FlvFramer::new();
-                    while let Some(chunk) = stream.next().await {
-                        if store.generation.load(Ordering::SeqCst) != gen_at_connect {
-                            println!("[proxy] stream source changed -> switch upstream");
-                            break;
-                        }
-                        let bytes = match chunk {
-                            Ok(b) => b,
-                            Err(e) => {
-                                eprintln!("[proxy] pump chunk error: {} (after {} chunks/{} bytes) -> reconnect", e, session_chunks, session_bytes);
-                                break;
-                            }
-                        };
-                        session_bytes += bytes.len() as u64;
-                        session_chunks += 1;
-                        if session_bytes > 200_000 && !p.session_healthy.swap(true, Ordering::SeqCst) {
-                            // Genuinely streaming now: forget earlier respawn
-                            // attempts so normal use is unlimited.
-                            p.task_spawns.store(0, Ordering::SeqCst);
-                        }
 
-                        for unit in framer.push(&bytes) {
-                            // Decide what to put on the wire. `forward` is the
-                            // byte payload clients receive; it is always a whole
-                            // tag (or the header), never a fragment.
-                            let forward: Option<bytes::Bytes> = match unit {
-                                FlvUnit::Header(h) => {
-                                    // Only a new source broadcasts the header;
-                                    // repeating it mid-stream corrupts attached
-                                    // decoders.
-                                    if new_source { Some(h) } else { None }
-                                }
-                                FlvUnit::Tag { bytes, is_keyframe, .. } => {
-                                    if await_keyframe {
-                                        if is_keyframe {
-                                            await_keyframe = false;
-                                            println!("[proxy] pump #{} resumed at keyframe after reconnect", pump_id);
-                                            Some(bytes)
-                                        } else {
-                                            // Drop mid-GOP tags until the first keyframe.
-                                            None
-                                        }
-                                    } else {
-                                        Some(bytes)
-                                    }
-                                }
-                                FlvUnit::Raw(b) => {
-                                    // Non-FLV (tests/mocks): on a reconnect we
-                                    // cannot realign, so forward from the start.
-                                    await_keyframe = false;
-                                    Some(b)
+                    // 斗鱼直链固定 300s 后 EOF。只有登记了续流上下文才做无缝接续
+                    // （虎牙/B站/抖音保持原有一次性直通 + 断线重签路径）。
+                    let renew_ctx = douyu_renew_context(&store);
+                    let mut renewal = renew_ctx.is_some();
+                    // 接续段标记：只有「斗鱼无缝续流」的新段走 tag 级裁剪路径。
+                    // 普通断线重连必须继续走 framer 直通 + 关键帧对齐路径，否则
+                    // 无法按 FLV 解析的上游（如测试用的填充数据）会被整段丢弃。
+                    let mut continuation = !new_source && renewal;
+                    let mut waiting_keyframe = continuation;
+                    let mut segment = flv_relay::Segment::new(continuation);
+                    let mut framer = FlvFramer::new();
+                    let mut demuxer = flv_relay::FlvDemuxer::default();
+                    let mut timeline = flv_relay::Timeline::default();
+                    let mut prefetch: Option<
+                        tokio::task::JoinHandle<
+                            Result<(flv_relay::UpstreamBody, String), String>,
+                        >,
+                    > = None;
+                    let mut renew_failures: u32 = 0;
+                    let mut segment_swaps: u32 = 0;
+
+                    'segments: loop {
+                        while let Some(chunk) = stream.next().await {
+                            if store.generation.load(Ordering::SeqCst) != gen_at_connect {
+                                println!("[proxy] stream source changed -> switch upstream");
+                                break 'segments;
+                            }
+                            let bytes = match chunk {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    eprintln!("[proxy] pump chunk error: {} (after {} chunks/{} bytes) -> reconnect", e, session_chunks, session_bytes);
+                                    break;
                                 }
                             };
+                            session_bytes += bytes.len() as u64;
+                            session_chunks += 1;
+                            if session_bytes > 200_000
+                                && !p.session_healthy.swap(true, Ordering::SeqCst)
+                            {
+                                // Genuinely streaming now: forget earlier respawn
+                                // attempts so normal use is unlimited.
+                                p.task_spawns.store(0, Ordering::SeqCst);
+                            }
 
-                            let Some(payload) = forward else { continue };
-                            let offset_before = offset_total;
-                            offset_total += payload.len() as u64;
-                            // Feed the primer EXACTLY what goes on the wire so its
-                            // offsets stay aligned with the broadcast offsets used
-                            // for late-join de-duplication.
-                            p.primer.lock().unwrap().feed(&payload, gen_at_connect, offset_total);
-                            p.header_sent.store(true, Ordering::SeqCst);
-                            p.broadcast_started.store(true, Ordering::SeqCst);
-                            let _ = tx.send((gen_at_connect, offset_before, payload));
+                            // 旧流临近 300s TTL 时提前取好下一条，切换时零空档。
+                            if renewal && prefetch.is_none() && segment.should_prefetch() {
+                                if let Some(ctx) = renew_ctx.clone() {
+                                    let c = client.clone();
+                                    prefetch = Some(tokio::spawn(async move {
+                                        flv_relay::acquire_douyu_stream(&ctx, &c).await
+                                    }));
+                                    println!("[proxy] pump #{} prefetching next douyu segment", pump_id);
+                                }
+                            }
+
+                            // 续流平台：旁路解析，只为记下时间轴位置供接续对齐。
+                            // 首段的转发仍是原始上游字节块，写入粒度不变。
+                            if renewal && !continuation {
+                                demuxer.push(&bytes);
+                                demuxer.take_header();
+                                while let Some(tag) = demuxer.next_tag() {
+                                    timeline.observe(&tag);
+                                }
+                                if demuxer.is_desynced() {
+                                    eprintln!("[proxy] upstream is not parsable FLV; disabling seamless renewal");
+                                    renewal = false;
+                                    demuxer.reset();
+                                }
+                            }
+
+                            if continuation {
+                                // 接续段：整 tag 裁剪后聚合发出。
+                                demuxer.push(&bytes);
+                                // 新段的文件头必须丢弃，播放器只认首段那一个。
+                                demuxer.take_header();
+                                let mut out = bytes::BytesMut::new();
+                                while let Some(tag) = demuxer.next_tag() {
+                                    if waiting_keyframe {
+                                        // 丢掉元数据与初始化 tag：播放器已经初始化过了。
+                                        if tag.tag_type == flv_relay::TAG_TYPE_SCRIPT
+                                            || tag.is_sequence_header
+                                        {
+                                            continue;
+                                        }
+                                        if !(tag.tag_type == flv_relay::TAG_TYPE_VIDEO
+                                            && tag.is_keyframe
+                                            && timeline.is_ahead(&tag))
+                                        {
+                                            continue;
+                                        }
+                                        waiting_keyframe = false;
+                                        println!(
+                                            "[proxy] pump #{} spliced renewal at keyframe ts={}",
+                                            pump_id, tag.timestamp
+                                        );
+                                    } else if tag.tag_type != flv_relay::TAG_TYPE_SCRIPT
+                                        && !timeline.is_ahead(&tag)
+                                    {
+                                        // CDN 会回吐一个 GOP 的缓冲，重复部分直接丢弃。
+                                        continue;
+                                    }
+                                    timeline.observe(&tag);
+                                    out.extend_from_slice(&tag.raw);
+                                }
+                                if !out.is_empty() {
+                                    let payload = out.freeze();
+                                    let offset_before = offset_total;
+                                    offset_total += payload.len() as u64;
+                                    p.primer
+                                        .lock()
+                                        .unwrap()
+                                        .feed(&payload, gen_at_connect, offset_total);
+                                    p.header_sent.store(true, Ordering::SeqCst);
+                                    p.broadcast_started.store(true, Ordering::SeqCst);
+                                    let _ = tx.send((gen_at_connect, offset_before, payload));
+                                }
+                                continue;
+                            }
+
+                            for unit in framer.push(&bytes) {
+                                // Decide what to put on the wire. `forward` is the
+                                // byte payload clients receive; it is always a whole
+                                // tag (or the header), never a fragment.
+                                let forward: Option<bytes::Bytes> = match unit {
+                                    FlvUnit::Header(h) => {
+                                        // Only a new source broadcasts the header;
+                                        // repeating it mid-stream corrupts attached
+                                        // decoders.
+                                        if new_source { Some(h) } else { None }
+                                    }
+                                    FlvUnit::Tag { bytes, is_keyframe, .. } => {
+                                        if await_keyframe {
+                                            if is_keyframe {
+                                                await_keyframe = false;
+                                                println!("[proxy] pump #{} resumed at keyframe after reconnect", pump_id);
+                                                Some(bytes)
+                                            } else {
+                                                // Drop mid-GOP tags until the first keyframe.
+                                                None
+                                            }
+                                        } else {
+                                            Some(bytes)
+                                        }
+                                    }
+                                    FlvUnit::Raw(b) => {
+                                        // Non-FLV (tests/mocks): on a reconnect we
+                                        // cannot realign, so forward from the start.
+                                        await_keyframe = false;
+                                        Some(b)
+                                    }
+                                };
+
+                                let Some(payload) = forward else { continue };
+                                let offset_before = offset_total;
+                                offset_total += payload.len() as u64;
+                                // Feed the primer EXACTLY what goes on the wire so its
+                                // offsets stay aligned with the broadcast offsets used
+                                // for late-join de-duplication.
+                                p.primer.lock().unwrap().feed(&payload, gen_at_connect, offset_total);
+                                p.header_sent.store(true, Ordering::SeqCst);
+                                p.broadcast_started.store(true, Ordering::SeqCst);
+                                let _ = tx.send((gen_at_connect, offset_before, payload));
+                            }
+                        }
+
+                        // ---- upstream segment ended ----
+                        if !renewal || renew_ctx.is_none() {
+                            break;
+                        }
+                        // 只有在真的做过无缝续流（或即将做）时才继续拼接下一段。
+                        if store.generation.load(Ordering::SeqCst) != gen_at_connect {
+                            break;
+                        }
+
+                        // 预取已就绪就直接用；否则说明是提前故障，同步补取一条。
+                        let acquired = match prefetch.take() {
+                            Some(handle) => match handle.await {
+                                Ok(r) => r,
+                                Err(e) => Err(format!("预取任务异常: {}", e)),
+                            },
+                            None => {
+                                flv_relay::acquire_douyu_stream(renew_ctx.as_ref().unwrap(), &client)
+                                    .await
+                            }
+                        };
+                        match acquired {
+                            Ok((body, fresh_url)) => {
+                                *store.url.lock().unwrap() = fresh_url;
+                                note_store_sign_now();
+                                renew_failures = 0;
+                                segment_swaps += 1;
+                                println!(
+                                    "[proxy] pump #{} seamlessly renewed douyu stream (swap #{}, {} clients)",
+                                    pump_id,
+                                    segment_swaps,
+                                    CLIENT_COUNT.load(Ordering::Relaxed)
+                                );
+                                stream = body;
+                                continuation = true;
+                                waiting_keyframe = true;
+                                segment = flv_relay::Segment::new(true);
+                                demuxer.reset();
+                                // primer 保留已抓到的 head/config/keyframe，迟到
+                                // 客户端在接续后依然拿到完整解码起点。
+                                p.primer.lock().unwrap().clear_pending();
+                                p.header_sent.store(true, Ordering::SeqCst);
+                            }
+                            Err(e) => {
+                                renew_failures += 1;
+                                eprintln!(
+                                    "[proxy] pump #{} renewal failed {}/{}: {}",
+                                    pump_id, renew_failures, flv_relay::MAX_CONSECUTIVE_FAILURES, e
+                                );
+                                if renew_failures >= flv_relay::MAX_CONSECUTIVE_FAILURES {
+                                    renewal = false;
+                                    break;
+                                }
+                                tokio::time::sleep(flv_relay::RETRY_DELAY).await;
+                                break;
+                            }
                         }
                     }
                     println!(
-                        "[proxy] pump #{} upstream EOF after {} chunks/{} bytes, {} clients, lived {:?} -> refresh URL and reconnect",
+                        "[proxy] pump #{} upstream EOF after {} chunks/{} bytes, {} clients, lived {:?}, renewals={} -> reconnect",
                         pump_id,
                         session_chunks,
                         session_bytes,
                         CLIENT_COUNT.load(Ordering::Relaxed),
-                        connected_at.elapsed()
+                        connected_at.elapsed(),
+                        segment_swaps
                     );
                 }
                 Ok(resp) => {
@@ -2071,6 +2252,51 @@ mod live_tests {
             );
         }
         assert!(leftover < 200_000, "too many trailing bytes ({}) to be just one in-flight tag", leftover);
+
+        // 6) THE user-visible invariant: video timestamps must never go
+        //    backwards. Douyu tags carry absolute session timestamps, so a
+        //    correct splice keeps them monotonic; a splice that replayed the
+        //    CDN's back-buffer GOP (or fed stale bytes on an out-of-order swap)
+        //    makes the decoder see time rewind -> decode error / "重播" prompt.
+        let mut walk = 13usize;
+        let mut last_video_ts: Option<u32> = None;
+        let mut regressions = 0usize;
+        let mut first_reg: Option<(u32, u32)> = None;
+        let mut keyframes = 0usize;
+        while walk + 11 <= collected.len() {
+            let tag_type = collected[walk] & 0x1f;
+            let size = ((collected[walk + 1] as usize) << 16)
+                | ((collected[walk + 2] as usize) << 8)
+                | (collected[walk + 3] as usize);
+            if walk + 11 + size + 4 > collected.len() { break; }
+            let ts = ((collected[walk + 7] as u32) << 24)
+                | ((collected[walk + 4] as u32) << 16)
+                | ((collected[walk + 5] as u32) << 8)
+                | (collected[walk + 6] as u32);
+            if tag_type == 9 {
+                let is_seq = size >= 2
+                    && collected[walk + 11] == 0x17
+                    && collected[walk + 12] == 0x00;
+                let is_key = size >= 1 && (collected[walk + 11] >> 4) == 1 && !is_seq;
+                if is_key { keyframes += 1; }
+                if !is_seq {
+                    if let Some(prev) = last_video_ts {
+                        if ts < prev {
+                            regressions += 1;
+                            if first_reg.is_none() { first_reg = Some((prev, ts)); }
+                        }
+                    }
+                    last_video_ts = Some(ts.max(last_video_ts.unwrap_or(0)));
+                }
+            }
+            walk += 11 + size + 4;
+        }
+        println!("[longrun] video keyframes={} last_video_ts={:?} regressions={}",
+            keyframes, last_video_ts, regressions);
+        assert!(keyframes >= 2, "expected multiple keyframes across the run, got {}", keyframes);
+        assert_eq!(regressions, 0,
+            "video timestamps went backwards {} time(s) (first {:?}) - the splice fed replayed/stale frames",
+            regressions, first_reg);
     }
 }
 
