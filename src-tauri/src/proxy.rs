@@ -1,5 +1,4 @@
 use actix_web::{dev::ServerHandle, web, App, HttpRequest, HttpResponse, HttpServer, Responder};
-use futures_util::StreamExt;
 use reqwest::Client;
 use crate::StreamUrlStore;
 use serde::Deserialize;
@@ -96,6 +95,9 @@ enum FlvUnit {
         bytes: bytes::Bytes,
         /// True for a video keyframe tag (a safe mid-stream resume point).
         is_keyframe: bool,
+        /// FLV absolute timestamp (ms) of this tag.
+        timestamp: u32,
+        tag_type: u8,
     },
     /// Not parseable as FLV (mock/test sources): pass through untouched so the
     /// framer never blocks a non-FLV stream.
@@ -158,13 +160,17 @@ impl FlvFramer {
                 break;
             }
             let tag_type = self.pending[0] & 0x1f;
+            let timestamp = ((self.pending[7] as u32) << 24)
+                | ((self.pending[4] as u32) << 16)
+                | ((self.pending[5] as u32) << 8)
+                | (self.pending[6] as u32);
             let tag: Vec<u8> = self.pending.drain(..total).collect();
             let is_keyframe = tag_type == 9
                 && tag.len() > 11
                 && (tag[11] >> 4) == 1
                 // Exclude the AVC sequence header (frame type 1, codec 7, pkt 0).
                 && !(tag.len() > 12 && tag[11] == 0x17 && tag[12] == 0x00);
-            out.push(FlvUnit::Tag { bytes: bytes::Bytes::from(tag), is_keyframe });
+            out.push(FlvUnit::Tag { bytes: bytes::Bytes::from(tag), is_keyframe, timestamp, tag_type });
         }
         if self.pending.len() > MAX_PENDING {
             self.unparsable = true;
@@ -370,7 +376,10 @@ fn pump_for(store: &StreamUrlStore) -> Arc<SharedPump> {
         }
     }
     drop(slot);
-    let (tx, _rx) = broadcast::channel::<(u64, u64, bytes::Bytes)>(4096);
+    // 广播环形缓冲：容量按“消息数”算。太小 -> 慢客户端（WiFi 投屏、后台标签页）
+    // 频繁掉出窗口被断开；太大 -> 积压时吃内存（每条消息是一个上游 chunk，
+    // 斗鱼约 10~70KB，1024 条 ≈ 30s 实时余量 / 最坏 ~50MB）。
+    let (tx, _rx) = broadcast::channel::<(u64, u64, bytes::Bytes)>(BROADCAST_RING_CAP);
     let id = PUMP_SEQ.fetch_add(1, Ordering::SeqCst) as u64 + 1;
     let p = Arc::new(SharedPump {
         tx,
@@ -560,23 +569,6 @@ pub fn reset_pump_header() {
 /// Upper bound on pump task respawns for a single pump.
 const MAX_PUMP_RESPAWNS: usize = 40;
 
-/// Best-effort audio gap estimate at splice time (audio usually re-syncs within a
-/// frame too, but it is worth logging because an audio hole also stalls playback).
-fn audio_gap_for(
-    timeline: &crate::flv_relay::Timeline,
-    first_video_ts: u32,
-) -> i64 {
-    match timeline.last_audio() {
-        Some(a) => first_video_ts as i64 - a as i64,
-        None => 0,
-    }
-}
-
-/// 续流接续时允许的最大时间戳空洞。同一次推流会话里，两段直链的 GOP 边界一致，
-/// 只要空洞小于一帧/一小段，说明新段正好接在旧段之后，可以立刻续上（解码器已持有
-/// 该 GOP 的关键帧）。空洞比这更大才需要等下一个关键帧，避免花屏。
-const MAX_GAPLESS_RESUME_MS: u32 = 1500;
-
 /// 斗鱼直链固定 300s 到期。登记续流上下文后 pump 会在到期前预取下一条并做
 /// tag 级无缝接续；其他平台返回 None，保持原有一次性直通 + 断线重签路径。
 fn douyu_renew_context(store: &StreamUrlStore) -> Option<flv_relay::StreamRenewContext> {
@@ -666,7 +658,7 @@ fn ensure_pump(store: StreamUrlStore) {
             match build_upstream_request(&client, &url).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     attempts = 0;
-                    let mut stream: flv_relay::UpstreamBody = Box::pin(resp.bytes_stream());
+                    let mut stream = flv_relay::SourceBody::Http(Box::pin(resp.bytes_stream()));
                     p.session_healthy.store(false, Ordering::SeqCst);
                     // Is this a brand new source (room/quality switch) or a
                     // reconnect of the same stream after a signature expired?
@@ -674,7 +666,6 @@ fn ensure_pump(store: StreamUrlStore) {
                     // A reconnect must resume on a keyframe boundary with whole
                     // tags, or the decoder shows mosaic until the next GOP. A new
                     // source forwards everything (header + config + keyframe).
-                    let mut await_keyframe = !new_source;
                     if new_source {
                         // Fresh stream: the primer rebuilds from this header.
                         p.primer.lock().unwrap().reset(gen_at_connect);
@@ -688,39 +679,111 @@ fn ensure_pump(store: StreamUrlStore) {
                     // （虎牙/B站/抖音保持原有一次性直通 + 断线重签路径）。
                     let renew_ctx = douyu_renew_context(&store);
                     let mut renewal = renew_ctx.is_some();
-                    // 接续段标记：只有「斗鱼无缝续流」的新段走 tag 级裁剪路径。
+                    // 接续段标记：只有「斗鱼无缝续流」的新段走 tag 级去重路径。
                     // 普通断线重连必须继续走 framer 直通 + 关键帧对齐路径，否则
                     // 无法按 FLV 解析的上游（如测试用的填充数据）会被整段丢弃。
                     let mut continuation = !new_source && renewal;
-                    let mut waiting_keyframe = continuation;
+                    // 重连（非首段）时，首段直通路径必须等到视频关键帧才开始转发，
+                    // 否则从 GOP 中间接进去会花屏；斗鱼续流走 tag 级去重路径，不在此列。
+                    let mut waiting_keyframe = !new_source;
                     let mut segment = flv_relay::Segment::new(continuation);
                     let mut framer = FlvFramer::new();
                     let mut demuxer = flv_relay::FlvDemuxer::default();
-                    let mut timeline = flv_relay::Timeline::default();
-                    let mut prefetch: Option<
-                        tokio::task::JoinHandle<
-                            Result<(flv_relay::UpstreamBody, String), String>,
-                        >,
-                    > = None;
                     let mut renew_failures: u32 = 0;
                     let mut segment_swaps: u32 = 0;
+                    // 已转发到客户端的最新音视频时间戳（接续去重靠它）。
+                    let mut last_video_fwd: u32 = 0;
+                    let mut last_audio_fwd: u32 = 0;
+                    // 后台中继：新连接一建立就由独立任务**持续**把字节送进通道。
+                    // 关键：取直链、建连、追平直播沿这些耗时的事全在独立任务里做，pump
+                    // 主循环从头到尾没有一次为续流而停顿的 await。之前的「预取一小段缓冲」
+                    // 设计行不通 —— 斗鱼新连接的内容比直播沿落后数秒且同样 1x 推进，
+                    // 固定缓冲永远凑不出超前的内容；只有持续中继才能在切换瞬间就有活数据。
+                    let (stage_tx, mut stage_rx) = tokio::sync::mpsc::unbounded_channel::<
+                        Result<flv_relay::StagedSegment, String>,
+                    >();
+                    let mut staging = false;
+                    let mut relay: Option<flv_relay::StagedSegment> = None;
+                    // 上一次中继尝试的时间：失败后留 3s 退避，避免每个 chunk 都重打播放接口。
+                    let mut last_stage_attempt: Option<tokio::time::Instant> = None;
+                    let mut splice_logged = [false, false]; // [video, audio]
+                    // 「有数据进来但什么都没转发出去」持续多久了。真出现说明续流的时间戳
+                    // 标记已失效（例如新连接内容长期落后于标记、全被去重丢掉），必须整体
+                    // 重同步，绝不能带着冻结的标记无限空转（用户看到的就是永久转圈）。
+                    let mut starved_since: Option<std::time::Instant> = None;
+
+                    macro_rules! switch_to_relay {
+                        ($st:expr) => {
+                            apply_relay_switch(
+                                $st,
+                                &p,
+                                &tx,
+                                &store,
+                                gen_at_connect,
+                                &mut offset_total,
+                                &mut last_video_fwd,
+                                &mut last_audio_fwd,
+                                &mut stream,
+                                &mut continuation,
+                                &mut waiting_keyframe,
+                                &mut segment,
+                                &mut demuxer,
+                                &mut renew_failures,
+                                &mut segment_swaps,
+                                &note_store_sign_now,
+                                pump_id,
+                            )
+                        };
+                    }
 
                     'segments: loop {
-                        while let Some(chunk) = stream.next().await {
+                        // 上游静默 / 无客户端 两个看门狗都靠 chunk 循环里判定。
+                        #[allow(unused_assignments)]
+                        let mut silent = false; // true = 静默超时断开（不是正常 EOF）
+                        let mut idle_since: Option<std::time::Instant> = None;
+                        loop {
+                            let chunk = match tokio::time::timeout(
+                                UPSTREAM_SILENCE_TIMEOUT,
+                                stream.next_chunk(),
+                            )
+                            .await
+                            {
+                                Ok(Some(c)) => c,
+                                Ok(None) => {
+                                    silent = false;
+                                    break;
+                                }
+                                Err(_) => {
+                                    silent = true;
+                                    break;
+                                }
+                            };
+                            // 没人看了就别再烧上行带宽：过一会儿自行退出，
+                            // 下次有客户端请求时 ensure_pump 会重新拉起。
+                            if CLIENT_COUNT.load(Ordering::Relaxed) == 0 {
+                                match idle_since {
+                                    Some(t) if t.elapsed() >= IDLE_PUMP_SHUTDOWN => {
+                                        crate::tl!(
+                                            "proxy",
+                                            "pump #{} idle (0 clients) for {}s -> shutting down, will respawn on next request",
+                                            pump_id,
+                                            IDLE_PUMP_SHUTDOWN.as_secs()
+                                        );
+                                        return;
+                                    }
+                                    Some(_) => {}
+                                    None => idle_since = Some(std::time::Instant::now()),
+                                }
+                            } else {
+                                idle_since = None;
+                            }
                             if store.generation.load(Ordering::SeqCst) != gen_at_connect {
                                 crate::tl!("proxy", "[proxy] stream source changed -> switch upstream");
                                 break 'segments;
                             }
-                            let bytes = match chunk {
-                                Ok(b) => b,
-                                Err(e) => {
-                                    crate::tl!("proxy", "[proxy] pump chunk error: {} (after {} chunks/{} bytes) -> reconnect", e, session_chunks, session_bytes);
-                                    break;
-                                }
-                            };
-                            session_bytes += bytes.len() as u64;
+                            session_bytes += chunk.len() as u64;
                             session_chunks += 1;
-                            last_beat += bytes.len() as u64;
+                            last_beat += chunk.len() as u64;
                             if beat_at.elapsed() >= Duration::from_secs(60) {
                                 crate::tl!(
                                     "proxy",
@@ -745,25 +808,68 @@ fn ensure_pump(store: StreamUrlStore) {
                                 p.task_spawns.store(0, Ordering::SeqCst);
                             }
 
-                            // 旧流临近 300s TTL 时提前取好下一条，切换时零空档。
-                            if renewal && prefetch.is_none() && segment.should_prefetch() {
+                            // 临近 TTL 时启动后台中继（只启动一次；失败后 3s 退避重试）。
+                            if renewal
+                                && !staging
+                                && relay.is_none()
+                                && segment.should_prefetch()
+                                && last_stage_attempt.map_or(true, |t| t.elapsed() >= Duration::from_secs(3))
+                            {
+                                last_stage_attempt = Some(tokio::time::Instant::now());
                                 if let Some(ctx) = renew_ctx.clone() {
                                     let c = client.clone();
-                                    prefetch = Some(tokio::spawn(async move {
-                                        flv_relay::acquire_douyu_stream(&ctx, &c).await
-                                    }));
-                                    crate::tl!("proxy", "[proxy] pump #{} prefetching next douyu segment", pump_id);
+                                    let txc = stage_tx.clone();
+                                    tokio::spawn(async move {
+                                        let r = flv_relay::open_staged_relay(&ctx, &c).await;
+                                        let _ = txc.send(r);
+                                    });
+                                    staging = true;
+                                    crate::tl!(
+                                        "proxy",
+                                        "pump #{} opening staged relay in background at t={:.1}s (non-blocking)",
+                                        pump_id,
+                                        segment.elapsed().as_secs_f64()
+                                    );
+                                }
+                            }
+
+                            // 中继就绪：先拿着，等旧流 EOF 时切换（切换前排空积压）。
+                            match stage_rx.try_recv() {
+                                Ok(Ok(st)) => {
+                                    if store.generation.load(Ordering::SeqCst) != gen_at_connect {
+                                        crate::tl!("proxy", "pump #{} relay ready but source changed -> dropping it", pump_id);
+                                        break 'segments;
+                                    }
+                                    staging = false;
+                                    crate::tl!(
+                                        "proxy",
+                                        "pump #{} staged relay ready, {}ms after open (will splice at old-stream EOF)",
+                                        pump_id,
+                                        st.relay_started_at.elapsed().as_millis()
+                                    );
+                                    relay = Some(st);
+                                }
+                                Ok(Err(e)) => {
+                                    staging = false;
+                                    renew_failures += 1;
+                                    crate::tl!(
+                                        "proxy",
+                                        "pump #{} staged relay failed ({}/{}): {}",
+                                        pump_id, renew_failures, flv_relay::MAX_CONSECUTIVE_FAILURES, e
+                                    );
+                                }
+                                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+                                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                                    staging = false;
                                 }
                             }
 
                             // 续流平台：旁路解析，只为记下时间轴位置供接续对齐。
                             // 首段的转发仍是原始上游字节块，写入粒度不变。
                             if renewal && !continuation {
-                                demuxer.push(&bytes);
+                                demuxer.push(&chunk);
                                 demuxer.take_header();
-                                while let Some(tag) = demuxer.next_tag() {
-                                    timeline.observe(&tag);
-                                }
+                                while demuxer.next_tag().is_some() {}
                                 if demuxer.is_desynced() {
                                     crate::tl!("proxy", "[proxy] upstream is not parsable FLV; disabling seamless renewal");
                                     renewal = false;
@@ -771,175 +877,258 @@ fn ensure_pump(store: StreamUrlStore) {
                                 }
                             }
 
+                            let mut kept_this_chunk: usize = 0;
                             if continuation {
                                 // 接续段：整 tag 裁剪后聚合发出。
-                                demuxer.push(&bytes);
-                                // 新段的文件头必须丢弃，播放器只认首段那一个。
-                                demuxer.take_header();
-                                let mut out = bytes::BytesMut::new();
-                                while let Some(tag) = demuxer.next_tag() {
-                                    if waiting_keyframe {
-                                        // 元数据与初始化 tag 一律丢掉：播放器已经初始化过了，
-                                        // 重发一份 onMetaData / sequence header 会让部分播放器
-                                        // 直接报解码错误。
-                                        if tag.tag_type == flv_relay::TAG_TYPE_SCRIPT
-                                            || tag.is_sequence_header
-                                        {
-                                            continue;
+                                let mut payload = bytes::BytesMut::with_capacity(chunk.len());
+                                let mut kept = 0;
+                                let mut dropped_audio = 0;
+                                let mut dropped_video = 0;
+                                {
+                                    // 必须复用同一个 demuxer：FLV tag 会被 chunk 边界切开，
+                                    // 每个 chunk 新建一个解析器会把半截 tag 丢掉（撕裂的
+                                    // tag 让解码器错位 —— 就是用户看到的马赛克/花屏）。
+                                    demuxer.push(&chunk);
+                                    demuxer.take_header(); // 新段的文件头丢掉，播放器已拿到首段那一个
+                                    while let Some(tag) = demuxer.next_tag() {
+                                        match tag.tag_type {
+                                            flv_relay::TAG_TYPE_AUDIO => {
+                                                // 音频帧很小，只保留时间戳严格超前于已发
+                                                // 音频的那些；旧的/重复的一律丢掉，避免
+                                                // SourceBuffer.appendBuffer 报 QuotaExceeded。
+                                                if tag.timestamp <= last_audio_fwd {
+                                                    dropped_audio += 1;
+                                                    continue;
+                                                }
+                                                last_audio_fwd = tag.timestamp;
+                                            }
+                                            flv_relay::TAG_TYPE_VIDEO => {
+                                                if tag.timestamp <= last_video_fwd {
+                                                    dropped_video += 1;
+                                                    continue;
+                                                }
+                                                last_video_fwd = tag.timestamp;
+                                            }
+                                            _ => continue, // ONEDIATA/序列头：整场只认第一次
                                         }
-                                        let is_video = tag.tag_type == flv_relay::TAG_TYPE_VIDEO;
-                                        let prev = if is_video {
-                                            timeline.last_video().unwrap_or(0)
-                                        } else {
-                                            timeline.last_audio().unwrap_or(0)
-                                        };
-                                        // CDN 回吐的历史 GOP：时间戳没越过已转发位置，必须丢，
-                                        // 否则播放器看到时间戳倒退就会报错/卡住。
-                                        if tag.timestamp <= prev {
-                                            continue;
-                                        }
-                                        let hole = tag.timestamp.saturating_sub(prev);
-                                        // 关键：新旧两段是同一次推流会话（同编码器、同 GOP 边界、
-                                        // 绝对时间戳），所以「刚好接上」的那一帧所属 GOP 的关键帧
-                                        // 旧段已经转发过 -> 直接续上既没有空洞也可解码。
-                                        // 只有真的存在内容空洞时才退回到「等下一个关键帧」，
-                                        // 用一次轻微花屏换取不断流。
-                                        let gapless = hole <= MAX_GAPLESS_RESUME_MS;
-                                        if is_video && !gapless && !tag.is_keyframe {
-                                            continue;
-                                        }
-                                        if is_video {
-                                            waiting_keyframe = false;
-                                        }
-                                        crate::tl!(
-                                            "proxy",
-                                            "pump #{} SPLICED renewal: {} ts {} <- {} (gap {}ms, keyframe={}, audio_prev={:?})",
-                                            pump_id,
-                                            if is_video { "video" } else { "audio" },
-                                            tag.timestamp,
-                                            prev,
-                                            hole,
-                                            tag.is_keyframe,
-                                            timeline.last_audio()
-                                        );
-                                    } else if tag.tag_type != flv_relay::TAG_TYPE_SCRIPT
-                                        && !timeline.is_ahead(&tag)
-                                    {
-                                        // CDN 会回吐一个 GOP 的缓冲，重复部分直接丢弃。
-                                        continue;
+                                        payload.extend_from_slice(&tag.raw);
+                                        kept += 1;
                                     }
-                                    timeline.observe(&tag);
-                                    out.extend_from_slice(&tag.raw);
+                                }
+                                kept_this_chunk = kept;
+                                if kept > 0 {
+                                    let payload = payload.freeze();
+                                    let offset_before = offset_total;
+                                    offset_total = offset_total.wrapping_add(payload.len() as u64);
+                                    p.primer.lock().unwrap().feed(&payload, gen_at_connect, offset_total);
+                                    p.header_sent.store(true, Ordering::SeqCst);
+                                    p.broadcast_started.store(true, Ordering::SeqCst);
+                                    let _ = tx.send((gen_at_connect, offset_before, payload));
+                                } else if (dropped_audio > 0 || dropped_video > 0)
+                                    && !std::mem::replace(
+                                        &mut splice_logged[if dropped_video > 0 { 1 } else { 0 }],
+                                        true,
+                                    )
+                                {
+                                    crate::tl!(
+                                        "proxy",
+                                        "pump #{} skipped {} audio tags / {} video tags not ahead of dedup markers (v={} a={})",
+                                        pump_id, dropped_audio, dropped_video, last_video_fwd, last_audio_fwd
+                                    );
+                                }
+                            } else {
+                                // 首段路径：按整 tag 边界转发，绝不广播半个 FLV tag
+                                // （半个 tag 会让解码器错位，出现马赛克直到下一个关键帧）。
+                                let units = framer.push(&chunk);
+                                if units.is_empty() {
+                                    continue; // 还差一个完整 tag，继续攒
+                                }
+                                let mut out = bytes::BytesMut::with_capacity(chunk.len() + 64);
+                                for unit in units {
+                                    match unit {
+                                        FlvUnit::Header(h) => {
+                                            // 重连（不是全新源）时客户端已经拿到过 FLV 文件头，
+                                            // 再发一次会让 xgplayer/MSE 认为流重新开始（表现为
+                                            // 「请刷新」）。primer 同理：它已抓住 head，多喂 13
+                                            // 字节会被当成 tag 头解析而错位，所以整块丢弃。
+                                            if new_source {
+                                                out.extend_from_slice(&h);
+                                            }
+                                        }
+                                        FlvUnit::Raw(r) => out.extend_from_slice(&r),
+                                        FlvUnit::Tag { bytes: tag, is_keyframe, timestamp, tag_type } => {
+                                            if waiting_keyframe {
+                                                if tag_type == flv_relay::TAG_TYPE_VIDEO && is_keyframe {
+                                                    waiting_keyframe = false;
+                                                } else {
+                                                    continue; // 关键帧之前的内容丢掉，避免花屏
+                                                }
+                                            }
+                                            match tag_type {
+                                                flv_relay::TAG_TYPE_AUDIO => {
+                                                    last_audio_fwd = last_audio_fwd.max(timestamp);
+                                                }
+                                                flv_relay::TAG_TYPE_VIDEO => {
+                                                    last_video_fwd = last_video_fwd.max(timestamp);
+                                                }
+                                                _ => {}
+                                            }
+                                            out.extend_from_slice(&tag);
+                                        }
+                                    }
                                 }
                                 if !out.is_empty() {
+                                    kept_this_chunk = 1;
                                     let payload = out.freeze();
                                     let offset_before = offset_total;
-                                    offset_total += payload.len() as u64;
-                                    p.primer
-                                        .lock()
-                                        .unwrap()
-                                        .feed(&payload, gen_at_connect, offset_total);
+                                    offset_total = offset_total.wrapping_add(payload.len() as u64);
+                                    p.primer.lock().unwrap().feed(&payload, gen_at_connect, offset_total);
                                     p.header_sent.store(true, Ordering::SeqCst);
                                     p.broadcast_started.store(true, Ordering::SeqCst);
                                     let _ = tx.send((gen_at_connect, offset_before, payload));
                                 }
-                                continue;
                             }
 
-                            for unit in framer.push(&bytes) {
-                                // Decide what to put on the wire. `forward` is the
-                                // byte payload clients receive; it is always a whole
-                                // tag (or the header), never a fragment.
-                                let forward: Option<bytes::Bytes> = match unit {
-                                    FlvUnit::Header(h) => {
-                                        // Only a new source broadcasts the header;
-                                        // repeating it mid-stream corrupts attached
-                                        // decoders.
-                                        if new_source { Some(h) } else { None }
-                                    }
-                                    FlvUnit::Tag { bytes, is_keyframe, .. } => {
-                                        if await_keyframe {
-                                            if is_keyframe {
-                                                await_keyframe = false;
-                                                crate::tl!("proxy", "[proxy] pump #{} resumed at keyframe after reconnect", pump_id);
-                                                Some(bytes)
-                                            } else {
-                                                // Drop mid-GOP tags until the first keyframe.
-                                                None
-                                            }
-                                        } else {
-                                            Some(bytes)
-                                        }
-                                    }
-                                    FlvUnit::Raw(b) => {
-                                        // Non-FLV (tests/mocks): on a reconnect we
-                                        // cannot realign, so forward from the start.
-                                        await_keyframe = false;
-                                        Some(b)
-                                    }
-                                };
+                            // 安全网：长时间一帧都发不出去 = 时间轴标记失效，硬重同步，
+                            // 绝不能像旧版那样带着冻结的标记无限空转（用户会永远卡住）。
+                            if kept_this_chunk == 0 {
+                                let since = *starved_since.get_or_insert_with(std::time::Instant::now);
+                                if since.elapsed() >= STARVE_TIMEOUT {
+                                    // 连续这么多 chunk 都没转发出去任何 tag：说明续流的时间戳
+                                    // 标记已经失效（例如新连接的内容长期落后于标记，全被去重
+                                    // 丢掉），客户端只会一直转圈。必须整体重同步：bump generation
+                                    // 让所有客户端断开重连（拿到干净的 primer），同时重连上游。
+                                    // 绝不能像以前那样带着冻结的标记无限空转。
+                                    crate::tl!(
+                                        "proxy",
+                                        "pump #{} kept receiving chunks but forwarded nothing for {:.0}s (markers v={} a={}) -> HARD RESYNC: bumping generation and reconnecting upstream",
+                                        pump_id, since.elapsed().as_secs_f32(), last_video_fwd, last_audio_fwd
+                                    );
+                                    commit_new_source(&store);
+                                    break 'segments;
+                                }
+                            } else {
+                                starved_since = None;
+                            }
 
-                                let Some(payload) = forward else { continue };
-                                let offset_before = offset_total;
-                                offset_total += payload.len() as u64;
-                                // Feed the primer EXACTLY what goes on the wire so its
-                                // offsets stay aligned with the broadcast offsets used
-                                // for late-join de-duplication.
-                                p.primer.lock().unwrap().feed(&payload, gen_at_connect, offset_total);
-                                p.header_sent.store(true, Ordering::SeqCst);
-                                p.broadcast_started.store(true, Ordering::SeqCst);
-                                let _ = tx.send((gen_at_connect, offset_before, payload));
+                            // 中继内容一旦超前于「已转发位置」就立刻切换，不必等旧流 EOF：
+                            // 旧流剩下的内容比新连接更落后，丢掉它反而让客户端时间轴无缝。
+                            // （等 EOF 才切的话，若新连接起播回吐更深，切换点就会留下几秒空洞，
+                            //   播放器缓冲被抽干 -> 卡住转圈 / 提示刷新。）
+                            let mut relay_dead = false;
+                            let ahead = if let Some(st) = relay.as_mut() {
+                                st.poll();
+                                match st.video_ts() {
+                                    Some(v) if v > last_video_fwd => true,
+                                    // 中继连接已经结束却仍然落后于标记：这条废连接留着
+                                    // 只会挡住下一次预取，丢掉它让 pump 重新取流。
+                                    _ => {
+                                        relay_dead = st.is_done();
+                                        false
+                                    }
+                                }
+                            } else {
+                                false
+                            };
+                            if relay_dead {
+                                crate::tl!(
+                                    "proxy",
+                                    "pump #{} staged relay ended before it got ahead (v={:?} marker={}) -> discarding it and re-prefetching",
+                                    pump_id,
+                                    relay.as_ref().and_then(|s| s.video_ts()),
+                                    last_video_fwd
+                                );
+                                relay = None;
+                                staging = false;
+                            }
+                            if ahead {
+                                if store.generation.load(Ordering::SeqCst) != gen_at_connect {
+                                    crate::tl!("proxy", "pump #{} relay ahead but source changed -> dropping it", pump_id);
+                                    break 'segments;
+                                }
+                                let st = relay.take().expect("relay checked above");
+                                crate::tl!(
+                                    "proxy",
+                                    "pump #{} relay reached v={:?} > marker v={} after {}ms -> switching early (old stream still had {}s left)",
+                                    pump_id,
+                                    st.video_ts(),
+                                    last_video_fwd,
+                                    st.relay_started_at.elapsed().as_millis(),
+                                    flv_relay::STREAM_TTL.as_secs_f32() - segment.elapsed().as_secs_f32()
+                                );
+                                if !switch_to_relay!(st) {
+                                    break 'segments;
+                                }
+                                continue 'segments;
                             }
                         }
 
-                        // ---- upstream segment ended ----
+                        // ---- 上游段结束（正常 EOF 或静默超时）----
+                        if silent {
+                            crate::tl!(
+                                "proxy",
+                                "[proxy] pump #{} upstream silent for {}s, {} clients, lived {:?} -> dropping the connection and renewing",
+                                pump_id,
+                                UPSTREAM_SILENCE_TIMEOUT.as_secs(),
+                                CLIENT_COUNT.load(Ordering::Relaxed),
+                                connected_at.elapsed()
+                            );
+                        }
                         if !renewal || renew_ctx.is_none() {
                             break;
                         }
-                        // 只有在真的做过无缝续流（或即将做）时才继续拼接下一段。
                         if store.generation.load(Ordering::SeqCst) != gen_at_connect {
                             break;
                         }
 
-                        // 预取已就绪就直接用；否则说明是提前故障，同步补取一条。
-                        let acquired = match prefetch.take() {
-                            Some(handle) => match handle.await {
-                                Ok(r) => r,
-                                Err(e) => Err(format!("预取任务异常: {}", e)),
-                            },
+                        // 有后台中继就直接用；在跑就等它交回；都没有就同步开一条。
+                        let mut seg = relay.take();
+                        if seg.is_none() && staging {
+                            staging = false;
+                            seg = match tokio::time::timeout(
+                                flv_relay::STAGE_TIMEOUT + Duration::from_secs(5),
+                                stage_rx.recv(),
+                            )
+                            .await
+                            {
+                                Ok(Some(Ok(st))) => Some(st),
+                                Ok(Some(Err(e))) => {
+                                    renew_failures += 1;
+                                    crate::tl!(
+                                        "proxy",
+                                        "pump #{} staged relay failed at EOF ({}/{}): {}",
+                                        pump_id, renew_failures, flv_relay::MAX_CONSECUTIVE_FAILURES, e
+                                    );
+                                    None
+                                }
+                                Ok(None) => None,
+                                Err(_) => {
+                                    crate::tl!("proxy", "pump #{} staged relay did not answer in time; opening synchronously", pump_id);
+                                    None
+                                }
+                            };
+                        }
+                        if seg.is_none() {
+                            match flv_relay::open_staged_relay(renew_ctx.as_ref().unwrap(), &client).await {
+                                Ok(st) => seg = Some(st),
+                                Err(e) => {
+                                    renew_failures += 1;
+                                    crate::tl!(
+                                        "proxy",
+                                        "[proxy] pump #{} renewal failed {}/{}: {}",
+                                        pump_id, renew_failures, flv_relay::MAX_CONSECUTIVE_FAILURES, e
+                                    );
+                                }
+                            }
+                        }
+                        match seg {
+                            Some(st) => {
+                                if switch_to_relay!(st) {
+                                    continue 'segments;
+                                }
+                                break;
+                            }
                             None => {
-                                flv_relay::acquire_douyu_stream(renew_ctx.as_ref().unwrap(), &client)
-                                    .await
-                            }
-                        };
-                        match acquired {
-                            Ok((body, fresh_url)) => {
-                                *store.url.lock().unwrap() = fresh_url;
-                                note_store_sign_now();
-                                renew_failures = 0;
-                                segment_swaps += 1;
-                                crate::tl!("proxy", 
-                                    "[proxy] pump #{} seamlessly renewed douyu stream (swap #{}, {} clients)",
-                                    pump_id,
-                                    segment_swaps,
-                                    CLIENT_COUNT.load(Ordering::Relaxed)
-                                );
-                                stream = body;
-                                continuation = true;
-                                waiting_keyframe = true;
-                                segment = flv_relay::Segment::new(true);
-                                demuxer.reset();
-                                // primer 保留已抓到的 head/config/keyframe，迟到
-                                // 客户端在接续后依然拿到完整解码起点。
-                                p.primer.lock().unwrap().clear_pending();
-                                p.header_sent.store(true, Ordering::SeqCst);
-                            }
-                            Err(e) => {
-                                renew_failures += 1;
-                                crate::tl!("proxy", 
-                                    "[proxy] pump #{} renewal failed {}/{}: {}",
-                                    pump_id, renew_failures, flv_relay::MAX_CONSECUTIVE_FAILURES, e
-                                );
                                 if renew_failures >= flv_relay::MAX_CONSECUTIVE_FAILURES {
                                     renewal = false;
                                     break;
@@ -1013,6 +1202,19 @@ fn ensure_pump(store: StreamUrlStore) {
     });
 }
 
+/// 上游静默看门狗：连接还开着但这么久没有任何字节 -> 判定为 CDN 卡死，主动断开重连。
+/// 没有它，客户端只会一直转圈（斗鱼偶发的「看着看着就不动了」）。
+pub const UPSTREAM_SILENCE_TIMEOUT: Duration = Duration::from_secs(20);
+/// 没有任何客户端时，pump 继续拉流这么久后自行退出（下次请求会重新拉起），
+/// 避免后台一直烧带宽。
+pub const IDLE_PUMP_SHUTDOWN: Duration = Duration::from_secs(90);
+
+pub const BROADCAST_RING_CAP: usize = 1024;
+
+/// 收到 chunk 但连续这么久一帧都没转发出去 -> 判定续流时间轴标记失效，整体重同步。
+/// （远大于一个 GOP，正常的关键帧等待不会误触发。）
+pub const STARVE_TIMEOUT: Duration = Duration::from_secs(15);
+
 pub static CLIENT_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Epoch-ms when the store URL was last signed (by the frontend or the pump's
@@ -1052,6 +1254,12 @@ struct ClientStream {
     /// skipped so nothing is delivered twice.
     primer_offset: u64,
     expect_gen: Option<u64>,
+    /// 下一个字节的广播偏移（None = 还没收到第一条，此时从哪儿起都算对齐）。
+    /// 广播消息必须首尾相接：中间少了字节说明这个客户端被环形缓冲甩掉了
+    /// （消息被覆盖）。继续发下去客户端拿到的是撕裂的 FLV tag —— 表现就是
+    /// 花屏/马赛克、解码错误、播放器提示「请刷新」。所以一旦发现空洞就立刻
+    /// 结束响应，让客户端重连并从 primer 对齐续读。
+    next_offset: Option<u64>,
 }
 
 impl Drop for ClientStream {
@@ -1093,11 +1301,37 @@ impl futures_util::Stream for ClientStream {
                         // The primer ended inside this chunk: hand over only the
                         // part it does not already contain (no gap, no overlap).
                         let skip = (self.primer_offset - offset) as usize;
+                        self.next_offset = Some(end);
                         return std::task::Poll::Ready(Some(Ok(bytes.slice(skip..))));
                     }
+                    if let Some(expect) = self.next_offset {
+                        if offset != expect {
+                            crate::tl!(
+                                "proxy",
+                                "[proxy] client stream hole: expected offset {} but got {} ({} bytes missing) -> ending response so it reconnects with a fresh primer",
+                                expect,
+                                offset,
+                                offset.saturating_sub(expect)
+                            );
+                            return std::task::Poll::Ready(None);
+                        }
+                    }
+                    self.next_offset = Some(end);
                     return std::task::Poll::Ready(Some(Ok(bytes)));
                 }
-                std::task::Poll::Ready(Some(Err(_))) => continue, // lagged: skip to live edge
+                std::task::Poll::Ready(Some(Err(e))) => {
+                    // 客户端读得比 pump 广播得慢，环形缓冲把它落后的消息覆盖了。
+                    // 绝不能静默跳过：被跳过的字节会让客户端的 FLV 流错位
+                    // （撕裂的 tag -> 花屏 / 解码错误 / 播放器提示「请刷新」）。
+                    // 正确做法是结束这个响应，客户端自动重连后会拿到 primer
+                    // （文件头 + 配置 + 最近关键帧）并从对齐的位置续读。
+                    crate::tl!(
+                        "proxy",
+                        "[proxy] client lost the broadcast window ({}) -> ending response so it reconnects with a fresh primer",
+                        e
+                    );
+                    return std::task::Poll::Ready(None);
+                }
                 std::task::Poll::Ready(None) => return std::task::Poll::Ready(None),
                 std::task::Poll::Pending => return std::task::Poll::Pending,
             }
@@ -1167,6 +1401,9 @@ async fn flv_proxy_handler(
             }
         }
     };
+    // 只有拿到了 primer 的客户端才从 primer_offset 开始要求连续；
+    // 全新加入的客户端从当前直播位置起读，第一条消息不算空洞。
+    let resume_offset = if primer.is_some() { Some(primer_offset) } else { None };
     HttpResponse::Ok()
         .content_type("video/x-flv")
         .insert_header(("Connection", "keep-alive"))
@@ -1177,6 +1414,7 @@ async fn flv_proxy_handler(
             primer,
             primer_offset,
             expect_gen: None,
+            next_offset: resume_offset,
         })
 }
 
@@ -1224,6 +1462,120 @@ async fn image_proxy_handler(
         }
         Err(e) => HttpResponse::InternalServerError().body(format!("Connection error: {}", e)),
     }
+}
+
+/// 把后台中继的新连接接上：先排空通道里已积压的字节（按音/视频轨时间戳去重），
+/// 广播差量，然后把 stream 换成中继通道继续读。
+///
+/// 返回 true 表示已切换（调用方应结束当前段循环）。
+#[allow(clippy::too_many_arguments)]
+fn apply_relay_switch<F: Fn()>(
+    st: flv_relay::StagedSegment,
+    p: &Arc<SharedPump>,
+    tx: &broadcast::Sender<(u64, u64, bytes::Bytes)>,
+    store: &crate::StreamUrlStore,
+    gen_at_connect: u64,
+    offset_total: &mut u64,
+    last_video_fwd: &mut u32,
+    last_audio_fwd: &mut u32,
+    stream: &mut flv_relay::SourceBody,
+    continuation: &mut bool,
+    waiting_keyframe: &mut bool,
+    segment: &mut flv_relay::Segment,
+    demuxer: &mut flv_relay::FlvDemuxer,
+    renew_failures: &mut u32,
+    segment_swaps: &mut u32,
+    note_sign: &F,
+    pump_id: u64,
+) -> bool {
+    let mut st = st;
+    // 标记「已接手」：中继任务的上限从此失效，否则它会在十几秒后把这条
+    // 正在直播的连接掐断（表现为反复重签 + 画面每 20s 断一次）。
+    st.consumed.store(true, Ordering::Relaxed);
+    st.poll();
+    let drained = st.take_buffered();
+    let drained_head = {
+        let n = drained.len().min(6);
+        drained[..n].iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ")
+    };
+    let flv_relay::StagedSegment { url, body, relay_started_at, .. } = st;
+
+    // 排空积压：按轨去重后剩下的正好接在已转发位置之后。
+    let mut payload = bytes::BytesMut::with_capacity(drained.len());
+    let mut dropped = 0usize;
+    let mut kept = 0usize;
+    // 复用 pump 的 demuxer：排空得到的字节可能在 tag 中间断开，剩下的半截要留给
+    // 切换后的 chunk 继续解析，否则就是撕裂 tag（马赛克/解码错误）。
+    demuxer.reset();
+    demuxer.push(&drained);
+    demuxer.take_header();
+    while let Some(tag) = demuxer.next_tag() {
+        let duplicate = match tag.tag_type {
+            flv_relay::TAG_TYPE_AUDIO => {
+                if tag.timestamp <= *last_audio_fwd {
+                    dropped += 1;
+                    true
+                } else {
+                    *last_audio_fwd = tag.timestamp;
+                    false
+                }
+            }
+            flv_relay::TAG_TYPE_VIDEO => {
+                if tag.timestamp <= *last_video_fwd {
+                    dropped += 1;
+                    true
+                } else {
+                    *last_video_fwd = tag.timestamp;
+                    false
+                }
+            }
+            _ => true, // 脚本/序列头：整场只认第一次
+        };
+        if duplicate {
+            continue;
+        }
+        payload.extend_from_slice(&tag.raw);
+        kept += 1;
+    }
+
+    let offset_before = *offset_total;
+    if !payload.is_empty() {
+        let payload = payload.freeze();
+        *offset_total = offset_total.wrapping_add(payload.len() as u64);
+        // primer 喂进去的必须和广播出去的严格一致，迟到客户端的 resume 偏移才对得上。
+        p.primer.lock().unwrap().feed(&payload, gen_at_connect, *offset_total);
+        p.header_sent.store(true, Ordering::SeqCst);
+        p.broadcast_started.store(true, Ordering::SeqCst);
+        let _ = tx.send((gen_at_connect, offset_before, payload));
+    }
+
+    *store.url.lock().unwrap() = url;
+    note_sign();
+    *renew_failures = 0;
+    *segment_swaps += 1;
+
+    // 新连接已经在中继里活了 `preage`，下一次预取要按它的真实年龄提前触发。
+    let preage = relay_started_at.elapsed();
+    *stream = body;
+    *continuation = true;
+    *waiting_keyframe = false;
+    *segment = flv_relay::Segment::new_with_preage(true, preage);
+    crate::tl!(
+        "proxy",
+        "[proxy] pump #{} SEAMLESS relay swap #{} at offset {}: relay age {}ms, drained head={:?} ({} bytes) -> applied {} tags, dropped {} dup tags, markers v={} a={}, {} clients",
+        pump_id,
+        *segment_swaps,
+        offset_before,
+        preage.as_millis(),
+        drained_head,
+        drained.len(),
+        kept,
+        dropped,
+        last_video_fwd,
+        last_audio_fwd,
+        CLIENT_COUNT.load(Ordering::Relaxed)
+    );
+    true
 }
 
 pub async fn start_proxy_inner(
@@ -1370,6 +1722,7 @@ pub async fn start_static_proxy_server(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::StreamExt;
 
     /// Mock CDN: streams FLV header + 3x20KB per connection, then drops.
     async fn mock_cdn() -> u16 {
@@ -2152,6 +2505,7 @@ mod tests {
 
 #[cfg(test)]
 mod live_tests {
+    use futures_util::StreamExt;
     use super::*;
 
     /// Real Douyu CDN through the real HTTP endpoint (the exact cast path).
@@ -2308,6 +2662,11 @@ mod live_tests {
             tag_count, leftover);
         if let Some(break_at) = first_break {
             let window = &collected[break_at.saturating_sub(8)..(break_at + 24).min(collected.len())];
+            // 证据留存：撕裂点前后各 64KB，方便离线用 flv 解析器对照。
+            let lo = break_at.saturating_sub(65_536);
+            let hi = (break_at + 65_536).min(collected.len());
+            let _ = std::fs::write("/tmp/dtv_tear.bin", &collected[lo..hi]);
+            println!("[longrun] dumped tear window [{}, {}) -> /tmp/dtv_tear.bin", lo, hi);
             panic!(
                 "FLV structure broke at byte {} (after {} whole tags): {} - a torn/mid-tag forward leaked to the client",
                 break_at, tag_count,
@@ -2326,6 +2685,9 @@ mod live_tests {
         let mut regressions = 0usize;
         let mut first_reg: Option<(u32, u32)> = None;
         let mut keyframes = 0usize;
+        // 用户可见的另一个不变量：续流切换处不能出现大空洞（画面卡住/一直转圈）。
+        let mut max_video_gap = 0u32;
+        let mut max_gap_at: Option<(u32, u32)> = None;
         while walk + 11 <= collected.len() {
             let tag_type = collected[walk] & 0x1f;
             let size = ((collected[walk + 1] as usize) << 16)
@@ -2347,6 +2709,9 @@ mod live_tests {
                         if ts < prev {
                             regressions += 1;
                             if first_reg.is_none() { first_reg = Some((prev, ts)); }
+                        } else if ts.saturating_sub(prev) > max_video_gap {
+                            max_video_gap = ts - prev;
+                            max_gap_at = Some((prev, ts));
                         }
                     }
                     last_video_ts = Some(ts.max(last_video_ts.unwrap_or(0)));
@@ -2354,8 +2719,15 @@ mod live_tests {
             }
             walk += 11 + size + 4;
         }
-        println!("[longrun] video keyframes={} last_video_ts={:?} regressions={}",
-            keyframes, last_video_ts, regressions);
+        println!("[longrun] video keyframes={} last_video_ts={:?} regressions={} max_gap={}ms at {:?}",
+            keyframes, last_video_ts, regressions, max_video_gap, max_gap_at);
+        // 33ms/帧的流里，正常 GOP 间隔 < 2s；续流切换若留下 > 5s 的空洞，播放器缓冲
+        // 一定耗尽 -> 卡住转圈。这是「看着看着就停了」的直接判据。
+        assert!(
+            max_video_gap < 5_000,
+            "renewal left a {}ms video hole at {:?} -> the player would stall/spin",
+            max_video_gap, max_gap_at
+        );
         assert!(keyframes >= 2, "expected multiple keyframes across the run, got {}", keyframes);
         assert_eq!(regressions, 0,
             "video timestamps went backwards {} time(s) (first {:?}) - the splice fed replayed/stale frames",
@@ -2365,6 +2737,7 @@ mod live_tests {
 
 #[cfg(test)]
 mod live_tests_all_platforms {
+    use futures_util::StreamExt;
     use super::*;
 
     async fn verify_stream(name: &str, url: String, expect_flv: bool) {
@@ -2523,6 +2896,7 @@ mod live_tests_all_platforms {
 
 #[cfg(test)]
 mod live_cast_tv {
+    use futures_util::StreamExt;
     use super::*;
 
     /// End-to-end cast test: real Douyu CDN -> proxy -> real TV (DLNA SOAP).
@@ -2738,6 +3112,7 @@ mod live_cast_tv {
 
 #[cfg(test)]
 mod live_switch_tests {
+    use futures_util::StreamExt;
     use super::*;
     use super::tests::spawn_test_server;
 

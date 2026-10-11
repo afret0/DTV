@@ -1023,6 +1023,26 @@ export function MainPlayer({
             void reloadStreamRef.current?.("refresh");
           }, 15000);
         });
+        // 直播流正常情况下永远不会 ended。一旦 ended，说明代理结束了这条响应
+        // （房间/清晰度切换、客户端读得太慢被丢弃、上游重同步等）。立刻重连，
+        // 不要等 15s 的看门狗 —— 那样用户会看到十几秒的定格画面。
+        let lastEndedReloadAt = 0;
+        player.on?.("ended", () => {
+          if (!isSessionActive(sessionId)) return;
+          // 软切换 URL 时旧流也会 ended；3s 去抖避免自己触发连环重签
+          // （斗鱼的新签名会让旧连接立刻断开，反复重签反而把播放搞崩）。
+          if (Date.now() - lastEndedReloadAt < 3000) return;
+          lastEndedReloadAt = Date.now();
+          invoke("frontend_log", {
+            msg: `player ENDED on a live stream [${platform}/${roomId}] -> reloading immediately`
+          }).catch(() => {});
+          if (autoReconnectTimerRef.current) clearTimeout(autoReconnectTimerRef.current);
+          autoReconnectTimerRef.current = setTimeout(() => {
+            autoReconnectTimerRef.current = null;
+            void reloadStreamRef.current?.("refresh");
+          }, 300);
+        });
+
         player.on?.("playing", () => {
           // Healthy playback resets both reconnect budgets: a long session with
           // occasional blips must never exhaust them and stop auto-recovering.
@@ -1404,7 +1424,14 @@ export function MainPlayer({
     let lastTime = -1;
     let staleSamples = 0;
     let stallRecoveries = 0;
+    let lastRecoveryAt = 0;
     let lastHeartbeat = Date.now();
+    // 恢复预算绝不能「用完就彻底放弃」：直播是长时间挂着的场景，看门狗一旦触到
+    // 上限就再也不重载，用户会永久停在冻结帧上（一直转圈，只能杀进程重开）。
+    // 播放恢复健康后归还预算；预算耗尽也仍按冷却继续重试。
+    const MAX_BURST = 3;
+    const BURST_RESET_AFTER_MS = 120_000;
+    const RETRY_COOLDOWN_MS = 30_000;
 
     const id = window.setInterval(() => {
       const player: any = playerRef.current;
@@ -1421,10 +1448,16 @@ export function MainPlayer({
         staleSamples++;
       } else {
         staleSamples = 0;
+        // 播放确实在走：健康一段时间后把恢复预算还给看门狗。
+        if (lastRecoveryAt && Date.now() - lastRecoveryAt > BURST_RESET_AFTER_MS) {
+          stallRecoveries = 0;
+        }
       }
       lastTime = cur;
 
-      if (staleSamples >= 3 && stallRecoveries < 3) {
+      const canRecover =
+        stallRecoveries < MAX_BURST || Date.now() - lastRecoveryAt >= RETRY_COOLDOWN_MS;
+      if (staleSamples >= 3 && canRecover) {
         // Three consecutive frozen samples (~15s): describe the buffered state
         // first - this is the evidence that distinguishes "proxy stopped
         // feeding" from "player has a hole it cannot play through".
@@ -1440,6 +1473,7 @@ export function MainPlayer({
           buf = "n/a";
         }
         stallRecoveries++;
+        lastRecoveryAt = Date.now();
         staleSamples = 0;
         const holeAhead = (() => {
           try {
@@ -1456,7 +1490,7 @@ export function MainPlayer({
           }
         })();
         invoke("frontend_log", {
-          msg: `[player] STALL detected [${platform}/${roomId}] time=${cur.toFixed(1)} buffered=[${buf}] holeAhead=${holeAhead} readyState=${video.readyState} networkState=${video.networkState} recovery=${stallRecoveries}/3 -> reloading`
+          msg: `[player] STALL detected [${platform}/${roomId}] time=${cur.toFixed(1)} buffered=[${buf}] holeAhead=${holeAhead} readyState=${video.readyState} networkState=${video.networkState} recovery=${stallRecoveries} (burst=${MAX_BURST}) -> reloading`
         }).catch(() => {});
         void reloadStreamRef.current?.("refresh");
         return;
