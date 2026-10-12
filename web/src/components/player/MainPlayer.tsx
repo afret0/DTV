@@ -982,7 +982,11 @@ export function MainPlayer({
           invoke("frontend_log", { msg: `player PLAYING [${p}/${r}] kind=${playbackKindRef.current}` }).catch(() => {});
         });
         player.on?.("error", (err: any) => {
-          invoke("frontend_log", { msg: `player error event: ${JSON.stringify(err)?.slice(0, 300)}` }).catch(() => {});
+          // MediaError 的属性是 getter，JSON.stringify 会得到 {}；显式取 code/message。
+          const me = err?.mediaError;
+          invoke("frontend_log", {
+            msg: `player error event: code=${err?.errorCode} type=${err?.errorType} msg=${err?.message} mediaErrorCode=${me?.code ?? "n/a"} mediaErrorMsg=${me?.message ?? "n/a"} currentTime=${err?.currentTime?.toFixed?.(1)} readyState=${err?.readyState} networkState=${err?.networkState}`
+          }).catch(() => {});
           if (!isSessionActive(sessionId)) return;
           const errMsg = `${err?.message ?? ""}`;
           if (

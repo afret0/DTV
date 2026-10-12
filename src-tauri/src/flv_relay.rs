@@ -22,9 +22,11 @@ use std::time::{Duration, Instant};
 
 /// 斗鱼直链的硬性寿命。
 pub const STREAM_TTL: Duration = Duration::from_secs(300);
-/// 提前多久开始建中继连接。实测重新签名 + 建连 ~1~2s，8 秒余量足够；
-/// 留得过长会让中继在切换前白积压数据（每 1s 约 400KB）。
-pub const RENEW_LEAD: Duration = Duration::from_secs(8);
+/// 提前多久开始建中继连接。必须大于「CDN 回吐缓冲深度 + 一个 GOP」：
+/// 回吐深度实测 4~10s，GOP 约 2~5s；中继要先追到直播沿、再等到下一个 IDR
+/// 才能做对齐切换，这两步都必须在旧流 EOF 之前完成，否则只能退回会花屏的
+/// 兜底拼接。20s 余量对应的额外带宽约每次续流 10MB，可接受。
+pub const RENEW_LEAD: Duration = Duration::from_secs(20);
 /// 预取失败后的重试间隔。
 pub const RETRY_DELAY: Duration = Duration::from_millis(500);
 /// 后台中继最长等待时间：EOF 时若中继仍未就绪，超过这个时间就自己同步开一条，
@@ -242,44 +244,69 @@ pub type BoxedBytesStream = UpstreamBody;
 
 /// 重新取流：重新签名 + 建连，返回可直接读取的字节流。
 /// 预取与兜底重连共用。
+/// URL 的转码变体签名：斗鱼同一房间可能下发 30fps/60fps 等不同变体
+/// （URL 上的 `_4000` 后缀是可见信号），不同变体的 H.264 参考链互不兼容。
+pub fn url_variant_sig(url: &str) -> u8 {
+    u8::from(url.contains("_4000"))
+}
+
 pub async fn acquire_douyu_stream(
     ctx: &StreamRenewContext,
     client: &Client,
 ) -> Result<(UpstreamBody, String), String> {
-    let url = crate::platforms::douyu::get_stream_url_with_quality(
-        &ctx.room_id,
-        &ctx.quality,
-        ctx.line.as_deref(),
-    )
-    .await
-    .map_err(|e| format!("重新取流失败: {}", e))?;
-    let response = crate::proxy::build_upstream_request(client, &url)
-        .send()
+    acquire_douyu_stream_variant(ctx, client, None).await
+}
+
+/// `want_variant`：期望的变体签名。服务端偶尔会下发与当前播放不同的变体，
+/// 重试几次取流通常能拿回同变体直链；实在拿不到就用最后一次的结果
+/// （调用方会做兼容性判定，不兼容则走硬重同步）。
+pub async fn acquire_douyu_stream_variant(
+    ctx: &StreamRenewContext,
+    client: &Client,
+    want_variant: Option<u8>,
+) -> Result<(UpstreamBody, String), String> {
+    let mut last_url = String::new();
+    let mut last_body: Option<UpstreamBody> = None;
+    for attempt in 0..3 {
+        let url = crate::platforms::douyu::get_stream_url_with_quality(
+            &ctx.room_id,
+            &ctx.quality,
+            ctx.line.as_deref(),
+        )
         .await
-        .map_err(|e| format!("连接上游失败: {}", e))?;
-    if !response.status().is_success() {
-        return Err(format!("上游返回 {}", response.status()));
+        .map_err(|e| format!("重新取流失败: {}", e))?;
+        let ok = want_variant.map_or(true, |w| w == url_variant_sig(&url));
+        let response = crate::proxy::build_upstream_request(client, &url)
+            .send()
+            .await
+            .map_err(|e| format!("连接上游失败: {}", e))?;
+        if !response.status().is_success() {
+            return Err(format!("上游返回 {}", response.status()));
+        }
+        last_url = url.clone();
+        last_body = Some(Box::pin(response.bytes_stream()));
+        if ok || attempt == 2 {
+            if !ok {
+                eprintln!("[flv_relay] variant mismatch after 3 signs (want {:?}, got {})", want_variant, url_variant_sig(&url));
+            }
+            return Ok((last_body.take().unwrap(), last_url));
+        }
+        // 变体不符：丢掉这条连接再签一次。
     }
-    // 返回新地址：调用方（pump）负责写回 store，这样投屏 get_cast_info 和
-    // proxy handler 看到的都是最新签名，同时 generation 保持不变（这是同一条
-    // 逻辑流的延续，而不是切房间）。
-    Ok((Box::pin(response.bytes_stream()), url))
+    Ok((last_body.unwrap(), last_url))
 }
 
 /// 一条「正在被后台任务持续读取」的新上游连接。
 ///
-/// 实测事实：斗鱼新开的直链从 CDN 边缘缓存的某个关键帧开始（比直播沿落后
-/// 3~6 秒），并且同样以 1x 实时速率推进；旧连接也一样落后它自己的
-/// 「起播回吐深度」。两条连接的落后量互不相等，所以：
+/// 实测事实：斗鱼新开的直链从 CDN 边缘缓存的某个关键帧开始，和旧连接几乎
+/// 并排推进（差 0~1s）。切换采用「IDR 对齐切割」：记下中继的下一个关键帧 K，
+/// 旧流发布到 K+余量 时切到新流，K 这个 IDR 由旧流队列送达、其后内容由新流
+/// 接续 —— 解码器参考链在 K 处重置，时间轴无缺口、无重复。
+/// 若两条连接编码变体不同（帧率/序列头不一致，参考链互不兼容），则不做拼接，
+/// 改走硬重同步（客户端带 primer 重连）。
 ///
-/// * 新连接比旧连接靠前 -> 一旦它的内容超过「已转发位置」就**立刻**切换，
-///   旧连接剩下的内容直接丢弃（客户端时间轴上没有任何缺口）。
-/// * 新连接比旧连接靠后 -> 只能等旧连接 EOF 再切；此时去重会把落后的部分丢掉，
-///   缺口就是两条连接落后量之差（无法避免，但已经是理论下限）。
-///
-/// 因此这里提供 `poll()`：非阻塞地把中继通道里已到的字节搬进本地缓冲，并顺带
-/// 解析出「新连接目前推进到的时间戳」，让 pump 能在不阻塞转发的前提下判断
-/// 是否可以立刻切换。
+/// `poll()` 非阻塞地把中继通道里已到的字节搬进本地缓冲，并顺带解析时间戳 /
+/// 关键帧 / 序列头 / 帧率指纹，供 pump 决策。
 pub struct StagedSegment {
     /// 新直链，需要写回 store（投屏/handler 才能看到最新地址）。
     pub url: String,
@@ -295,6 +322,14 @@ pub struct StagedSegment {
     peek: FlvDemuxer,
     video_ts: Option<u32>,
     audio_ts: Option<u32>,
+    /// 新连接的视频/音频序列头（用于判断与旧连接是否同一编码变体）。
+    pub video_seq: Option<Bytes>,
+    pub audio_seq: Option<Bytes>,
+    /// 新连接相邻视频帧的时间戳间隔（帧率指纹：30fps≈33ms / 60fps≈17ms）。
+    pub last_video_delta: u32,
+    prev_video_ts: Option<u32>,
+    /// 已解析到的视频关键帧时间戳（供 pump 选择 IDR 对齐的切换点）。
+    keyframes: Vec<u32>,
     /// 中继任务已经结束（上游断开或积压上限）且通道已排空。
     done: bool,
 }
@@ -311,6 +346,11 @@ impl StagedSegment {
             peek: FlvDemuxer::default(),
             video_ts: None,
             audio_ts: None,
+            video_seq: None,
+            audio_seq: None,
+            last_video_delta: 0,
+            prev_video_ts: None,
+            keyframes: Vec::new(),
             done: false,
         }
     }
@@ -344,9 +384,27 @@ impl StagedSegment {
         while let Some(tag) = self.peek.next_tag() {
             match tag.tag_type {
                 TAG_TYPE_VIDEO => {
+                    if tag.is_sequence_header && self.video_seq.is_none() {
+                        self.video_seq = Some(tag.raw.clone());
+                    }
+                    if let Some(prev) = self.prev_video_ts {
+                        // 只认帧级间隔（<=500ms）：连接建立时的回吐跳变（几秒~几小时）
+                        // 不是帧率，混进来会把帧率指纹毁掉。
+                        let d = tag.timestamp.saturating_sub(prev);
+                        if d > 0 && d <= 500 {
+                            self.last_video_delta = d;
+                        }
+                    }
+                    self.prev_video_ts = Some(tag.timestamp);
                     self.video_ts = Some(self.video_ts.map_or(tag.timestamp, |v| v.max(tag.timestamp)));
+                    if tag.is_keyframe && self.keyframes.len() < 512 {
+                        self.keyframes.push(tag.timestamp);
+                    }
                 }
                 TAG_TYPE_AUDIO => {
+                    if tag.is_sequence_header && self.audio_seq.is_none() {
+                        self.audio_seq = Some(tag.raw.clone());
+                    }
                     self.audio_ts = Some(self.audio_ts.map_or(tag.timestamp, |a| a.max(tag.timestamp)));
                 }
                 _ => {}
@@ -357,6 +415,21 @@ impl StagedSegment {
     /// 新连接目前已推进到的视频/音频时间戳（None = 还没有完整 tag）。
     pub fn video_ts(&self) -> Option<u32> {
         self.video_ts
+    }
+
+    /// 最近解析到的视频关键帧时间戳。
+    pub fn last_keyframe(&self) -> Option<u32> {
+        self.keyframes.last().copied()
+    }
+
+    /// 已解析到的关键帧列表（诊断用，最多 8 个）。
+    pub fn keyframes_dbg(&self) -> Vec<u32> {
+        self.keyframes.iter().rev().take(8).rev().copied().collect()
+    }
+
+    /// 第一个严格超前于 `after` 的视频关键帧时间戳（IDR 对齐切换点）。
+    pub fn first_keyframe_after(&self, after: u32) -> Option<u32> {
+        self.keyframes.iter().copied().find(|ts| *ts > after)
     }
     pub fn audio_ts(&self) -> Option<u32> {
         self.audio_ts
@@ -417,10 +490,11 @@ pub const RELAY_CAP_SECS: u64 = 120;
 pub async fn open_staged_relay(
     ctx: &StreamRenewContext,
     client: &Client,
+    want_variant: Option<u8>,
 ) -> Result<StagedSegment, String> {
     // 连接年龄从这里算起（含重新签名 + 建连），pump 切换时用它推算下一次预取时刻。
     let started = Instant::now();
-    let (body, url) = acquire_douyu_stream(ctx, client).await?;
+    let (body, url) = acquire_douyu_stream_variant(ctx, client, want_variant).await?;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let consumed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let consumed_task = consumed.clone();
