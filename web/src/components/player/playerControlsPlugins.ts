@@ -1,6 +1,14 @@
 import Plugin, { POSITIONS } from 'xgplayer/es/plugin/plugin.js';
 
-import { ICONS, loadStoredVolume, persistStoredVolume } from './constants';
+import { invoke } from '@tauri-apps/api/core';
+
+import {
+  ICONS,
+  loadRoomVolume,
+  loadStoredVolume,
+  persistRoomVolume,
+  persistStoredVolume
+} from './constants';
 
 export class VolumeControl extends Plugin {
   static override pluginName = 'volumeControl';
@@ -16,6 +24,56 @@ export class VolumeControl extends Plugin {
   private onVolumeChange: ((value: number) => void) | null = null;
   private handleIconClick: ((event: Event) => void) | null = null;
   private previousVolume = 1;
+  private roomKey: string | null = null;
+  private updateUIFn: ((volume: number) => void) | null = null;
+  /** setRoomKey 程序化设置音量会异步触发 volumechange；这次不应回写存储
+   * （否则全局默认会被「路过」的直播间音量带跑）。 */
+  private lastApplied: number | null = null;
+  private saveLogTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /** 切换到某个直播间：应用该房间记忆过的音量（没调过就用全局默认）。 */
+  setRoomKey(roomKey: string | null) {
+    if (this.roomKey === roomKey) {
+      return;
+    }
+    this.roomKey = roomKey;
+    const stored = roomKey ? loadRoomVolume(roomKey) : null;
+    if (stored === null) {
+      return;
+    }
+    if (stored > 0) {
+      this.previousVolume = stored;
+    }
+    this.lastApplied = stored;
+    this.player.volume = stored;
+    this.player.muted = stored === 0 ? true : this.player.muted;
+    this.updateUIFn?.(this.player.volume ?? stored);
+    invoke('frontend_log', {
+      msg: `[player] room volume applied [${roomKey}] -> ${Math.round(stored * 100)}%`
+    }).catch(() => {});
+  }
+
+  /** 全局 + 当前直播间一起记住；日志去抖，避免拖动滑块时刷屏。 */
+  private persistVolume(volume: number) {
+    if (this.lastApplied !== null && Math.abs(volume - this.lastApplied) < 0.001) {
+      this.lastApplied = null;
+      return;
+    }
+    this.lastApplied = null;
+    persistStoredVolume(volume);
+    if (this.roomKey) {
+      persistRoomVolume(this.roomKey, volume);
+      const key = this.roomKey;
+      if (this.saveLogTimer) {
+        clearTimeout(this.saveLogTimer);
+      }
+      this.saveLogTimer = setTimeout(() => {
+        invoke('frontend_log', {
+          msg: `[player] room volume saved [${key}] -> ${Math.round(volume * 100)}%`
+        }).catch(() => {});
+      }, 600);
+    }
+  }
 
   override render() {
     if (this.config.disable) {
@@ -54,6 +112,7 @@ export class VolumeControl extends Plugin {
         this.volumeIcon.setAttribute('data-muted', clamped === 0 ? 'true' : 'false');
       }
     };
+    this.updateUIFn = updateUI;
 
     const storedVolume = loadStoredVolume();
     if (storedVolume !== null) {
@@ -83,7 +142,7 @@ export class VolumeControl extends Plugin {
       }
       this.player.volume = normalized;
       updateUI(normalized);
-      persistStoredVolume(normalized);
+      this.persistVolume(normalized);
     });
 
     this.handleIconClick = (event: Event) => {
@@ -95,26 +154,26 @@ export class VolumeControl extends Plugin {
         this.player.volume = 0;
         this.player.muted = true;
         updateUI(0);
-        persistStoredVolume(0);
+        this.persistVolume(0);
       } else {
         const restoreVolume = this.previousVolume > 0 ? this.previousVolume : 1;
         this.player.muted = false;
         this.player.volume = restoreVolume;
         updateUI(restoreVolume);
-        persistStoredVolume(restoreVolume);
+        this.persistVolume(restoreVolume);
       }
     };
 
     this.volumeIcon?.addEventListener('click', this.handleIconClick);
     if (this.volumeIcon) {
-      this.volumeIcon.setAttribute('title', '点击静音 / 取消静音');
+      this.volumeIcon.setAttribute('title', '点击静音 / 取消静音（音量按直播间记忆）');
       this.volumeIcon.style.cursor = 'pointer';
     }
 
     this.onVolumeChange = () => {
       const current = this.player.volume ?? 1;
       updateUI(current);
-      persistStoredVolume(current);
+      this.persistVolume(current);
     };
     this.player.on('volumechange', this.onVolumeChange);
   }
@@ -128,6 +187,12 @@ export class VolumeControl extends Plugin {
       this.player.off('volumechange', this.onVolumeChange);
       this.onVolumeChange = null;
     }
+    if (this.saveLogTimer) {
+      clearTimeout(this.saveLogTimer);
+      this.saveLogTimer = null;
+    }
+    this.updateUIFn = null;
+    this.roomKey = null;
     this.volumeIcon = null;
     this.slider = null;
     this.valueLabel = null;

@@ -1077,6 +1077,12 @@ export function MainPlayer({
         position: POSITIONS.CONTROLS_LEFT,
         index: 3
       });
+      // 应用这个直播间记忆过的音量（没调过则保持全局默认）。
+      try {
+        volumePluginRef.current?.setRoomKey?.(`${platform}/${roomId}`);
+      } catch {
+        // ignore
+      }
 
       danmuTogglePluginRef.current = player.registerPlugin?.(DanmuToggleControl, {
         position: POSITIONS.CONTROLS_RIGHT,
@@ -1235,6 +1241,12 @@ export function MainPlayer({
               if (ret && typeof (ret as any).then === "function") await ret;
               if (isSessionActive(sessionId)) {
                 playbackKindRef.current = nextKind;
+                // 软切换不重建播放器：音量插件需要跟着换房间记忆。
+                try {
+                  volumePluginRef.current?.setRoomKey?.(`${platform}/${roomId}`);
+                } catch {
+                  // ignore
+                }
                 await startDanmaku(sessionId, danmuOverlayRef.current, platform, roomId);
               }
             } catch {

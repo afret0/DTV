@@ -20,6 +20,11 @@ export const DANMU_AREA_OPTIONS = [0.25, 0.5, 0.75] as const;
 export const DANMU_OPACITY_MIN = 0.2;
 export const DANMU_OPACITY_MAX = 1;
 export const PLAYER_VOLUME_STORAGE_KEY = 'dtv_player_volume_v1';
+/** 按直播间记忆的音量：{ "<platform>/<roomId>": 0..1 }。不同主播的推流响度差异
+ * 很大，全局一个音量无法兼顾；每个直播间调一次之后就永久记住。 */
+export const PLAYER_ROOM_VOLUME_STORAGE_KEY = 'dtv_player_volume_room_v1';
+/** 最多记住多少个直播间的音量，超出后丢弃最早的（对象插入序）。 */
+const ROOM_VOLUME_MAX_ENTRIES = 300;
 export const DEFAULT_DANMU_FONT_FAMILY = '"OPPO Sans", "Microsoft YaHei", "PingFang SC", "Helvetica Neue", Arial, sans-serif';
 export const WINDOWS_DANMU_FONT_FAMILY = '"OPPO Sans", "Microsoft YaHei", "Segoe UI", sans-serif';
 
@@ -128,6 +133,53 @@ export const loadStoredVolume = (): number | null => {
   } catch (error) {
     console.warn('[Player] Failed to load stored volume:', error);
     return null;
+  }
+};
+
+export const loadRoomVolume = (roomKey: string): number | null => {
+  if (typeof window === 'undefined' || !window.localStorage || !roomKey) {
+    return null;
+  }
+  try {
+    const raw = window.localStorage.getItem(PLAYER_ROOM_VOLUME_STORAGE_KEY);
+    if (!raw) {
+      return null;
+    }
+    const map = JSON.parse(raw) as Record<string, unknown>;
+    const value = map?.[roomKey];
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      return Math.min(1, Math.max(0, value));
+    }
+    return null;
+  } catch (error) {
+    console.warn('[Player] Failed to load room volume:', error);
+    return null;
+  }
+};
+
+export const persistRoomVolume = (roomKey: string, volume: number) => {
+  if (typeof window === 'undefined' || !window.localStorage || !roomKey) {
+    return;
+  }
+  try {
+    const raw = window.localStorage.getItem(PLAYER_ROOM_VOLUME_STORAGE_KEY);
+    let map: Record<string, number> = {};
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') {
+        map = parsed as Record<string, number>;
+      }
+    }
+    map[roomKey] = Math.min(1, Math.max(0, volume));
+    const keys = Object.keys(map);
+    if (keys.length > ROOM_VOLUME_MAX_ENTRIES) {
+      for (const k of keys.slice(0, keys.length - ROOM_VOLUME_MAX_ENTRIES)) {
+        delete map[k];
+      }
+    }
+    window.localStorage.setItem(PLAYER_ROOM_VOLUME_STORAGE_KEY, JSON.stringify(map));
+  } catch (error) {
+    console.warn('[Player] Failed to persist room volume:', error);
   }
 };
 
