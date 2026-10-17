@@ -75,6 +75,9 @@ struct SharedPump {
     /// 连接是否与当前连接是同一编码变体（30fps/60fps、_4000 档位等）。
     vseq: std::sync::Mutex<Option<bytes::Bytes>>,
     video_delta: std::sync::Mutex<(u32, u32)>,
+    /// 连续「饿死重连」次数：反复发生说明续流在这条线上不可用，本连接内关掉
+    /// 续流退回普通断线重连，绝不让 pump 卡在重同步循环里（用户看到黑屏）。
+    starvation_streak: std::sync::atomic::AtomicU32,
     /// Consecutive respawns without a healthy session; bounded so a permanently
     /// broken source cannot spin forever. Any session that actually streams
     /// resets it, so ordinary use (room switches) is unlimited.
@@ -397,6 +400,7 @@ fn pump_for(store: &StreamUrlStore) -> Arc<SharedPump> {
         init: std::sync::Mutex::new((Vec::new(), false)),
         vseq: std::sync::Mutex::new(None),
         video_delta: std::sync::Mutex::new((0, 0)),
+        starvation_streak: std::sync::atomic::AtomicU32::new(0),
         task_spawns: AtomicUsize::new(0),
         session_healthy: AtomicBool::new(false),
         broadcast_started: AtomicBool::new(false),
@@ -658,6 +662,11 @@ fn ensure_pump(store: StreamUrlStore) {
                 break;
             }
 
+            // 没人看就先别建上游连接：签名/带宽都省下来，客户端一来立刻起流。
+            if CLIENT_COUNT.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
             let mut gen_at_connect = store.generation.load(Ordering::SeqCst);
             let connected_at = std::time::Instant::now();
             let mut rejected = false;
@@ -670,6 +679,11 @@ fn ensure_pump(store: StreamUrlStore) {
                     attempts = 0;
                     let mut stream = flv_relay::SourceBody::Http(Box::pin(resp.bytes_stream()));
                     p.session_healthy.store(false, Ordering::SeqCst);
+                    // init / 序列头指纹 / 帧率指纹按连接重采：重放与变体判定都必须
+                    // 基于当前这条连接的配置，拿上一个房间的旧值会误判+黑屏。
+                    *p.init.lock().unwrap() = (Vec::new(), false);
+                    *p.vseq.lock().unwrap() = None;
+                    *p.video_delta.lock().unwrap() = (0, 0);
                     // Is this a brand new source (room/quality switch) or a
                     // reconnect of the same stream after a signature expired?
                     let new_source = !p.header_sent.load(Ordering::SeqCst);
@@ -689,6 +703,14 @@ fn ensure_pump(store: StreamUrlStore) {
                     // （虎牙/B站/抖音保持原有一次性直通 + 断线重签路径）。
                     let renew_ctx = douyu_renew_context(&store);
                     let mut renewal = renew_ctx.is_some();
+                    if renewal && p.starvation_streak.load(Ordering::SeqCst) >= 3 {
+                        crate::tl!(
+                            "proxy",
+                            "pump #{} seamless renewal DISABLED for this connection (starvation streak={}): plain reconnect only",
+                            pump_id, p.starvation_streak.load(Ordering::SeqCst)
+                        );
+                        renewal = false;
+                    }
                     // 接续段标记：只有「斗鱼无缝续流」的新段走 tag 级去重路径。
                     // 普通断线重连必须继续走 framer 直通 + 关键帧对齐路径，否则
                     // 无法按 FLV 解析的上游（如测试用的填充数据）会被整段丢弃。
@@ -764,8 +786,9 @@ fn ensure_pump(store: StreamUrlStore) {
                                 p.broadcast_started.store(true, Ordering::SeqCst);
                                 let _ = tx.send((gen_at_connect, offset_before, payload));
                             }
-                            match ($st) as Option<flv_relay::StagedSegment> {
-                                Some(mut st) => {
+                            {
+                                let mut st = $st;
+                                {
                                     st.consumed.store(true, Ordering::Relaxed);
                                     st.poll();
                                     let drained = st.take_buffered();
@@ -824,19 +847,9 @@ fn ensure_pump(store: StreamUrlStore) {
                                     continuation = true;
                                     waiting_keyframe = false;
                                     await_idr = false;
+                                    capture_init_from(&p, &drained);
                                     segment = flv_relay::Segment::new_with_preage(true, preage);
                                     demuxer.reset();
-                                }
-                                None => {
-                                    await_idr = true;
-                                    continuation = true;
-                                    waiting_keyframe = false;
-                                    demuxer.reset();
-                                    crate::tl!(
-                                        "proxy",
-                                        "[proxy] pump #{} HARD RESYNC on the same connection at offset {}: forwarding resumes at its next IDR",
-                                        pump_id, offset_total
-                                    );
                                 }
                             }
                         }};
@@ -869,11 +882,13 @@ fn ensure_pump(store: StreamUrlStore) {
                         };
                     }
 
+                    // 无客户端计时放在段循环之外：续流切换/重同步的 continue 不能重置它，
+                    // 否则没人看的时候 pump 会永远烧带宽。
+                    let mut idle_since: Option<std::time::Instant> = None;
                     'segments: loop {
                         // 上游静默 / 无客户端 两个看门狗都靠 chunk 循环里判定。
                         #[allow(unused_assignments)]
                         let mut silent = false; // true = 静默超时断开（不是正常 EOF）
-                        let mut idle_since: Option<std::time::Instant> = None;
                         loop {
                             let chunk = match tokio::time::timeout(
                                 UPSTREAM_SILENCE_TIMEOUT,
@@ -952,6 +967,7 @@ fn ensure_pump(store: StreamUrlStore) {
                                 // Genuinely streaming now: forget earlier respawn
                                 // attempts so normal use is unlimited.
                                 p.task_spawns.store(0, Ordering::SeqCst);
+                                p.starvation_streak.store(0, Ordering::SeqCst);
                             }
 
                             // 临近 TTL 时启动后台中继（只启动一次；失败后 3s 退避重试）。
@@ -1231,11 +1247,12 @@ fn ensure_pump(store: StreamUrlStore) {
                                     // 绝不能像以前那样带着冻结的标记无限空转。
                                     crate::tl!(
                                         "proxy",
-                                        "pump #{} kept receiving chunks but forwarded nothing for {:.0}s (markers v={} a={}) -> hard resync",
+                                        "pump #{} kept receiving chunks but forwarded nothing for {:.0}s (markers v={} a={}) -> bumping generation and reconnecting (clients re-GET with a fresh primer)",
                                         pump_id, since.elapsed().as_secs_f32(), last_video_fwd, last_audio_fwd
                                     );
-                                    hard_resync!(None);
-                                    continue 'segments;
+                                    p.starvation_streak.fetch_add(1, Ordering::SeqCst);
+                                    commit_new_source(&store);
+                                    break 'segments;
                                 }
                             } else {
                                 starved_since = None;
@@ -1406,7 +1423,7 @@ fn ensure_pump(store: StreamUrlStore) {
                                     "pump #{} relay still behind at EOF (relay v={:?} marker={}) -> hard resync instead of dedup splice",
                                     pump_id, st.video_ts(), last_video_fwd
                                 );
-                                hard_resync!(Some(st));
+                                hard_resync!(st);
                                 continue 'segments;
                             }
                             None => {
@@ -1769,6 +1786,39 @@ async fn image_proxy_handler(
     }
 }
 
+/// 从一段 tag 对齐的字节（新连接积压的开头，含 FLV 头）里提取「FLV 头 +
+/// onMetaData + 音/视频序列头」作为本场 init，并记下视频序列头指纹。硬重同步
+/// 重放 init 时必须用**当前这条连接**的配置，拿旧房间的配置重放会直接黑屏。
+fn capture_init_from(p: &SharedPump, buf: &[u8]) {
+    let mut demux = flv_relay::FlvDemuxer::default();
+    demux.push(buf);
+    let mut out = Vec::new();
+    if let Some(h) = demux.take_header() {
+        out.extend_from_slice(&h);
+    }
+    let mut vseq: Option<bytes::Bytes> = None;
+    while let Some(tag) = demux.next_tag() {
+        let is_idr = tag.tag_type == flv_relay::TAG_TYPE_VIDEO
+            && tag.is_keyframe
+            && !tag.is_sequence_header;
+        if is_idr {
+            break;
+        }
+        if tag.tag_type == flv_relay::TAG_TYPE_SCRIPT || tag.is_sequence_header {
+            if tag.tag_type == flv_relay::TAG_TYPE_VIDEO && vseq.is_none() {
+                vseq = Some(tag.raw.clone());
+            }
+            out.extend_from_slice(&tag.raw);
+        }
+    }
+    if !out.is_empty() {
+        *p.init.lock().unwrap() = (out, true);
+    }
+    if let Some(v) = vseq {
+        *p.vseq.lock().unwrap() = Some(v);
+    }
+}
+
 /// 记录相邻视频帧的时间戳间隔（帧率指纹）。
 fn note_video_delta(p: &SharedPump, timestamp: u32) {
     let mut g = p.video_delta.lock().unwrap();
@@ -1876,6 +1926,8 @@ fn apply_relay_switch<F: Fn()>(
         let _ = tx.send((gen_at_connect, offset_before, payload));
     }
     let drained = st.take_buffered();
+    // 切换后这条中继连接就是本流：init/指纹换成它的配置。
+    capture_init_from(p, &drained);
     let drained_head = {
         let n = drained.len().min(6);
         drained[..n].iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ")
