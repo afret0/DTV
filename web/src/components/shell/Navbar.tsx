@@ -97,6 +97,13 @@ export function Navbar({
   const [versionInfo, setVersionInfo] = useState<VersionInfo | null>(null);
   const [hasUpdate, setHasUpdate] = useState(false);
   const [localVersion, setLocalVersion] = useState<string>("");
+  // 播放页顶栏的云同步按钮通过自定义事件请求打开面板。
+  useEffect(() => {
+    const onOpen = () => setCloudSyncOpen(true);
+    window.addEventListener("dtv-open-cloud-sync", onOpen);
+    return () => window.removeEventListener("dtv-open-cloud-sync", onOpen);
+  }, []);
+
   // 云同步心跳：每分钟检查一次是否到了自动上传周期。
   useEffect(() => {
     const tick = () => {

@@ -916,7 +916,8 @@ export class SourceBadgeControl extends Plugin {
   static override pluginName = 'sourceBadge';
   static override defaultConfig = {
     position: POSITIONS.CONTROLS_RIGHT,
-    index: 6.5,
+    // 右侧控件按 index 降序排布：5.6 落在投屏(6)与线路(5.2)之间 = 投屏按钮右侧。
+    index: 5.6,
     disable: false,
     getLabel: null as (() => string) | null,
   };
