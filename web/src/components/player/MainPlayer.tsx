@@ -1449,11 +1449,25 @@ export function MainPlayer({
     const BURST_RESET_AFTER_MS = 120_000;
     const RETRY_COOLDOWN_MS = 30_000;
 
+    let lastReplayReloadAt = 0;
     const id = window.setInterval(() => {
       const player: any = playerRef.current;
       const video: HTMLVideoElement | null =
         player?.video ??
         (document.querySelector(".xgplayer video") as HTMLVideoElement | null);
+      // 直播流永远不该出现「重播」覆盖层：它只在代理结束响应（硬重同步/上游
+      // 断开）后出现，此时 video 处于 ended/paused，下面的冻结看门狗会直接
+      // return，`ended` 事件也可能被 flv 插件吞掉 —— 结果就是用户盯着重播按钮
+      // 几十秒。检测到覆盖层就立即重连（5s 去抖防连环重载）。
+      const replayOverlay = document.querySelector(".xgplayer-replay") as HTMLElement | null;
+      if (replayOverlay && Date.now() - lastReplayReloadAt > 5000) {
+        lastReplayReloadAt = Date.now();
+        invoke("frontend_log", {
+          msg: `[player] replay overlay on a LIVE stream [${platform}/${roomId}] (ended=${video?.ended} paused=${video?.paused}) -> reloading`
+        }).catch(() => {});
+        void reloadStreamRef.current?.("refresh");
+        return;
+      }
       if (!video || video.paused || video.ended) {
         lastTime = -1;
         staleSamples = 0;

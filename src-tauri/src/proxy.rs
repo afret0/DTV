@@ -74,6 +74,7 @@ struct SharedPump {
     /// 当前会话首个视频序列头 + 最近视频帧间隔（帧率指纹），用于判断中继
     /// 连接是否与当前连接是同一编码变体（30fps/60fps、_4000 档位等）。
     vseq: std::sync::Mutex<Option<bytes::Bytes>>,
+    aseq: std::sync::Mutex<Option<bytes::Bytes>>,
     video_delta: std::sync::Mutex<(u32, u32)>,
     /// 连续「饿死重连」次数：反复发生说明续流在这条线上不可用，本连接内关掉
     /// 续流退回普通断线重连，绝不让 pump 卡在重同步循环里（用户看到黑屏）。
@@ -205,8 +206,12 @@ struct Primer {
     fed: u64,
     /// 9-byte FLV header + PreviousTagSize0, captured once per generation.
     head: Vec<u8>,
-    /// onMetaData + codec sequence headers, captured once per generation.
+    /// onMetaData, captured once per generation.
     config: Vec<u8>,
+    /// 最新一份音/视频序列头。带内配置变更（续流拼接点重放新 SPS/PPS）时
+    /// 会被替换，迟到客户端拿到的永远是「当前配置 + 当前配置编码的关键帧」。
+    vseq: Vec<u8>,
+    aseq: Vec<u8>,
     /// Latest keyframe tag plus every tag that followed it (one GOP).
     kf: Vec<u8>,
     /// Bytes the pump has broadcast so far (offset at the end of the primer).
@@ -229,6 +234,8 @@ impl Default for Primer {
             fed: 0,
             head: Vec::new(),
             config: Vec::new(),
+            vseq: Vec::new(),
+            aseq: Vec::new(),
             kf: Vec::new(),
             offset: 0,
             pending: Vec::new(),
@@ -310,10 +317,13 @@ impl Primer {
                     let is_key = !body.is_empty() && (body[0] >> 4) == 1;
                     let is_seq = body.len() > 1 && body[0] == 0x17 && body[1] == 0x00;
                     if is_seq {
-                        if !self.got_vseq {
-                            self.got_vseq = true;
-                            self.config.extend_from_slice(&tag);
+                        if self.vseq != tag {
+                            // 配置变了：旧关键帧块是旧配置编码的，必须丢掉，
+                            // 等下一个 IDR 重新积累。
+                            self.vseq = tag;
+                            self.kf.clear();
                         }
+                        self.got_vseq = true;
                     } else if is_key {
                         self.kf.clear();
                         self.kf.extend_from_slice(&tag);
@@ -324,9 +334,12 @@ impl Primer {
                 // audio: only the AAC sequence header belongs in the primer
                 8 => {
                     let is_seq = body.len() > 1 && body[1] == 0x00;
-                    if is_seq && !self.got_aseq {
+                    if is_seq {
+                        if self.aseq != tag {
+                            self.aseq = tag;
+                            self.kf.clear();
+                        }
                         self.got_aseq = true;
-                        self.config.extend_from_slice(&tag);
                     }
                 }
                 // script data (onMetaData)
@@ -349,6 +362,8 @@ impl Primer {
             Vec::with_capacity(self.head.len() + self.config.len() + self.kf.len() + self.pending.len());
         out.extend_from_slice(&self.head);
         out.extend_from_slice(&self.config);
+        out.extend_from_slice(&self.vseq);
+        out.extend_from_slice(&self.aseq);
         out.extend_from_slice(&self.kf);
         // The tail of the last chunk is only a partial FLV tag; it still has to
         // be replayed, otherwise the client resumes mid-tag and every renderer
@@ -399,6 +414,7 @@ fn pump_for(store: &StreamUrlStore) -> Arc<SharedPump> {
         task_running: AtomicBool::new(false),
         init: std::sync::Mutex::new((Vec::new(), false)),
         vseq: std::sync::Mutex::new(None),
+        aseq: std::sync::Mutex::new(None),
         video_delta: std::sync::Mutex::new((0, 0)),
         starvation_streak: std::sync::atomic::AtomicU32::new(0),
         task_spawns: AtomicUsize::new(0),
@@ -683,6 +699,7 @@ fn ensure_pump(store: StreamUrlStore) {
                     // 基于当前这条连接的配置，拿上一个房间的旧值会误判+黑屏。
                     *p.init.lock().unwrap() = (Vec::new(), false);
                     *p.vseq.lock().unwrap() = None;
+                    *p.aseq.lock().unwrap() = None;
                     *p.video_delta.lock().unwrap() = (0, 0);
                     // Is this a brand new source (room/quality switch) or a
                     // reconnect of the same stream after a signature expired?
@@ -741,6 +758,9 @@ fn ensure_pump(store: StreamUrlStore) {
                     // 参考链在切换点重置。中途拼接会破坏 H.264 参考链（两条连接的
                     // frame_num/POC 不同源），播放器几秒后报 5103「解码错误」。
                     let mut pending_cut: Option<u32> = None;
+                    // 严格模式：配置变更时拼接从 relay 的 IDR(K) 开始并丢弃
+                    // marker..K；普通模式按已转发标记去重。
+                    let mut cut_strict = false;
                     // 延迟发布队列：(入队时间, payload, 入队时的视频标记)。见 RELEASE_DELAY。
                     let mut pending_out: Vec<(std::time::Instant, bytes::Bytes, u32)> = Vec::new();
                     // 硬重同步后：丢弃内容直到下一个 IDR 再恢复转发。
@@ -856,10 +876,11 @@ fn ensure_pump(store: StreamUrlStore) {
                     }
 
                     macro_rules! switch_to_relay {
-                        ($st:expr, $cut:expr) => {
+                        ($st:expr, $cut:expr, $strict:expr) => {
                             apply_relay_switch(
                                 $st,
                                 $cut,
+                                $strict,
                                 &mut pending_out,
                                 &p,
                                 &tx,
@@ -1119,7 +1140,9 @@ fn ensure_pump(store: StreamUrlStore) {
                                     }
                                     if let Some(st) = relay.take() {
                                         let cut = pending_cut.take();
-                                        if switch_to_relay!(st, cut) {
+                                        let strict = cut_strict;
+                                        cut_strict = false;
+                                        if switch_to_relay!(st, cut, strict) {
                                             continue 'segments;
                                         }
                                     }
@@ -1190,6 +1213,11 @@ fn ensure_pump(store: StreamUrlStore) {
                                                     if g.is_none() {
                                                         *g = Some(tag.clone());
                                                     }
+                                                } else if tag_type == flv_relay::TAG_TYPE_AUDIO {
+                                                    let mut g = p.aseq.lock().unwrap();
+                                                    if g.is_none() {
+                                                        *g = Some(tag.clone());
+                                                    }
                                                 }
                                             } else if tag_type == flv_relay::TAG_TYPE_VIDEO {
                                                 note_video_delta(&p, timestamp);
@@ -1227,7 +1255,9 @@ fn ensure_pump(store: StreamUrlStore) {
                                     }
                                     if let Some(st) = relay.take() {
                                         let cut = pending_cut.take();
-                                        if switch_to_relay!(st, cut) {
+                                        let strict = cut_strict;
+                                        cut_strict = false;
+                                        if switch_to_relay!(st, cut, strict) {
                                             continue 'segments;
                                         }
                                     }
@@ -1288,17 +1318,23 @@ fn ensure_pump(store: StreamUrlStore) {
                                     }
                                 }
                                 if pending_cut.is_none() && !relay_incompatible {
-                                    // K 取中继「最近解析到的关键帧」：它必然已在中继积压里。
-                                    // 切换在旧流解析到 K+余量 时执行：此刻客户端（延迟发布）
-                                    // 只看到 K 之前，K 本身要么由旧流队列送达、要么由中继
-                                    // 送达（cut_floor 兜底），参考链始终完整。
-                                    pending_cut = st.last_keyframe()
-                                        .filter(|k| k.saturating_add(CUT_GATE_MARGIN_MS) > last_video_fwd.saturating_sub(30_000));
+                                    let released = pending_out.last().map(|e| e.2).unwrap_or(last_video_fwd);
+                                    if relay_config_differs(&p, st) {
+                                        // 严格模式：K 必须晚于已发布上界（不重不漏），
+                                        // 且是中继已解析到的关键帧（在积压里）。
+                                        cut_strict = true;
+                                        pending_cut = st.first_keyframe_after(released);
+                                    } else {
+                                        // 普通模式：K 取中继最近的关键帧，切换立即生效，
+                                        // 按已转发标记去重即可（配置相同，中途接也安全）。
+                                        pending_cut = st.last_keyframe()
+                                            .filter(|k| k.saturating_add(CUT_GATE_MARGIN_MS) > last_video_fwd.saturating_sub(30_000));
+                                    }
                                     if let Some(k) = pending_cut {
                                         crate::tl!(
                                             "proxy",
-                                            "pump #{} cut scheduled at IDR K={} (gate at K+{}ms; relay v={:?}, marker={}, old stream has {:.1}s left)",
-                                            pump_id, k, CUT_GATE_MARGIN_MS, st.video_ts(), last_video_fwd,
+                                            "pump #{} cut scheduled at IDR K={} strict={} (gate at K+{}ms; relay v={:?}, marker={}, old stream has {:.1}s left)",
+                                            pump_id, k, cut_strict, CUT_GATE_MARGIN_MS, st.video_ts(), last_video_fwd,
                                             flv_relay::STREAM_TTL.as_secs_f32() - segment.elapsed().as_secs_f32()
                                         );
                                     }
@@ -1400,17 +1436,32 @@ fn ensure_pump(store: StreamUrlStore) {
                         match seg {
                             Some(mut st) => {
                                 st.poll();
-                                let cut = if relay_incompatible {
+                                let mut strict = cut_strict;
+                                let mut cut = if relay_incompatible {
                                     None
                                 } else {
-                                    pending_cut
-                                        .take()
-                                        .or_else(|| st.first_keyframe_after(last_video_fwd))
+                                    pending_cut.take()
                                 };
+                                // 配置变更但 K 还没解析到：中继还在活读，等它最多 6s
+                                // 拿出 marker 之后的第一个 IDR 做严格拼接（小空洞），
+                                // 仍比硬重同步断开重连好。
+                                if cut.is_none() && relay_config_differs(&p, &st) {
+                                    let released = pending_out.last().map(|e| e.2).unwrap_or(last_video_fwd);
+                                    let wait_until = std::time::Instant::now() + Duration::from_secs(6);
+                                    while cut.is_none() && std::time::Instant::now() < wait_until {
+                                        st.poll();
+                                        cut = st.first_keyframe_after(released);
+                                        if cut.is_none() {
+                                            tokio::time::sleep(Duration::from_millis(100)).await;
+                                        }
+                                    }
+                                    strict = cut.is_some();
+                                }
+                                cut_strict = false;
                                 if !relay_incompatible
                                     && (cut.is_some() || st.video_ts().map_or(false, |v| v > last_video_fwd))
                                 {
-                                    if switch_to_relay!(st, cut) {
+                                    if switch_to_relay!(st, cut, strict) {
                                         continue 'segments;
                                     }
                                     break;
@@ -1797,6 +1848,7 @@ fn capture_init_from(p: &SharedPump, buf: &[u8]) {
         out.extend_from_slice(&h);
     }
     let mut vseq: Option<bytes::Bytes> = None;
+    let mut aseq: Option<bytes::Bytes> = None;
     while let Some(tag) = demux.next_tag() {
         let is_idr = tag.tag_type == flv_relay::TAG_TYPE_VIDEO
             && tag.is_keyframe
@@ -1805,8 +1857,10 @@ fn capture_init_from(p: &SharedPump, buf: &[u8]) {
             break;
         }
         if tag.tag_type == flv_relay::TAG_TYPE_SCRIPT || tag.is_sequence_header {
-            if tag.tag_type == flv_relay::TAG_TYPE_VIDEO && vseq.is_none() {
-                vseq = Some(tag.raw.clone());
+            match tag.tag_type {
+                flv_relay::TAG_TYPE_VIDEO if vseq.is_none() => vseq = Some(tag.raw.clone()),
+                flv_relay::TAG_TYPE_AUDIO if aseq.is_none() => aseq = Some(tag.raw.clone()),
+                _ => {}
             }
             out.extend_from_slice(&tag.raw);
         }
@@ -1816,6 +1870,9 @@ fn capture_init_from(p: &SharedPump, buf: &[u8]) {
     }
     if let Some(v) = vseq {
         *p.vseq.lock().unwrap() = Some(v);
+    }
+    if let Some(a) = aseq {
+        *p.aseq.lock().unwrap() = Some(a);
     }
 }
 
@@ -1829,21 +1886,26 @@ fn note_video_delta(p: &SharedPump, timestamp: u32) {
     g.0 = timestamp;
 }
 
-/// 两条连接是否是同一编码变体（可安全拼接参考链）：
-/// 序列头字节、帧率（相邻帧间隔）、URL 档位后缀（如 `_4000`）都必须一致。
-/// 斗鱼同一房间的不同取流可能落在不同转码变体上（30fps/60fps），它们的
-/// H.264 参考链互不兼容，拼接必出解码错误。
-/// 返回 None 表示证据还不够（中继还没解析出帧率指纹），调用方下一轮再判断。
+/// 中继连接的编码配置（SPS/PPS、AAC config）是否与当前会话不同。
+/// 不同则拼接走「严格模式」：从 relay 的下一个 IDR(K) 开始、丢弃 marker..K
+/// 的旧配置 P 帧，并在拼接点重放新配置（代价是一个 <= GOP 的小空洞，
+/// 播放器 5s 缓冲可吸收；比硬重同步断开重连好得多）。
+fn relay_config_differs(p: &SharedPump, st: &flv_relay::StagedSegment) -> bool {
+    let v = p.vseq.lock().unwrap();
+    let a = p.aseq.lock().unwrap();
+    st.video_seq.as_ref().map_or(false, |x| v.as_ref() != Some(x))
+        || st.audio_seq.as_ref().map_or(false, |x| a.as_ref() != Some(x))
+}
+
+/// 两条连接是否是同一转码变体：只看帧率指纹（相邻视频帧间隔）。
+/// 30fps/60fps 是不同变体，拼接没有意义（内容节奏都不同），走硬重同步。
+/// 序列头（SPS/PPS）不同**不算**不兼容：拼接点会在 IDR 处重放新配置
+/// （MSE 规范的带内 config change），解码器在关键帧处重新配置即可。
+/// 返回 None 表示证据还不够（帧率指纹还没采到），调用方下一轮再判断。
 fn relay_compatible(
     p: &SharedPump,
     st: &flv_relay::StagedSegment,
 ) -> Option<bool> {
-    let cur_vseq = p.vseq.lock().unwrap().clone();
-    if let (Some(a), Some(b)) = (&cur_vseq, &st.video_seq) {
-        if a != b {
-            return Some(false);
-        }
-    }
     let cur_delta = p.video_delta.lock().unwrap().1;
     match (cur_delta, st.last_video_delta) {
         (0, _) | (_, 0) => None, // 帧率指纹还没采到，稍后再判
@@ -1890,6 +1952,7 @@ fn note_config(pump_id: u64, tag_type: u8, raw: &[u8], fp: &mut [u64; 2]) {
 fn apply_relay_switch<F: Fn()>(
     st: flv_relay::StagedSegment,
     cut: Option<u32>,
+    strict: bool,
     pending_out: &mut Vec<(std::time::Instant, bytes::Bytes, u32)>,
     p: &Arc<SharedPump>,
     tx: &broadcast::Sender<(u64, u64, bytes::Bytes)>,
@@ -1916,7 +1979,26 @@ fn apply_relay_switch<F: Fn()>(
     st.consumed.store(true, Ordering::Relaxed);
     st.poll();
 
-    // 延迟发布队列里还有旧流的包（都早于切换点 K）：先按序发完，客户端字节流才连续。
+    // 延迟发布队列里是旧流还没发出去的包：
+    // - 普通模式：全部早于 K，按序发完，客户端字节流才连续；
+    // - 严格模式：队列里 marker >= K 的包是「旧配置编码的 K 及之后」，和新配置
+    //   的 relay 内容重复且配置不符，必须丢弃；只发 marker < K 的部分。
+    let keep_until = if strict { cut.unwrap_or(u32::MAX) } else { u32::MAX };
+    let mut discarded: usize = 0;
+    pending_out.retain(|(_, _, marker)| {
+        let keep = *marker < keep_until;
+        if !keep {
+            discarded += 1;
+        }
+        keep
+    });
+    if discarded > 0 {
+        crate::tl!(
+            "proxy",
+            "pump #{} strict splice: discarded {} queued old-config packets at/after K={:?}",
+            pump_id, discarded, cut
+        );
+    }
     for (_, payload, _) in pending_out.drain(..) {
         let offset_before = *offset_total;
         *offset_total = offset_total.wrapping_add(payload.len() as u64);
@@ -1947,7 +2029,12 @@ fn apply_relay_switch<F: Fn()>(
     while let Some(tag) = demuxer.next_tag() {
         let duplicate = match tag.tag_type {
             flv_relay::TAG_TYPE_AUDIO => {
-                if tag.timestamp <= *last_audio_fwd {
+                let dup = if strict {
+                    tag.timestamp < cut.unwrap_or(0)
+                } else {
+                    tag.timestamp <= *last_audio_fwd
+                };
+                if dup {
                     dropped += 1;
                     true
                 } else {
@@ -1956,9 +2043,14 @@ fn apply_relay_switch<F: Fn()>(
                 }
             }
             flv_relay::TAG_TYPE_VIDEO => {
-                // 一律按「已转发标记」去重：切换点 K 这个 IDR 已经由旧流的延迟
-                // 发布队列送达客户端，中继里 K 及其之前的 tag 都是重复内容。
-                let dup = tag.timestamp <= *last_video_fwd;
+                // 普通模式按「已转发标记」去重（K 已由旧流队列送达，之前皆重复）；
+                // 严格模式（配置变更）只保留 K 及之后：marker..K 的 P 帧是旧配置
+                // 编码的，喂给新配置的解码器必花屏，丢掉换一个小空洞。
+                let dup = if strict {
+                    tag.timestamp < cut.unwrap_or(0)
+                } else {
+                    tag.timestamp <= *last_video_fwd
+                };
                 if dup {
                     dropped += 1;
                     true
@@ -1984,6 +2076,37 @@ fn apply_relay_switch<F: Fn()>(
         kept += 1;
     }
 
+    // 带内配置变更：新连接的 SPS/PPS（或音频配置）与当前会话不同时，把新配置
+    // 插到拼接点（IDR）之前重放。MSE 允许在任意位置追加新的 init segment，
+    // 解码器会在关键帧处用新配置重新初始化 —— 否则拿旧 SPS 解新 GOP 必花屏/报错。
+    let cur_vseq = p.vseq.lock().unwrap().clone();
+    let cur_aseq = p.aseq.lock().unwrap().clone();
+    let v_changed = strict
+        && st.video_seq.as_ref().map_or(false, |v| cur_vseq.as_ref() != Some(v));
+    let a_changed = strict
+        && st.audio_seq.as_ref().map_or(false, |a| cur_aseq.as_ref() != Some(a));
+    if v_changed || a_changed {
+        let mut prefixed = bytes::BytesMut::new();
+        if v_changed {
+            if let Some(v) = &st.video_seq {
+                prefixed.extend_from_slice(v);
+            }
+        }
+        if a_changed {
+            if let Some(a) = &st.audio_seq {
+                prefixed.extend_from_slice(a);
+            }
+        }
+        crate::tl!(
+            "proxy",
+            "pump #{} codec config changed at splice (video={} audio={}) -> replaying new config before the IDR",
+            pump_id, v_changed, a_changed
+        );
+        prefixed.extend_from_slice(&payload);
+        payload = prefixed;
+        *p.vseq.lock().unwrap() = st.video_seq.clone().or(cur_vseq);
+        *p.aseq.lock().unwrap() = st.audio_seq.clone().or(cur_aseq);
+    }
     let offset_before = *offset_total;
     if !payload.is_empty() {
         let payload = payload.freeze();
@@ -2008,11 +2131,12 @@ fn apply_relay_switch<F: Fn()>(
     *segment = flv_relay::Segment::new_with_preage(true, preage);
     crate::tl!(
         "proxy",
-        "[proxy] pump #{} SEAMLESS relay swap #{} at offset {}: cut={:?} relay age {}ms, drained head={} ({} bytes) -> applied {} tags (first kept video ts={:?} keyframe={:?}), dropped {} dup tags, markers v={} a={}, {} clients",
+        "[proxy] pump #{} SEAMLESS relay swap #{} at offset {}: cut={:?} strict={} relay age {}ms, drained head={} ({} bytes) -> applied {} tags (first kept video ts={:?} keyframe={:?}), dropped {} dup tags, markers v={} a={}, {} clients",
         pump_id,
         *segment_swaps,
         offset_before,
         cut,
+        strict,
         preage.as_millis(),
         drained_head,
         drained.len(),
