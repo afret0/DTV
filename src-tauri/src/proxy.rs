@@ -1458,13 +1458,27 @@ fn ensure_pump(store: StreamUrlStore) {
                                     strict = cut.is_some();
                                 }
                                 cut_strict = false;
+                                // 配置不同却拿不到 K：普通去重拼接会把旧配置的帧喂给
+                                // 新配置的解码器（花屏/解码错误），宁可硬重同步。
+                                let config_differs = relay_config_differs(&p, &st);
                                 if !relay_incompatible
-                                    && (cut.is_some() || st.video_ts().map_or(false, |v| v > last_video_fwd))
+                                    && (cut.is_some()
+                                        || (!config_differs
+                                            && st.video_ts().map_or(false, |v| v > last_video_fwd)))
                                 {
                                     if switch_to_relay!(st, cut, strict) {
                                         continue 'segments;
                                     }
                                     break;
+                                }
+                                if config_differs && cut.is_none() {
+                                    crate::tl!(
+                                        "proxy",
+                                        "pump #{} config differs and no IDR ahead after waiting -> hard resync",
+                                        pump_id
+                                    );
+                                    hard_resync!(st);
+                                    continue 'segments;
                                 }
                                 // 中继仍落后于标记：去重拼接会先饿几秒再从中途接 GOP，
                                 // 参考链必断（5103 解码错误）。改为硬重同步：客户端带
