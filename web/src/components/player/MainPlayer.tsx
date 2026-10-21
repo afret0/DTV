@@ -191,6 +191,13 @@ function resolveCurrentLineFor(options: LineOption[], currentLine: string | null
   return options[0]?.key ?? null;
 }
 
+const PLATFORM_CN_LABEL: Record<string, string> = {
+  DOUYU: "斗鱼",
+  HUYA: "虎牙",
+  DOUYIN: "抖音",
+  BILIBILI: "B站"
+};
+
 export function MainPlayer({
   platform,
   roomId,
@@ -227,6 +234,7 @@ export function MainPlayer({
 
   const refreshPluginRef = useRef<any>(null);
   const volumePluginRef = useRef<any>(null);
+  const sourceBadgeRef = useRef<any>(null);
   const danmuTogglePluginRef = useRef<any>(null);
   const danmuSettingsPluginRef = useRef<any>(null);
   const danmuKeywordBlockPluginRef = useRef<any>(null);
@@ -665,6 +673,7 @@ export function MainPlayer({
 
     refreshPluginRef.current = null;
     volumePluginRef.current = null;
+    sourceBadgeRef.current = null;
     danmuTogglePluginRef.current = null;
     danmuSettingsPluginRef.current = null;
     qualityPluginRef.current = null;
@@ -835,8 +844,17 @@ export function MainPlayer({
       const FlvPlugin: any = (flvMod as any).default ?? flvMod;
       const HlsPlugin: any = (hlsMod as any).default ?? hlsMod;
       const { applyDanmuOverlayPreferences, createDanmuOverlay, syncDanmuEnabledState } = overlayMod as any;
-      const { DanmuKeywordBlockControl, DanmuSettingsControl, DanmuToggleControl, LineControl, QualityControl, RefreshControl, VolumeControl, CastControl } =
-        pluginsMod as any;
+      const {
+        DanmuKeywordBlockControl,
+        DanmuSettingsControl,
+        DanmuToggleControl,
+        LineControl,
+        QualityControl,
+        RefreshControl,
+        SourceBadgeControl,
+        VolumeControl,
+        CastControl
+      } = pluginsMod as any;
 
       const playerOptions: any = {
         el: playerContainerRef.current,
@@ -1167,6 +1185,13 @@ export function MainPlayer({
         onClick: () => setCastOpen(true)
       });
 
+      // 投屏按钮右侧的直播来源标记（斗鱼/虎牙/抖音/B站）。
+      sourceBadgeRef.current = player.registerPlugin?.(SourceBadgeControl, {
+        position: POSITIONS.CONTROLS_RIGHT,
+        index: 6.5,
+        getLabel: () => PLATFORM_CN_LABEL[streamLabelRef.current?.platform ?? ""] ?? ""
+      });
+
       arrangeControlClusters(player);
 
       // danmu overlay
@@ -1260,6 +1285,11 @@ export function MainPlayer({
                 // 软切换不重建播放器：音量插件需要跟着换房间记忆。
                 try {
                   volumePluginRef.current?.setRoomKey?.(`${platform}/${roomId}`);
+                } catch {
+                  // ignore
+                }
+                try {
+                  sourceBadgeRef.current?.updateLabel?.();
                 } catch {
                   // ignore
                 }

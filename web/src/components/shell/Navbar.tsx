@@ -3,12 +3,14 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import ReactDOM from "react-dom";
 import { AnimatePresence, m } from "framer-motion";
-import { ChevronDown, ExternalLink, LayoutGrid, MonitorSmartphone, Moon, Search, Sun, ThumbsUp, X } from "lucide-react";
+import { ChevronDown, Cloud, ExternalLink, LayoutGrid, MonitorSmartphone, Moon, Search, Sun, ThumbsUp, X } from "lucide-react";
 import { usePathname } from "next/navigation";
 import { invoke } from "@tauri-apps/api/core";
 
 import styles from "./Navbar.module.css";
+import { CloudSyncModal } from "./CloudSyncModal";
 import { LanSyncModal } from "./LanSyncModal";
+import { maybeAutoCloudSync } from "@/services/cloudSync";
 import { searchAnchors, type SearchAnchorResult, type SearchPlatform } from "@/services/search";
 import { usePlayerUi } from "@/state/playerUi/PlayerUiProvider";
 import { useFollow, type Platform as FollowPlatform } from "@/state/follow/FollowProvider";
@@ -90,9 +92,20 @@ export function Navbar({
   const [donateOpen, setDonateOpen] = useState(false);
   const [updateOpen, setUpdateOpen] = useState(false);
   const [lanSyncOpen, setLanSyncOpen] = useState(false);
+  const [cloudSyncOpen, setCloudSyncOpen] = useState(false);
+
   const [versionInfo, setVersionInfo] = useState<VersionInfo | null>(null);
   const [hasUpdate, setHasUpdate] = useState(false);
   const [localVersion, setLocalVersion] = useState<string>("");
+  // 云同步心跳：每分钟检查一次是否到了自动上传周期。
+  useEffect(() => {
+    const tick = () => {
+      void maybeAutoCloudSync(localVersion).catch(() => {});
+    };
+    const id = window.setInterval(tick, 60_000);
+    tick();
+    return () => window.clearInterval(id);
+  }, [localVersion]);
 
   const playerUi = usePlayerUi();
   const playerOverlay = usePlayerOverlay();
@@ -697,6 +710,18 @@ export function Navbar({
           type="button"
           // eslint-disable-next-line react/no-unknown-property
           data-tauri-drag-region="false"
+          className={styles.navIconBtn}
+          title="云同步（OSS / WebDAV）"
+          aria-label="云同步"
+          onClick={() => setCloudSyncOpen(true)}
+        >
+          <Cloud size={18} />
+        </button>
+
+        <button
+          type="button"
+          // eslint-disable-next-line react/no-unknown-property
+          data-tauri-drag-region="false"
           className={`${styles.themeToggle} ${theme === "dark" ? styles.themeToggleDark : styles.themeToggleLight}`}
           onClick={onThemeToggle}
           aria-label={theme === "dark" ? "切换到浅色" : "切换到深色"}
@@ -811,7 +836,18 @@ export function Navbar({
       </AnimatePresence>
 
       <LanSyncModalPortal open={lanSyncOpen} onClose={() => setLanSyncOpen(false)} appVersion={localVersion} />
+      <CloudSyncModalPortal open={cloudSyncOpen} onClose={() => setCloudSyncOpen(false)} appVersion={localVersion} />
     </nav>
+  );
+}
+
+function CloudSyncModalPortal({ open, ...props }: { open: boolean; onClose: () => void; appVersion?: string }) {
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
+  if (!mounted) return null;
+  return ReactDOM.createPortal(
+    <CloudSyncModal open={open} {...props} />,
+    document.body
   );
 }
 

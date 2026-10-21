@@ -24,6 +24,10 @@ export class VolumeControl extends Plugin {
   private onVolumeChange: ((value: number) => void) | null = null;
   private handleIconClick: ((event: Event) => void) | null = null;
   private previousVolume = 1;
+  private handleSliderClick: ((event: MouseEvent) => void) | null = null;
+  private handleWheel: ((event: WheelEvent) => void) | null = null;
+  private handleIconDouble: ((event: Event) => void) | null = null;
+  private rootEl: HTMLElement | null = null;
   private roomKey: string | null = null;
   private updateUIFn: ((volume: number) => void) | null = null;
   /** setRoomKey 程序化设置音量/静音会异步触发 volumechange（改 muted 也会
@@ -177,9 +181,61 @@ export class VolumeControl extends Plugin {
 
     this.volumeIcon?.addEventListener('click', this.handleIconClick);
     if (this.volumeIcon) {
-      this.volumeIcon.setAttribute('title', '点击静音 / 取消静音（音量按直播间记忆）');
+      this.volumeIcon.setAttribute('title', '点击静音 / 取消静音，双击恢复 100%（音量按直播间记忆）');
       this.volumeIcon.style.cursor = 'pointer';
     }
+
+    // 点击滑杆任意位置直接定位音量（WKWebView 里原生 range 的点击跳变不可靠）。
+    this.handleSliderClick = (event: MouseEvent) => {
+      if (!this.slider) return;
+      const rect = this.slider.getBoundingClientRect();
+      if (rect.width <= 0) return;
+      const ratio = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
+      this.applying = false;
+      if (ratio === 0) {
+        this.player.muted = true;
+      } else {
+        this.player.muted = false;
+        this.previousVolume = ratio;
+      }
+      this.player.volume = ratio;
+      updateUI(ratio);
+      this.persistVolume(ratio);
+    };
+    this.slider?.addEventListener('click', this.handleSliderClick);
+
+    // 滚轮微调：向上 +5%，向下 -5%。
+    this.rootEl = this.root as HTMLElement | null;
+    this.handleWheel = (event: WheelEvent) => {
+      event.preventDefault();
+      const current = this.player.muted ? 0 : (this.player.volume ?? 0);
+      const step = event.deltaY < 0 ? 0.05 : -0.05;
+      const next = Math.max(0, Math.min(1, Math.round((current + step) * 100) / 100));
+      this.applying = false;
+      if (next === 0) {
+        this.player.muted = true;
+      } else {
+        this.player.muted = false;
+        this.previousVolume = next;
+      }
+      this.player.volume = next;
+      updateUI(next);
+      this.persistVolume(next);
+    };
+    this.rootEl?.addEventListener('wheel', this.handleWheel, { passive: false });
+
+    // 双击图标：恢复 100%。
+    this.handleIconDouble = (event: Event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      this.applying = false;
+      this.player.muted = false;
+      this.player.volume = 1;
+      this.previousVolume = 1;
+      updateUI(1);
+      this.persistVolume(1);
+    };
+    this.volumeIcon?.addEventListener('dblclick', this.handleIconDouble);
 
     this.onVolumeChange = () => {
       const current = this.player.volume ?? 1;
@@ -195,6 +251,19 @@ export class VolumeControl extends Plugin {
   }
 
   override destroy() {
+    if (this.handleSliderClick && this.slider) {
+      this.slider.removeEventListener('click', this.handleSliderClick);
+      this.handleSliderClick = null;
+    }
+    if (this.handleWheel && this.rootEl) {
+      this.rootEl.removeEventListener('wheel', this.handleWheel);
+      this.handleWheel = null;
+    }
+    if (this.handleIconDouble && this.volumeIcon) {
+      this.volumeIcon.removeEventListener('dblclick', this.handleIconDouble);
+      this.handleIconDouble = null;
+    }
+    this.rootEl = null;
     if (this.handleIconClick && this.volumeIcon) {
       this.volumeIcon.removeEventListener('click', this.handleIconClick);
       this.handleIconClick = null;
@@ -840,5 +909,55 @@ export class CastControl extends Plugin {
         <polyline points="17 2 12 7 7 2"/>
       </svg>
     </xg-icon>`;
+  }
+}
+
+export class SourceBadgeControl extends Plugin {
+  static override pluginName = 'sourceBadge';
+  static override defaultConfig = {
+    position: POSITIONS.CONTROLS_RIGHT,
+    index: 6.5,
+    disable: false,
+    getLabel: null as (() => string) | null,
+  };
+
+  private labelEl: HTMLElement | null = null;
+
+  override render() {
+    if (this.config.disable) {
+      return '';
+    }
+    return `<xg-icon class="xgplayer-source-badge" title="直播来源">
+      <span class="source-badge-text"></span>
+    </xg-icon>`;
+  }
+
+  override afterCreate() {
+    if (this.config.disable) {
+      return;
+    }
+    this.labelEl = this.find('.source-badge-text') as HTMLElement | null;
+    this.refresh();
+  }
+
+  /** 平台/房间软切换时由外部调用刷新文案。 */
+  updateLabel() {
+    this.refresh();
+  }
+
+  private refresh() {
+    if (!this.labelEl) {
+      return;
+    }
+    const label = typeof this.config.getLabel === 'function' ? this.config.getLabel() : '';
+    this.labelEl.textContent = label;
+    const root = this.root as HTMLElement | null;
+    if (root) {
+      root.style.display = label ? '' : 'none';
+    }
+  }
+
+  override destroy() {
+    this.labelEl = null;
   }
 }

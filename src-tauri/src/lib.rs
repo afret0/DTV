@@ -5,6 +5,7 @@ mod cast;
 mod config_transfer;
 mod dlna;
 pub mod flv_relay;
+mod cloud_sync;
 mod lan_sync;
 mod sync_transfer;
 pub mod platforms;
@@ -344,6 +345,9 @@ pub fn run_app() {
                 sync_transfer::export_lan_sync_json_to_desktop,
                 sync_transfer::pick_lan_sync_json_import,
                 sync_transfer::import_latest_lan_sync_json_from_desktop,
+                cloud_sync::cloud_sync_push,
+                cloud_sync::cloud_sync_pull,
+                cloud_sync::cloud_sync_test,
                 lan_sync::lan_sync_start_server,
                 lan_sync::lan_sync_stop_server,
                 lan_sync::lan_sync_status,

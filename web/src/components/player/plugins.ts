@@ -4,6 +4,7 @@ export {
   LineControl,
   QualityControl,
   RefreshControl,
+  SourceBadgeControl,
   VolumeControl,
   type LineOption,
 } from './playerControlsPlugins';

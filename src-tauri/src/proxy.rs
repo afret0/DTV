@@ -1275,7 +1275,6 @@ fn ensure_pump(store: StreamUrlStore) {
                             // 5103 解码错误 -> 冻结几十秒等看门狗。这里直接 bump generation：
                             // 客户端带「新配置 + 新关键帧」的 primer 重连，1s 级换台感。
                             if config_changed {
-                                config_changed = false;
                                 crate::tl!(
                                     "proxy",
                                     "pump #{} in-band codec config change -> bumping generation so clients re-prime with the new config",

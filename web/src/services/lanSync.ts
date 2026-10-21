@@ -9,7 +9,9 @@ export const LAN_SYNC_KEYS = [
   "followListOrder",
   "dtv_custom_categories_v1",
   "danmu_block_keywords",
-  "dtv_danmu_preferences_v1"
+  "dtv_danmu_preferences_v1",
+  "dtv_player_volume_v1",
+  "dtv_player_volume_room_v1"
 ] as const;
 
 type LanSyncKey = (typeof LAN_SYNC_KEYS)[number];
