@@ -1450,6 +1450,8 @@ export function MainPlayer({
     const RETRY_COOLDOWN_MS = 30_000;
 
     let lastReplayReloadAt = 0;
+    let replayReloads = 0;
+    let lastReplayWindowAt = Date.now();
     const id = window.setInterval(() => {
       const player: any = playerRef.current;
       const video: HTMLVideoElement | null =
@@ -1458,12 +1460,20 @@ export function MainPlayer({
       // 直播流永远不该出现「重播」覆盖层：它只在代理结束响应（硬重同步/上游
       // 断开）后出现，此时 video 处于 ended/paused，下面的冻结看门狗会直接
       // return，`ended` 事件也可能被 flv 插件吞掉 —— 结果就是用户盯着重播按钮
-      // 几十秒。检测到覆盖层就立即重连（5s 去抖防连环重载）。
+      // 几十秒。检测到覆盖层**真的可见**才重连。
+      // 注意：xgplayer 的 replay 插件节点常驻 DOM，隐藏时只是 display:none，
+      // 只查 querySelector 会在正常播放时每 5s 误判一次 -> 无限重载循环。
       const replayOverlay = document.querySelector(".xgplayer-replay") as HTMLElement | null;
-      if (replayOverlay && Date.now() - lastReplayReloadAt > 5000) {
+      const replayVisible =
+        !!replayOverlay &&
+        replayOverlay.isConnected &&
+        getComputedStyle(replayOverlay).display !== "none" &&
+        getComputedStyle(replayOverlay).visibility !== "hidden";
+      if (replayVisible && Date.now() - lastReplayReloadAt > 8000 && replayReloads < 6) {
         lastReplayReloadAt = Date.now();
+        replayReloads++;
         invoke("frontend_log", {
-          msg: `[player] replay overlay on a LIVE stream [${platform}/${roomId}] (ended=${video?.ended} paused=${video?.paused}) -> reloading`
+          msg: `[player] replay overlay VISIBLE on a LIVE stream [${platform}/${roomId}] (ended=${video?.ended} paused=${video?.paused}) -> reloading (${replayReloads}/6)`
         }).catch(() => {});
         void reloadStreamRef.current?.("refresh");
         return;
@@ -1481,6 +1491,10 @@ export function MainPlayer({
         // 播放确实在走：健康一段时间后把恢复预算还给看门狗。
         if (lastRecoveryAt && Date.now() - lastRecoveryAt > BURST_RESET_AFTER_MS) {
           stallRecoveries = 0;
+        }
+        if (Date.now() - lastReplayWindowAt > BURST_RESET_AFTER_MS) {
+          replayReloads = 0;
+          lastReplayWindowAt = Date.now();
         }
       }
       lastTime = cur;
