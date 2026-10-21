@@ -31,7 +31,10 @@ pub fn best_lan_ip() -> Option<IpAddr> {
 }
 
 /// Proxy port every renderer is pointed at (must match `proxy::start_proxy_inner`).
-pub const CAST_PORT: u16 = 34719;
+/// 与 proxy 固定端口保持一致（DTV_PROXY_PORT 可覆盖）。
+pub fn cast_port() -> u16 {
+    crate::proxy::proxy_port()
+}
 
 
 #[derive(Serialize, Clone)]
@@ -50,7 +53,7 @@ pub async fn get_cast_info(
         return Err("没有正在播放的直播流".to_string());
     }
     let ip = best_lan_ip().ok_or_else(|| "无法获取本机IP".to_string())?;
-    let lan_url = format!("http://{}:{}/live.flv", ip, CAST_PORT);
+    let lan_url = format!("http://{}:{}/live.flv", ip, cast_port());
     crate::tl!("cast", "[cast] cast info: local_ip={} lan_url={}", ip, lan_url);
     Ok(CastInfo {
         stream_url,
@@ -77,6 +80,8 @@ mod cast_tests {
             Some(IpAddr::V6(v6)) => assert!(!v6.is_loopback(), "loopback v6 cannot be cast to"),
             None => println!("[cast test] no LAN interface available"),
         }
-        assert_eq!(CAST_PORT, 34719, "cast port must match the proxy");
+        if std::env::var("DTV_PROXY_PORT").is_err() {
+            assert_eq!(cast_port(), 34719, "cast port must match the proxy");
+        }
     }
 }

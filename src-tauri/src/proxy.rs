@@ -19,7 +19,16 @@ pub type ServerHandleForStore = ServerHandle;
 const HUYA_HYSDK_UA: &str =
     "HYSDK(Windows,30000002)_APP(pc_exe&7080000&official)_SDK(trans&2.34.0.5795)";
 
-async fn find_free_port() -> u16 { 34719 }
+/// 代理固定端口。默认 34719（投屏/客户端都认这个口）；DTV_PROXY_PORT 可覆盖，
+/// 用于同机跑第二个实例（隔离验证/排障）时避免端口冲突。
+pub fn proxy_port() -> u16 {
+    std::env::var("DTV_PROXY_PORT")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(34719)
+}
+
+async fn find_free_port() -> u16 { proxy_port() }
 
 pub fn build_upstream_request(client: &Client, url: &str) -> reqwest::RequestBuilder {
     let mut req = client
@@ -500,7 +509,7 @@ async fn refresh_store_url(
                             .upstream_url
                             .clone()
                             .or(info.stream_url.clone())
-                            .filter(|u| !u.contains(":34719/"));
+                            .filter(|u| !u.contains(&format!(":{}/", proxy_port())));
                         match fresh {
                             Some(url) => {
                                 if stale() {
@@ -673,7 +682,7 @@ fn ensure_pump(store: StreamUrlStore) {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             }
-            if url.contains(":34719/live.flv") || url.contains(":34721/live.flv") {
+            if url.contains(&format!(":{}/live.flv", proxy_port())) || url.contains(":34721/live.flv") {
                 crate::tl!("proxy", "[proxy] pump refused self-referential URL");
                 break;
             }
