@@ -773,6 +773,7 @@ fn ensure_pump(store: StreamUrlStore) {
                     let mut last_stage_attempt: Option<tokio::time::Instant> = None;
                     let mut splice_logged = [false, false]; // [video, audio]
                     let mut config_fp = [0u64; 2]; // [video, audio] 序列头指纹
+                    let mut config_changed = false;
                     // 「有数据进来但什么都没转发出去」持续多久了。真出现说明续流的时间戳
                     // 标记已失效（例如新连接内容长期落后于标记、全被去重丢掉），必须整体
                     // 重同步，绝不能带着冻结的标记无限空转（用户看到的就是永久转圈）。
@@ -1120,8 +1121,10 @@ fn ensure_pump(store: StreamUrlStore) {
                                                 // 序列头/脚本 tag：整场只认第一次。但若新连接
                                                 // 的 SPS/PPS 与首段不同（CDN 边缘重封装），丢掉
                                                 // 它会让解码器拿着旧配置解新帧 -> 解码错误。
-                                                if tag.is_sequence_header {
-                                                    note_config(pump_id, tag.tag_type, &tag.raw, &mut config_fp);
+                                                if tag.is_sequence_header
+                                                    && note_config(pump_id, tag.tag_type, &tag.raw, &mut config_fp)
+                                                {
+                                                    config_changed = true;
                                                 }
                                                 continue;
                                             }
@@ -1207,7 +1210,9 @@ fn ensure_pump(store: StreamUrlStore) {
                                                 _ => false,
                                             };
                                             if is_seq {
-                                                note_config(pump_id, tag_type, &tag, &mut config_fp);
+                                                if note_config(pump_id, tag_type, &tag, &mut config_fp) {
+                                                    config_changed = true;
+                                                }
                                                 if tag_type == flv_relay::TAG_TYPE_VIDEO {
                                                     let mut g = p.vseq.lock().unwrap();
                                                     if g.is_none() {
@@ -1263,6 +1268,21 @@ fn ensure_pump(store: StreamUrlStore) {
                                     }
                                     break 'segments;
                                 }
+                            }
+
+                            // 上游带内配置变更（主播编码器重配 / CDN 换边缘）：播放器
+                            // 不处理带内 init segment 变更，会继续用旧 SPS/PPS 解新帧 ->
+                            // 5103 解码错误 -> 冻结几十秒等看门狗。这里直接 bump generation：
+                            // 客户端带「新配置 + 新关键帧」的 primer 重连，1s 级换台感。
+                            if config_changed {
+                                config_changed = false;
+                                crate::tl!(
+                                    "proxy",
+                                    "pump #{} in-band codec config change -> bumping generation so clients re-prime with the new config",
+                                    pump_id
+                                );
+                                commit_new_source(&store);
+                                break 'segments;
                             }
 
                             // 安全网：长时间一帧都发不出去 = 时间轴标记失效，硬重同步，
@@ -1932,11 +1952,12 @@ fn relay_compatible(
 /// 续流路径会丢弃重复序列头（整场只认第一次），前提是每条连接的配置完全相同；
 /// 一旦某条新连接的配置变了还继续丢，解码器就会拿旧配置解新帧 -> 5103 解码错误。
 /// 这里只做检测 + 告警，为离线定位提供证据。
-fn note_config(pump_id: u64, tag_type: u8, raw: &[u8], fp: &mut [u64; 2]) {
+/// 返回 true 表示配置相对本场会话发生了变化（调用方需要让客户端重同步）。
+fn note_config(pump_id: u64, tag_type: u8, raw: &[u8], fp: &mut [u64; 2]) -> bool {
     let idx = match tag_type {
         flv_relay::TAG_TYPE_VIDEO => 0,
         flv_relay::TAG_TYPE_AUDIO => 1,
-        _ => return,
+        _ => return false,
     };
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in raw {
@@ -1945,10 +1966,11 @@ fn note_config(pump_id: u64, tag_type: u8, raw: &[u8], fp: &mut [u64; 2]) {
     }
     let prev = fp[idx];
     fp[idx] = h;
-    if prev != 0 && prev != h {
+    let changed = prev != 0 && prev != h;
+    if changed {
         crate::tl!(
             "proxy",
-            "pump #{} codec config CHANGED for {} track (fp {:016x} -> {:016x}, {} bytes) - dropped duplicates would decode with the stale config!",
+            "pump #{} codec config CHANGED in-band for {} track (fp {:016x} -> {:016x}, {} bytes)",
             pump_id,
             if idx == 0 { "video" } else { "audio" },
             prev,
@@ -1956,6 +1978,7 @@ fn note_config(pump_id: u64, tag_type: u8, raw: &[u8], fp: &mut [u64; 2]) {
             raw.len()
         );
     }
+    changed
 }
 
 /// 把后台中继的新连接接上：先排空通道里已积压的字节（按音/视频轨时间戳去重），
@@ -2078,7 +2101,7 @@ fn apply_relay_switch<F: Fn()>(
             }
             _ => {
                 if tag.is_sequence_header {
-                    note_config(pump_id, tag.tag_type, &tag.raw, config_fp);
+                    let _ = note_config(pump_id, tag.tag_type, &tag.raw, config_fp);
                 }
                 true // 脚本/序列头：整场只认第一次
             }
