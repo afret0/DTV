@@ -960,7 +960,7 @@ export function MainPlayer({
         const storedPlayerVolume = loadStoredVolume();
         if (storedPlayerVolume !== null) {
           player.volume = storedPlayerVolume;
-          player.muted = storedPlayerVolume === 0 ? true : player.muted;
+          player.muted = storedPlayerVolume === 0;
         }
       } catch {
         // ignore

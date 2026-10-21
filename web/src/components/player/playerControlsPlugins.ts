@@ -46,7 +46,9 @@ export class VolumeControl extends Plugin {
     }
     this.lastApplied = stored;
     this.player.volume = stored;
-    this.player.muted = stored === 0 ? true : this.player.muted;
+    // 静音状态必须跟着房间记忆走：上一个房间静音留下的 muted=true 若不清掉，
+    // 切到任何房间都没声音（用户只能靠拖滑块自救）。
+    this.player.muted = stored === 0;
     this.updateUIFn?.(this.player.volume ?? stored);
     invoke('frontend_log', {
       msg: `[player] room volume applied [${roomKey}] -> ${Math.round(stored * 100)}%`
@@ -60,7 +62,11 @@ export class VolumeControl extends Plugin {
       return;
     }
     this.lastApplied = null;
-    persistStoredVolume(volume);
+    // 全局默认只记「有声」的音量：某个房间静音不应该把全局默认写成 0，
+    // 否则没记忆的房间全部开局静音。房间级记忆照常存 0。
+    if (volume > 0) {
+      persistStoredVolume(volume);
+    }
     if (this.roomKey) {
       persistRoomVolume(this.roomKey, volume);
       const key = this.roomKey;
