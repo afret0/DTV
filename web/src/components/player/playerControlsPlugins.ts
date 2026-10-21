@@ -26,9 +26,11 @@ export class VolumeControl extends Plugin {
   private previousVolume = 1;
   private roomKey: string | null = null;
   private updateUIFn: ((volume: number) => void) | null = null;
-  /** setRoomKey 程序化设置音量会异步触发 volumechange；这次不应回写存储
-   * （否则全局默认会被「路过」的直播间音量带跑）。 */
-  private lastApplied: number | null = null;
+  /** setRoomKey 程序化设置音量/静音会异步触发 volumechange（改 muted 也会
+   * 触发一次）；这些事件绝不能回写存储，否则全局默认会被「路过」的直播间
+   * 音量带跑。用户真正操作滑块/静音按钮时清除该标志。 */
+  private applying = false;
+  private appliedValue = 0;
   private saveLogTimer: ReturnType<typeof setTimeout> | null = null;
 
   /** 切换到某个直播间：应用该房间记忆过的音量（没调过就用全局默认）。 */
@@ -44,7 +46,8 @@ export class VolumeControl extends Plugin {
     if (stored > 0) {
       this.previousVolume = stored;
     }
-    this.lastApplied = stored;
+    this.applying = true;
+    this.appliedValue = stored;
     this.player.volume = stored;
     // 静音状态必须跟着房间记忆走：上一个房间静音留下的 muted=true 若不清掉，
     // 切到任何房间都没声音（用户只能靠拖滑块自救）。
@@ -57,11 +60,9 @@ export class VolumeControl extends Plugin {
 
   /** 全局 + 当前直播间一起记住；日志去抖，避免拖动滑块时刷屏。 */
   private persistVolume(volume: number) {
-    if (this.lastApplied !== null && Math.abs(volume - this.lastApplied) < 0.001) {
-      this.lastApplied = null;
+    if (this.applying) {
       return;
     }
-    this.lastApplied = null;
     // 全局默认只记「有声」的音量：某个房间静音不应该把全局默认写成 0，
     // 否则没记忆的房间全部开局静音。房间级记忆照常存 0。
     if (volume > 0) {
@@ -137,6 +138,7 @@ export class VolumeControl extends Plugin {
     updateUI(this.player.volume ?? storedVolume ?? 1);
 
     this.slider?.addEventListener('input', (event) => {
+      this.applying = false;
       const value = Number((event.target as HTMLInputElement).value);
       const clampedPercent = Math.max(0, Math.min(100, value));
       const normalized = clampedPercent / 100;
@@ -154,6 +156,7 @@ export class VolumeControl extends Plugin {
     this.handleIconClick = (event: Event) => {
       event.preventDefault();
       event.stopPropagation();
+      this.applying = false;
       const currentVolume = this.player.volume ?? 0;
       if (currentVolume > 0) {
         this.previousVolume = currentVolume;
@@ -179,6 +182,11 @@ export class VolumeControl extends Plugin {
     this.onVolumeChange = () => {
       const current = this.player.volume ?? 1;
       updateUI(current);
+      // 程序化应用只会产生「值不变」的 volumechange（改 volume / 改 muted 各
+      // 一次）；值变了说明是别的途径（键盘等）在改，恢复持久化。
+      if (this.applying && Math.abs(current - this.appliedValue) > 0.001) {
+        this.applying = false;
+      }
       this.persistVolume(current);
     };
     this.player.on('volumechange', this.onVolumeChange);
