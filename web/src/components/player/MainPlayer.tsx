@@ -1003,6 +1003,21 @@ export function MainPlayer({
             }, 400);
             return;
           }
+          // 解码类错误（5103 / MediaError 3）在直播里是致命的：缓冲里的数据已经
+          // 解不出来，等预算/看门狗只会冻结几十秒。直接强制重连（8s 去抖防循环），
+          // 不受 MAX_AUTO_RECONNECT 预算限制。
+          const isDecodeError = err?.errorCode === 5103 || me?.code === 3;
+          if (isDecodeError) {
+            if (Date.now() - lastDecodeReloadAt < 8000) return;
+            lastDecodeReloadAt = Date.now();
+            invoke("frontend_log", { msg: `player decode error -> forced reload [${platform}/${roomId}]` }).catch(() => {});
+            if (autoReconnectTimerRef.current) clearTimeout(autoReconnectTimerRef.current);
+            autoReconnectTimerRef.current = setTimeout(() => {
+              autoReconnectTimerRef.current = null;
+              void reloadStreamRef.current?.("refresh");
+            }, 200);
+            return;
+          }
           if (reconnectAttemptRef.current >= MAX_AUTO_RECONNECT) return;
           reconnectAttemptRef.current++;
           console.log(`[Player] Stream error detected, auto-reconnecting (attempt ${reconnectAttemptRef.current}/${MAX_AUTO_RECONNECT})`);
@@ -1014,6 +1029,7 @@ export function MainPlayer({
           }, 2000);
         });
 
+        let lastDecodeReloadAt = 0;
         let waitingTimer: ReturnType<typeof setTimeout> | null = null;
         player.on?.("waiting", () => {
           if (!isSessionActive(sessionId)) return;
