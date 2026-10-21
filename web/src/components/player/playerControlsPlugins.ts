@@ -127,7 +127,9 @@ export class VolumeControl extends Plugin {
         this.previousVolume = storedVolume;
       }
       this.player.volume = storedVolume;
-      this.player.muted = storedVolume === 0 ? true : this.player.muted;
+      // 同上：静音态严格跟随所应用的音量，不让 WKWebView 自动播放策略留下的
+      // muted=true 粘住（否则重载后有声变无声）。
+      this.player.muted = storedVolume === 0;
     } else {
       const initial = this.player.volume ?? 1;
       if (initial > 0) {
