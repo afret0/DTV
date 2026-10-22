@@ -2,12 +2,13 @@
 
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { AnimatePresence, m } from "framer-motion";
-import { Download, Upload, X } from "lucide-react";
+import { Cloud, Download, Upload, X } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { QRCodeCanvas } from "qrcode.react";
 
 import styles from "./Navbar.module.css";
 import { applyIncrementalLanSyncImport, createLanSyncPayload, parseLanSyncManifest, parseLanSyncPayload } from "@/services/lanSync";
+import { CloudSyncPanel } from "./CloudSyncModal";
 
 type ServerInfo = { port: number; hosts: string[]; token: string };
 type DiscoveredPeer = { name: string; host: string; port: number; token?: string | null; baseUrl: string };
@@ -114,13 +115,15 @@ async function fetchJsonWithTimeout(url: string, timeoutMs: number) {
 export function LanSyncModal({
   open,
   onClose,
-  appVersion
+  appVersion,
+  initialTab
 }: {
   open: boolean;
   onClose: () => void;
   appVersion?: string;
+  initialTab?: "export" | "import" | "cloud";
 }) {
-  const [tab, setTab] = useState<"export" | "import">("export");
+  const [tab, setTab] = useState<"export" | "import" | "cloud">(initialTab ?? "export");
 
   const [serverInfo, setServerInfo] = useState<ServerInfo | null>(null);
   const [exportBusy, setExportBusy] = useState(false);
@@ -153,7 +156,7 @@ export function LanSyncModal({
   useEffect(() => {
     if (!open) return;
 
-    setTab("export");
+    setTab(initialTab ?? "export");
     setExportBusy(false);
     setExportError(null);
     setJsonExportBusy(false);
@@ -173,7 +176,7 @@ export function LanSyncModal({
         setServerInfo(null);
       }
     })();
-  }, [open]);
+  }, [open, initialTab]);
 
   const stopShare = useCallback(async () => {
     setExportBusy(true);
@@ -399,9 +402,19 @@ export function LanSyncModal({
                 <Download size={16} />
                 导入
               </button>
+              <button
+                type="button"
+                className={`${styles.syncTab} ${styles.syncBtnGlass} ${tab === "cloud" ? styles.syncTabActive : ""}`}
+                onClick={() => setTab("cloud")}
+              >
+                <Cloud size={16} />
+                云同步
+              </button>
             </div>
 
-            {tab === "export" ? (
+            {tab === "cloud" ? (
+              <CloudSyncPanel appVersion={appVersion} />
+            ) : tab === "export" ? (
               <>
                 {serverInfo?.hosts?.length && shareImportUrl ? (
                   <div className={styles.syncQrBlock} aria-label="lan-qr">

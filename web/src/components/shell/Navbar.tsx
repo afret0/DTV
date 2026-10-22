@@ -8,7 +8,6 @@ import { usePathname } from "next/navigation";
 import { invoke } from "@tauri-apps/api/core";
 
 import styles from "./Navbar.module.css";
-import { CloudSyncModal } from "./CloudSyncModal";
 import { LanSyncModal } from "./LanSyncModal";
 import { maybeAutoCloudSync } from "@/services/cloudSync";
 import { searchAnchors, type SearchAnchorResult, type SearchPlatform } from "@/services/search";
@@ -92,18 +91,11 @@ export function Navbar({
   const [donateOpen, setDonateOpen] = useState(false);
   const [updateOpen, setUpdateOpen] = useState(false);
   const [lanSyncOpen, setLanSyncOpen] = useState(false);
-  const [cloudSyncOpen, setCloudSyncOpen] = useState(false);
+  const [lanSyncTab, setLanSyncTab] = useState<"export" | "import" | "cloud">("export");
 
   const [versionInfo, setVersionInfo] = useState<VersionInfo | null>(null);
   const [hasUpdate, setHasUpdate] = useState(false);
   const [localVersion, setLocalVersion] = useState<string>("");
-  // 播放页顶栏的云同步按钮通过自定义事件请求打开面板。
-  useEffect(() => {
-    const onOpen = () => setCloudSyncOpen(true);
-    window.addEventListener("dtv-open-cloud-sync", onOpen);
-    return () => window.removeEventListener("dtv-open-cloud-sync", onOpen);
-  }, []);
-
   // 云同步心跳：每分钟检查一次是否到了自动上传周期。
   useEffect(() => {
     const tick = () => {
@@ -708,7 +700,10 @@ export function Navbar({
           className={styles.navIconBtn}
           title="Data Sync"
           aria-label="Data Sync"
-          onClick={() => setLanSyncOpen(true)}
+          onClick={() => {
+            setLanSyncTab("export");
+            setLanSyncOpen(true);
+          }}
         >
           <MonitorSmartphone size={18} />
         </button>
@@ -720,7 +715,10 @@ export function Navbar({
           className={styles.navIconBtn}
           title="云同步（OSS / WebDAV）"
           aria-label="云同步"
-          onClick={() => setCloudSyncOpen(true)}
+          onClick={() => {
+            setLanSyncTab("cloud");
+            setLanSyncOpen(true);
+          }}
         >
           <Cloud size={18} />
         </button>
@@ -751,7 +749,11 @@ export function Navbar({
         ) : null}
       </div>
 
-      <AnimatePresence>
+      {/* nav 有 backdrop-filter，会成为 fixed 的 containing block，弹层必须
+          portal 到 body，否则会被裁切显示不全 */}
+      {ReactDOM.createPortal(
+        <>
+          <AnimatePresence>
         {donateOpen ? (
           <m.div
             className={styles.overlayBackdrop}
@@ -783,9 +785,9 @@ export function Navbar({
             </m.div>
           </m.div>
         ) : null}
-      </AnimatePresence>
+          </AnimatePresence>
 
-      <AnimatePresence>
+          <AnimatePresence>
         {updateOpen ? (
           <m.div
             className={styles.overlayBackdrop}
@@ -840,25 +842,31 @@ export function Navbar({
             </m.div>
           </m.div>
         ) : null}
-      </AnimatePresence>
+          </AnimatePresence>
 
-      <LanSyncModalPortal open={lanSyncOpen} onClose={() => setLanSyncOpen(false)} appVersion={localVersion} />
-      <CloudSyncModalPortal open={cloudSyncOpen} onClose={() => setCloudSyncOpen(false)} appVersion={localVersion} />
+        </>,
+        document.body
+      )}
+
+      <LanSyncModalPortal
+        open={lanSyncOpen}
+        onClose={() => setLanSyncOpen(false)}
+        appVersion={localVersion}
+        initialTab={lanSyncTab}
+      />
     </nav>
   );
 }
 
-function CloudSyncModalPortal({ open, ...props }: { open: boolean; onClose: () => void; appVersion?: string }) {
-  const [mounted, setMounted] = useState(false);
-  useEffect(() => setMounted(true), []);
-  if (!mounted) return null;
-  return ReactDOM.createPortal(
-    <CloudSyncModal open={open} {...props} />,
-    document.body
-  );
-}
-
-function LanSyncModalPortal({ open, ...props }: { open: boolean; onClose: () => void; appVersion?: string }) {
+function LanSyncModalPortal({
+  open,
+  ...props
+}: {
+  open: boolean;
+  onClose: () => void;
+  appVersion?: string;
+  initialTab?: "export" | "import" | "cloud";
+}) {
   const [mounted, setMounted] = useState(false);
 
   useEffect(() => {

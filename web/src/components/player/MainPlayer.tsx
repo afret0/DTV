@@ -4,7 +4,6 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { useRouter } from "next/navigation";
 import { listen, type Event as TauriEvent } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
-import { Cloud } from "lucide-react";
 import { v4 as uuidv4 } from "uuid";
 import { AnimatePresence, m } from "framer-motion";
 import { POSITIONS } from "xgplayer/es/plugin/plugin.js";
@@ -1811,15 +1810,6 @@ export function MainPlayer({
                     <div className={`player-topbar-status ${playerIsLive === false ? "is-offline" : "is-live"}`}>
                       {isLoadingStream ? "加载中" : playerIsLive === false ? "未开播" : "直播中"}
                     </div>
-                    <button
-                      type="button"
-                      className="player-topbar-cloud"
-                      title="云同步（OSS / WebDAV）"
-                      aria-label="云同步"
-                      onClick={() => window.dispatchEvent(new CustomEvent("dtv-open-cloud-sync"))}
-                    >
-                      <Cloud size={15} />
-                    </button>
                     <button
                       type="button"
                       className={`player-topbar-follow ${isFollowed ? "is-following" : ""}`}

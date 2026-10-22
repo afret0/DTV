@@ -2452,23 +2452,21 @@ video.xgplayer-video {
   animation: dtv-spin 1s linear infinite;
 }
 
-/* 直播来源标记：投屏按钮右侧的小徽章 */
+/* 直播来源标记：投屏按钮右侧的纯文字（不加圆圈/底色） */
 .xgplayer-source-badge {
   display: inline-flex;
   align-items: center;
-  padding: 0 8px;
-  height: 22px;
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.12);
-  border: 1px solid rgba(255, 255, 255, 0.18);
+  padding: 0 6px;
+  background: none;
+  border: none;
   cursor: default;
 }
 
 .xgplayer-source-badge .source-badge-text {
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 800;
   letter-spacing: 0.5px;
-  color: rgba(255, 255, 255, 0.92);
+  color: rgba(255, 255, 255, 0.88);
   white-space: nowrap;
 }
 
@@ -2478,24 +2476,4 @@ video.xgplayer-video {
   cursor: pointer;
   padding: 6px 0;
   background-clip: content-box;
-}
-
-.player-topbar-cloud {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 28px;
-  height: 28px;
-  margin-left: 8px;
-  border-radius: 999px;
-  border: 1px solid rgba(255, 255, 255, 0.18);
-  background: rgba(255, 255, 255, 0.08);
-  color: rgba(255, 255, 255, 0.85);
-  cursor: pointer;
-  transition: background 0.15s ease, color 0.15s ease;
-}
-
-.player-topbar-cloud:hover {
-  background: rgba(255, 255, 255, 0.16);
-  color: #fff;
 }

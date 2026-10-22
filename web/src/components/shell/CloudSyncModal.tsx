@@ -1,8 +1,7 @@
 "use client";
 
 import React, { useCallback, useEffect, useState } from "react";
-import { AnimatePresence, m } from "framer-motion";
-import { CloudDownload, CloudUpload, PlugZap, X } from "lucide-react";
+import { CloudDownload, CloudUpload, PlugZap } from "lucide-react";
 
 import styles from "./Navbar.module.css";
 import {
@@ -24,29 +23,22 @@ function formatTime(ts: number | null): string {
   return `${d.getMonth() + 1}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
-export function CloudSyncModal({
-  open,
-  onClose,
-  appVersion
-}: {
-  open: boolean;
-  onClose: () => void;
-  appVersion?: string;
-}) {
+/** 云同步配置面板：可独立成弹窗，也可嵌入「数据同步」弹窗作为页签。 */
+export function CloudSyncPanel({ appVersion }: { appVersion?: string }) {
   const [settings, setSettings] = useState<CloudSyncSettings>(() => loadCloudSyncSettings());
   const [state, setState] = useState<CloudSyncState>(() => loadCloudSyncState());
   const [busy, setBusy] = useState<"" | "test" | "push" | "pull">("");
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  // 每次挂载（弹窗打开/切到云同步页签）都重新读一遍本地配置与状态。
   useEffect(() => {
-    if (!open) return;
     setSettings(loadCloudSyncSettings());
     setState(loadCloudSyncState());
     setMessage(null);
     setError(null);
     setBusy("");
-  }, [open]);
+  }, []);
 
   const patch = useCallback((next: Partial<CloudSyncSettings>) => {
     setSettings((prev) => {
@@ -104,32 +96,8 @@ export function CloudSyncModal({
   );
 
   return (
-    <AnimatePresence>
-      {open && (
-        <m.div
-          className={styles.overlayBackdrop}
-          data-tauri-drag-region="false"
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          exit={{ opacity: 0 }}
-          onMouseDown={() => onClose()}
-        >
-          <m.div
-            className={styles.overlayCard}
-            initial={{ opacity: 0, y: 10, scale: 0.985 }}
-            animate={{ opacity: 1, y: 0, scale: 1 }}
-            exit={{ opacity: 0, y: 8, scale: 0.99 }}
-            transition={{ type: "spring", stiffness: 520, damping: 44, mass: 0.7 }}
-            onMouseDown={(e) => e.stopPropagation()}
-          >
-            <div className={styles.overlayHeader}>
-              <div className={styles.overlayTitle}>云同步</div>
-              <button type="button" className={`${styles.overlayClose} ${styles.syncBtnGlass}`} onClick={onClose} aria-label="关闭">
-                <X size={16} />
-              </button>
-            </div>
-
-            <div className={styles.overlayBody}>
+    <>
+      <div className={styles.overlayBody} style={{ padding: 0 }}>
               <div className={styles.syncField}>
                 <span className={styles.syncLabel}>同步方式</span>
                 <div className={styles.syncTabs}>
@@ -271,13 +239,10 @@ export function CloudSyncModal({
                   {busy === "pull" ? "下载中…" : "下载并应用"}
                 </button>
               </div>
-              <div className={styles.syncHint}>
-                同步内容：关注列表、分组、自定义分类、弹幕偏好与屏蔽词、各直播间音量。密钥只保存在本机。
-              </div>
-            </div>
-          </m.div>
-        </m.div>
-      )}
-    </AnimatePresence>
+      <div className={styles.syncHint}>
+        同步内容：关注列表、分组、自定义分类、弹幕偏好与屏蔽词、各直播间音量。密钥只保存在本机。
+      </div>
+      </div>
+    </>
   );
 }
