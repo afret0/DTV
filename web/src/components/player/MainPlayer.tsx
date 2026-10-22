@@ -1054,7 +1054,12 @@ export function MainPlayer({
           if (!isSessionActive(sessionId)) return;
           // 转圈 = 播放器缓冲空了。先让代理无缝换一条上游（不断播放位置、不丢
           // 弹幕），8s 去抖；只有换线后还卡才走整体 reload。
-          if (Date.now() - lastRenewNudgeAt > 8000) {
+          // 起播阶段的 waiting 是正常首缓冲（currentTime 还很小），不能换线。
+          const vid: HTMLVideoElement | null =
+            playerRef.current?.video ??
+            (document.querySelector(".xgplayer video") as HTMLVideoElement | null);
+          const startedForAWhile = (vid?.currentTime ?? 0) > 20;
+          if (startedForAWhile && Date.now() - lastRenewNudgeAt > 8000) {
             lastRenewNudgeAt = Date.now();
             invoke("proxy_renew_upstream").catch(() => {});
             invoke("frontend_log", {
