@@ -92,6 +92,11 @@ export function Navbar({
   const [updateOpen, setUpdateOpen] = useState(false);
   const [lanSyncOpen, setLanSyncOpen] = useState(false);
   const [lanSyncTab, setLanSyncTab] = useState<"export" | "import" | "cloud">("export");
+  const [portalsMounted, setPortalsMounted] = useState(false);
+
+  useEffect(() => {
+    setPortalsMounted(true);
+  }, []);
 
   const [versionInfo, setVersionInfo] = useState<VersionInfo | null>(null);
   const [hasUpdate, setHasUpdate] = useState(false);
@@ -750,8 +755,8 @@ export function Navbar({
       </div>
 
       {/* nav 有 backdrop-filter，会成为 fixed 的 containing block，弹层必须
-          portal 到 body，否则会被裁切显示不全 */}
-      {ReactDOM.createPortal(
+          portal 到 body，否则会被裁切显示不全。SSR 阶段没有 document，需守卫。 */}
+      {portalsMounted && ReactDOM.createPortal(
         <>
           <AnimatePresence>
         {donateOpen ? (
