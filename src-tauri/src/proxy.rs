@@ -792,6 +792,9 @@ fn ensure_pump(store: StreamUrlStore) {
                     let mut starved_since: Option<std::time::Instant> = None;
                     let mut rate_window_at = std::time::Instant::now();
                     let mut rate_window_bytes: u64 = 0;
+                    let mut rate_ema: f64 = 0.0; // bytes per STARVE_WINDOW
+                    let mut rate_windows: u32 = 0;
+                    let mut starve_strikes: u32 = 0;
 
                     // 硬重同步：bump generation 让所有客户端干净重连（拿 primer），
                     // 同时重放 init（文件头+配置）并从 IDR 恢复内容。用于两种绝境：
@@ -993,27 +996,46 @@ fn ensure_pump(store: StreamUrlStore) {
                             last_beat += chunk.len() as u64;
                             rate_window_bytes += chunk.len() as u64;
                             if rate_window_at.elapsed() >= STARVE_WINDOW {
-                                // 有客户端且会话已起量时才判定，避免起播/切换瞬间误报。
-                                if CLIENT_COUNT.load(Ordering::Relaxed) > 0
-                                    && session_bytes > 5_000_000
-                                    && rate_window_bytes < STARVE_WINDOW_MIN_BYTES
-                                {
-                                    crate::tl!(
-                                        "proxy",
-                                        "pump #{} upstream trickle-starved: {} bytes in last {}s (< {} threshold) with {} clients -> dropping connection and renewing",
-                                        pump_id,
-                                        rate_window_bytes,
-                                        STARVE_WINDOW.as_secs(),
-                                        STARVE_WINDOW_MIN_BYTES,
-                                        CLIENT_COUNT.load(Ordering::Relaxed)
-                                    );
-                                    rate_window_at = std::time::Instant::now();
-                                    rate_window_bytes = 0;
-                                    silent = true;
-                                    break;
-                                }
+                                let w = rate_window_bytes as f64;
                                 rate_window_at = std::time::Instant::now();
                                 rate_window_bytes = 0;
+                                // 有客户端且会话已起量时才判定，避免起播/切换瞬间误报。
+                                let watching = CLIENT_COUNT.load(Ordering::Relaxed) > 0
+                                    && session_bytes > 5_000_000;
+                                if watching && rate_windows >= 3 {
+                                    let absolute = w < STARVE_WINDOW_MIN_BYTES as f64;
+                                    let relative = w < rate_ema * STARVE_EMA_RATIO;
+                                    if absolute || relative {
+                                        starve_strikes += 1;
+                                        crate::tl!(
+                                            "proxy",
+                                            "pump #{} upstream slowed: {:.1}KB in last {}s (ema {:.1}KB, strike {}/2, absolute={} relative={})",
+                                            pump_id,
+                                            w / 1024.0,
+                                            STARVE_WINDOW.as_secs(),
+                                            rate_ema / 1024.0,
+                                            starve_strikes,
+                                            absolute,
+                                            relative
+                                        );
+                                        if starve_strikes >= 2 || absolute {
+                                            crate::tl!(
+                                                "proxy",
+                                                "pump #{} -> dropping the starved connection and renewing",
+                                                pump_id
+                                            );
+                                            starve_strikes = 0;
+                                            silent = true;
+                                            break;
+                                        }
+                                    } else {
+                                        starve_strikes = 0;
+                                        rate_ema = rate_ema * 0.7 + w * 0.3;
+                                    }
+                                } else if watching {
+                                    rate_ema = rate_ema * 0.7 + w * 0.3;
+                                }
+                                rate_windows += 1;
                             }
                             if beat_at.elapsed() >= Duration::from_secs(60) {
                                 crate::tl!(
@@ -1642,12 +1664,14 @@ fn ensure_pump(store: StreamUrlStore) {
 /// 8s 已远超正常 chunk 间隔（毫秒级），又比播放器缓冲（~5s）+转圈容忍快得多。
 pub const UPSTREAM_SILENCE_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// 上游「 trickle 卡死」看门狗窗口：CDN 有时不静默而是极慢地滴数据，
-/// 静默看门狗抓不到，播放器缓冲却被慢慢抽干（圈圈反复转）。
+/// 上游「变慢卡死」看门狗窗口：CDN 有时不静默而是降速滴数据（实测从
+/// 2.5MB/10s 掉到 ~1.5MB/10s），静默看门狗抓不到，播放器缓冲却被慢慢抽干
+/// （圈圈反复转）。用「窗口速率 vs 会话 EMA」的相对判定抓它。
 pub const STARVE_WINDOW: Duration = Duration::from_secs(10);
-/// 窗口内字节数下限。实测各平台原画约 2~3MB/10s；低于 512KB/10s(=400kbps)
-/// 必然不是正常直播码率，判定为上游卡死。
+/// 绝对下限：窗口字节低于此值（=400kbps，任何原画直播都不可能）立即换线。
 pub const STARVE_WINDOW_MIN_BYTES: u64 = 512 * 1024;
+/// 相对判定：窗口速率 < EMA 的 45% 记一次饥饿，连续 2 次（20s）换线。
+pub const STARVE_EMA_RATIO: f64 = 0.45;
 /// 没有任何客户端时，pump 继续拉流这么久后自行退出（下次请求会重新拉起），
 /// 避免后台一直烧带宽。
 pub const IDLE_PUMP_SHUTDOWN: Duration = Duration::from_secs(90);
