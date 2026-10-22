@@ -1049,8 +1049,18 @@ export function MainPlayer({
 
         let lastDecodeReloadAt = 0;
         let waitingTimer: ReturnType<typeof setTimeout> | null = null;
+        let lastRenewNudgeAt = 0;
         player.on?.("waiting", () => {
           if (!isSessionActive(sessionId)) return;
+          // 转圈 = 播放器缓冲空了。先让代理无缝换一条上游（不断播放位置、不丢
+          // 弹幕），8s 去抖；只有换线后还卡才走整体 reload。
+          if (Date.now() - lastRenewNudgeAt > 8000) {
+            lastRenewNudgeAt = Date.now();
+            invoke("proxy_renew_upstream").catch(() => {});
+            invoke("frontend_log", {
+              msg: `[player] waiting (spinner) [${platform}/${roomId}] -> asked proxy to rotate upstream`
+            }).catch(() => {});
+          }
           if (reconnectAttemptRef.current >= MAX_AUTO_RECONNECT) return;
           if (waitingTimer) return;
           waitingTimer = setTimeout(() => {

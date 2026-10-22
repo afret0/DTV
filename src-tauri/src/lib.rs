@@ -365,6 +365,7 @@ pub fn run_app() {
                 platforms::bilibili::danmaku::stop_bilibili_danmaku_listener,
                 proxy::start_proxy,
                 proxy::stop_proxy,
+                proxy::proxy_renew_upstream,
                 proxy::start_static_proxy_server,
                 cast::get_cast_info,
                 dlna::discover_dlna_devices,

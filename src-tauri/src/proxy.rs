@@ -88,6 +88,8 @@ struct SharedPump {
     /// 连续「饿死重连」次数：反复发生说明续流在这条线上不可用，本连接内关掉
     /// 续流退回普通断线重连，绝不让 pump 卡在重同步循环里（用户看到黑屏）。
     starvation_streak: std::sync::atomic::AtomicU32,
+    /// 前端 waiting 时请求立即换上游。
+    force_renew: std::sync::atomic::AtomicBool,
     /// Consecutive respawns without a healthy session; bounded so a permanently
     /// broken source cannot spin forever. Any session that actually streams
     /// resets it, so ordinary use (room switches) is unlimited.
@@ -426,6 +428,7 @@ fn pump_for(store: &StreamUrlStore) -> Arc<SharedPump> {
         aseq: std::sync::Mutex::new(None),
         video_delta: std::sync::Mutex::new((0, 0)),
         starvation_streak: std::sync::atomic::AtomicU32::new(0),
+        force_renew: std::sync::atomic::AtomicBool::new(false),
         task_spawns: AtomicUsize::new(0),
         session_healthy: AtomicBool::new(false),
         broadcast_started: AtomicBool::new(false),
@@ -787,6 +790,8 @@ fn ensure_pump(store: StreamUrlStore) {
                     // 标记已失效（例如新连接内容长期落后于标记、全被去重丢掉），必须整体
                     // 重同步，绝不能带着冻结的标记无限空转（用户看到的就是永久转圈）。
                     let mut starved_since: Option<std::time::Instant> = None;
+                    let mut rate_window_at = std::time::Instant::now();
+                    let mut rate_window_bytes: u64 = 0;
 
                     // 硬重同步：bump generation 让所有客户端干净重连（拿 primer），
                     // 同时重放 init（文件头+配置）并从 IDR 恢复内容。用于两种绝境：
@@ -973,9 +978,43 @@ fn ensure_pump(store: StreamUrlStore) {
                                 crate::tl!("proxy", "[proxy] stream source changed -> switch upstream");
                                 break 'segments;
                             }
+                            if p.force_renew.swap(false, Ordering::SeqCst) {
+                                crate::tl!(
+                                    "proxy",
+                                    "pump #{} force-renew honored at t={:.1}s (player was buffering) -> rotating upstream",
+                                    pump_id,
+                                    segment.elapsed().as_secs_f64()
+                                );
+                                silent = true;
+                                break;
+                            }
                             session_bytes += chunk.len() as u64;
                             session_chunks += 1;
                             last_beat += chunk.len() as u64;
+                            rate_window_bytes += chunk.len() as u64;
+                            if rate_window_at.elapsed() >= STARVE_WINDOW {
+                                // 有客户端且会话已起量时才判定，避免起播/切换瞬间误报。
+                                if CLIENT_COUNT.load(Ordering::Relaxed) > 0
+                                    && session_bytes > 5_000_000
+                                    && rate_window_bytes < STARVE_WINDOW_MIN_BYTES
+                                {
+                                    crate::tl!(
+                                        "proxy",
+                                        "pump #{} upstream trickle-starved: {} bytes in last {}s (< {} threshold) with {} clients -> dropping connection and renewing",
+                                        pump_id,
+                                        rate_window_bytes,
+                                        STARVE_WINDOW.as_secs(),
+                                        STARVE_WINDOW_MIN_BYTES,
+                                        CLIENT_COUNT.load(Ordering::Relaxed)
+                                    );
+                                    rate_window_at = std::time::Instant::now();
+                                    rate_window_bytes = 0;
+                                    silent = true;
+                                    break;
+                                }
+                                rate_window_at = std::time::Instant::now();
+                                rate_window_bytes = 0;
+                            }
                             if beat_at.elapsed() >= Duration::from_secs(60) {
                                 crate::tl!(
                                     "proxy",
@@ -1600,8 +1639,15 @@ fn ensure_pump(store: StreamUrlStore) {
 }
 
 /// 上游静默看门狗：连接还开着但这么久没有任何字节 -> 判定为 CDN 卡死，主动断开重连。
-/// 没有它，客户端只会一直转圈（斗鱼偶发的「看着看着就不动了」）。
-pub const UPSTREAM_SILENCE_TIMEOUT: Duration = Duration::from_secs(20);
+/// 8s 已远超正常 chunk 间隔（毫秒级），又比播放器缓冲（~5s）+转圈容忍快得多。
+pub const UPSTREAM_SILENCE_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// 上游「 trickle 卡死」看门狗窗口：CDN 有时不静默而是极慢地滴数据，
+/// 静默看门狗抓不到，播放器缓冲却被慢慢抽干（圈圈反复转）。
+pub const STARVE_WINDOW: Duration = Duration::from_secs(10);
+/// 窗口内字节数下限。实测各平台原画约 2~3MB/10s；低于 512KB/10s(=400kbps)
+/// 必然不是正常直播码率，判定为上游卡死。
+pub const STARVE_WINDOW_MIN_BYTES: u64 = 512 * 1024;
 /// 没有任何客户端时，pump 继续拉流这么久后自行退出（下次请求会重新拉起），
 /// 避免后台一直烧带宽。
 pub const IDLE_PUMP_SHUTDOWN: Duration = Duration::from_secs(90);
@@ -2266,6 +2312,25 @@ pub async fn start_proxy(
     stream_url_store: State<'_, StreamUrlStore>,
 ) -> Result<String, String> {
     start_proxy_inner(server_handle_state.0.clone(), stream_url_store.inner().clone()).await
+}
+
+/// 前端检测到播放器 waiting（转圈）时调用：让 pump 立刻放弃当前上游连接并
+/// 走无缝续流路径换一条 CDN 会话，比等缓冲自己恢复或整体 reload 快得多。
+#[tauri::command]
+pub async fn proxy_renew_upstream() -> Result<bool, String> {
+    let Some(slot) = PUMP.get() else { return Ok(false) };
+    let guard = slot.lock().unwrap();
+    let Some((_, p)) = guard.as_ref() else { return Ok(false) };
+    if CLIENT_COUNT.load(Ordering::SeqCst) == 0 {
+        return Ok(false);
+    }
+    crate::tl!(
+        "proxy",
+        "pump #{} renew requested by player (waiting/spinner) -> forcing upstream rotation",
+        p.id
+    );
+    p.force_renew.store(true, Ordering::SeqCst);
+    Ok(true)
 }
 
 #[tauri::command]
