@@ -84,6 +84,8 @@ struct SharedPump {
     /// 连接是否与当前连接是同一编码变体（30fps/60fps、_4000 档位等）。
     vseq: std::sync::Mutex<Option<bytes::Bytes>>,
     aseq: std::sync::Mutex<Option<bytes::Bytes>>,
+    /// 当前会话视频序列头的解码身份（profile/level/分辨率）。
+    vseq_id: std::sync::Mutex<Option<flv_relay::SpsIdentity>>,
     video_delta: std::sync::Mutex<(u32, u32)>,
     /// 连续「饿死重连」次数：反复发生说明续流在这条线上不可用，本连接内关掉
     /// 续流退回普通断线重连，绝不让 pump 卡在重同步循环里（用户看到黑屏）。
@@ -426,6 +428,7 @@ fn pump_for(store: &StreamUrlStore) -> Arc<SharedPump> {
         init: std::sync::Mutex::new((Vec::new(), false)),
         vseq: std::sync::Mutex::new(None),
         aseq: std::sync::Mutex::new(None),
+        vseq_id: std::sync::Mutex::new(None),
         video_delta: std::sync::Mutex::new((0, 0)),
         starvation_streak: std::sync::atomic::AtomicU32::new(0),
         force_renew: std::sync::atomic::AtomicBool::new(false),
@@ -713,6 +716,7 @@ fn ensure_pump(store: StreamUrlStore) {
                     *p.init.lock().unwrap() = (Vec::new(), false);
                     *p.vseq.lock().unwrap() = None;
                     *p.aseq.lock().unwrap() = None;
+                    *p.vseq_id.lock().unwrap() = None;
                     *p.video_delta.lock().unwrap() = (0, 0);
                     // Is this a brand new source (room/quality switch) or a
                     // reconnect of the same stream after a signature expired?
@@ -1199,7 +1203,22 @@ fn ensure_pump(store: StreamUrlStore) {
                                                 if tag.is_sequence_header
                                                     && note_config(pump_id, tag.tag_type, &tag.raw, &mut config_fp)
                                                 {
-                                                    config_changed = true;
+                                                    let new_id = (tag.tag_type == flv_relay::TAG_TYPE_VIDEO)
+                                                        .then(|| flv_relay::sps_identity_from_seq_header(&tag.raw))
+                                                        .flatten();
+                                                    let cur_id = p.vseq_id.lock().unwrap().clone();
+                                                    match (&cur_id, &new_id) {
+                                                        (Some(a), Some(b)) if a != b => {
+                                                            *p.vseq_id.lock().unwrap() = new_id;
+                                                            *p.vseq.lock().unwrap() = Some(tag.raw.clone());
+                                                            crate::tl!(
+                                                                "proxy",
+                                                                "pump #{} in-band config change with NEW identity ({:?} -> {:?}) -> forwarding it in-band (player re-inits natively)",
+                                                                pump_id, a, b
+                                                            );
+                                                        }
+                                                        _ => config_changed = true,
+                                                    }
                                                 }
                                                 continue;
                                             }
@@ -1286,11 +1305,33 @@ fn ensure_pump(store: StreamUrlStore) {
                                             };
                                             if is_seq {
                                                 if note_config(pump_id, tag_type, &tag, &mut config_fp) {
-                                                    config_changed = true;
+                                                    let new_id = (tag_type == flv_relay::TAG_TYPE_VIDEO)
+                                                        .then(|| flv_relay::sps_identity_from_seq_header(&tag))
+                                                        .flatten();
+                                                    let cur_id = p.vseq_id.lock().unwrap().clone();
+                                                    match (&cur_id, &new_id) {
+                                                        // 身份变化（分辨率/档位切换）：xgplayer 的
+                                                        // initSegmentId 会变 -> 播放器原生重建 init，
+                                                        // 带内转发新序列头即可，零打断。
+                                                        (Some(a), Some(b)) if a != b => {
+                                                            *p.vseq_id.lock().unwrap() = new_id;
+                                                            *p.vseq.lock().unwrap() = Some(tag.clone());
+                                                            crate::tl!(
+                                                                "proxy",
+                                                                "pump #{} in-band config change with NEW identity ({:?} -> {:?}) -> forwarding it in-band (player re-inits natively)",
+                                                                pump_id, a, b
+                                                            );
+                                                        }
+                                                        // 身份不变：播放器不会重建 init，继续用旧
+                                                        // SPS 解新帧必花屏 -> 换线。
+                                                        _ => config_changed = true,
+                                                    }
                                                 }
                                                 if tag_type == flv_relay::TAG_TYPE_VIDEO {
                                                     let mut g = p.vseq.lock().unwrap();
                                                     if g.is_none() {
+                                                        *p.vseq_id.lock().unwrap() =
+                                                            flv_relay::sps_identity_from_seq_header(&tag);
                                                         *g = Some(tag.clone());
                                                     }
                                                 } else if tag_type == flv_relay::TAG_TYPE_AUDIO {
@@ -1988,6 +2029,7 @@ fn capture_init_from(p: &SharedPump, buf: &[u8]) {
         *p.init.lock().unwrap() = (out, true);
     }
     if let Some(v) = vseq {
+        *p.vseq_id.lock().unwrap() = flv_relay::sps_identity_from_seq_header(&v);
         *p.vseq.lock().unwrap() = Some(v);
     }
     if let Some(a) = aseq {
@@ -4083,7 +4125,7 @@ mod live_config_probe {
                 i,
                 host,
                 v.as_ref().map(|b| b.len()).unwrap_or(0),
-                v.as_ref().map(|b| b[..b.len().min(48)].to_vec()),
+                v.clone().map(|b| b.to_vec()),
                 a.as_ref().map(|b| b.len()).unwrap_or(0),
                 a.as_ref().map(|b| b[..b.len().min(24)].to_vec())
             );

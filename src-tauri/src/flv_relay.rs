@@ -296,6 +296,169 @@ pub async fn acquire_douyu_stream_variant(
     Ok((last_body.unwrap(), last_url))
 }
 
+
+/// H.264 SPS 的「解码身份」：profile/compat/level + 分辨率。
+/// xgplayer 的 MSE init segment 只在 `codec字符串/宽/高` 变化时才重建
+/// （buffer-service 的 initSegmentId），身份相同的配置变更（PPS 内部差异等）
+/// 播放器无法自愈 -> 必须由代理换线；身份不同的变更播放器能原生消化 ->
+/// 只需把新序列头带内转发，零打断。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpsIdentity {
+    pub profile: u8,
+    pub constraint: u8,
+    pub level: u8,
+    pub width: u32,
+    pub height: u32,
+}
+
+struct BitReader<'a> {
+    b: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(b: &'a [u8]) -> Self {
+        Self { b, pos: 0 }
+    }
+    fn bit(&mut self) -> Option<u32> {
+        let byte = *self.b.get(self.pos >> 3)?;
+        let v = ((byte >> (7 - (self.pos & 7))) & 1) as u32;
+        self.pos += 1;
+        Some(v)
+    }
+    fn u(&mut self, n: usize) -> Option<u32> {
+        let mut v = 0u32;
+        for _ in 0..n {
+            v = (v << 1) | self.bit()?;
+        }
+        Some(v)
+    }
+    fn ue(&mut self) -> Option<u32> {
+        let mut zeros = 0u32;
+        while self.bit()? == 0 {
+            zeros += 1;
+            if zeros > 32 {
+                return None;
+            }
+        }
+        Some((1 << zeros) - 1 + self.u(zeros as usize)?)
+    }
+    fn se(&mut self) -> Option<i64> {
+        let v = self.ue()? as i64;
+        Some(if v % 2 == 1 { (v + 1) / 2 } else { -(v / 2) })
+    }
+}
+
+fn ebsp_to_sbsp(b: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if i + 2 < b.len() && b[i] == 0 && b[i + 1] == 0 && b[i + 2] == 3 {
+            out.push(b[i]);
+            out.push(b[i + 1]);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// 从 AVCDecoderConfigurationRecord（FLV 视频序列头 body）解析 SPS 身份。
+/// body 布局：[0]=0x17 [1]=0x00 [2..5]=cts [5]=configVer [6]=profile [7]=compat
+/// [8]=level [9]=lenSize [10]=spsCount [11..13]=spsLen [13..]=sps(NAL)
+pub fn sps_identity_from_seq_header(body: &[u8]) -> Option<SpsIdentity> {
+    if body.len() < 13 || body[1] != 0x00 {
+        return None;
+    }
+    let profile = body[6];
+    let constraint = body[7];
+    let level = body[8];
+    let sps_count = (body[10] & 0x1f) as usize;
+    let mut i = 11usize;
+    if sps_count == 0 || i + 2 > body.len() {
+        return None;
+    }
+    let len = ((body[i] as usize) << 8) | body[i + 1] as usize;
+    i += 2;
+    let nal = body.get(i..i + len)?;
+    if nal.is_empty() || nal[0] & 0x1f != 7 {
+        return None;
+    }
+    let sps = ebsp_to_sbsp(&nal[1..]);
+    let mut br = BitReader::new(&sps);
+    br.u(8)?; // profile_idc (already known)
+    br.u(8)?; // constraint
+    br.u(8)?; // level
+    br.ue()?; // sps_id
+    let chroma_high = matches!(profile, 100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134);
+    let mut chroma = 1u32;
+    if chroma_high {
+        chroma = br.ue()?;
+        if chroma == 3 {
+            br.bit()?;
+        }
+        br.ue()?;
+        br.ue()?;
+        br.bit()?;
+        if br.bit()? == 1 {
+            let n = if chroma != 3 { 8 } else { 12 };
+            for k in 0..n {
+                if br.bit()? == 1 {
+                    // scaling_list: 16 or 64 delta scales
+                    let size = if k < 6 { 16 } else { 64 };
+                    let mut last = 8i64;
+                    for _ in 0..size {
+                        let delta = br.se()?;
+                        let next = (last + delta) & 0xff;
+                        if next != 0 {
+                            last = next;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    br.ue()?; // log2_max_frame_num_minus4
+    let poc = br.ue()?;
+    if poc == 0 {
+        br.ue()?;
+    } else if poc == 1 {
+        br.bit()?;
+        br.se()?;
+        br.se()?;
+        let n = br.ue()?;
+        for _ in 0..n {
+            br.se()?;
+        }
+    }
+    br.ue()?; // max_num_ref_frames
+    br.bit()?; // gaps
+    let pw = br.ue()?; // pic_width_in_mbs_minus1
+    let ph = br.ue()?; // pic_height_in_map_units_minus1
+    let frame_mbs_only = br.bit()?;
+    if frame_mbs_only == 0 {
+        br.bit()?;
+    }
+    br.bit()?; // direct_8x8
+    let (mut width, mut height) = ((pw + 1) * 16, (2 - frame_mbs_only) * (ph + 1) * 16);
+    if br.bit()? == 1 {
+        // frame_cropping
+        let cl = br.ue()?;
+        let cr = br.ue()?;
+        let ct = br.ue()?;
+        let cb = br.ue()?;
+        let sub_wc = if chroma == 1 || chroma == 2 { 2 } else { 1 };
+        let sub_hc = if chroma == 1 { 2 } else { 1 };
+        let crop_x = sub_wc;
+        let crop_y = sub_hc * (2 - frame_mbs_only);
+        width = width.saturating_sub((cl + cr) * crop_x);
+        height = height.saturating_sub((ct + cb) * crop_y);
+    }
+    Some(SpsIdentity { profile, constraint, level, width, height })
+}
+
 /// 一条「正在被后台任务持续读取」的新上游连接。
 ///
 /// 实测事实：斗鱼新开的直链从 CDN 边缘缓存的某个关键帧开始，和旧连接几乎
@@ -733,5 +896,31 @@ mod tests {
         for w in video2.windows(2) { assert!(w[1] > w[0], "second renewal rewound video"); }
         assert!(video2.first().map_or(false, |t| *t > *video.last().unwrap()),
             "second renewal must continue after the first");
+    }
+}
+
+#[cfg(test)]
+mod sps_tests {
+    use super::*;
+
+    /// 真实斗鱼原画序列头 tag（1080p60 High，探针实抓 65 字节）：身份必须自洽。
+    #[test]
+    fn parses_real_douyu_seq_header() {
+        let tag: Vec<u8> = vec![
+            9, 0, 0, 50, 1, 166, 235, 0, 0, 0, 0, 23, 0, 0, 0, 0, 1, 100, 0, 40, 255, 225, 0, 30,
+            103, 100, 0, 40, 172, 82, 20, 7, 128, 34, 126, 89, 168, 8, 8, 10, 0, 0, 3, 0, 2, 0, 0,
+            3, 0, 120, 30, 48, 97, 11, 1, 0, 4, 104, 235, 141, 203, 0, 0, 0, 61,
+        ];
+        let body = &tag[11..tag.len() - 4];
+        let id = sps_identity_from_seq_header(body).expect("must parse");
+        assert_eq!(id.profile, 0x64);
+        assert_eq!(id.level, 0x28);
+        assert_eq!((id.width, id.height), (1920, 1080));
+    }
+
+    #[test]
+    fn rejects_non_seq_header() {
+        assert!(sps_identity_from_seq_header(&[0x27, 0x01, 0, 0]).is_none());
+        assert!(sps_identity_from_seq_header(&[]).is_none());
     }
 }
