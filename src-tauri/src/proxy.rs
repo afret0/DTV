@@ -690,10 +690,11 @@ fn ensure_pump(store: StreamUrlStore) {
                 break;
             }
 
-            // 没人看就先别建上游连接：签名/带宽都省下来，客户端一来立刻起流。
+            // 没人看就直接睡掉 pump（下次有客户端请求时 ensure_pump 重新拉起）：
+            // 不空转烧带宽，也不像 2s 轮询那样拖慢下一次开播/切房。
             if CLIENT_COUNT.load(Ordering::SeqCst) == 0 {
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                continue;
+                crate::tl!("proxy", "pump #{} parked: 0 clients -> task exits, respawns on next request", pump_id);
+                break;
             }
             let mut gen_at_connect = store.generation.load(Ordering::SeqCst);
             let connected_at = std::time::Instant::now();
@@ -945,7 +946,19 @@ fn ensure_pump(store: StreamUrlStore) {
                                     break;
                                 }
                             };
-                            // 延迟发布：到期的旧流包才发给客户端（保证中继先看到 K）。
+                            // 延迟发布只服务于续流段（保证中继先看到 K）。首段必须
+                            // 立即发布：开播/切房的头几个字节每慢 1ms 都是用户可感的
+                            // 「点一下要等半天」，而首段不存在切换对齐问题。
+                            if !continuation {
+                                for (_, payload, _) in pending_out.drain(..) {
+                                    let offset_before = offset_total;
+                                    offset_total = offset_total.wrapping_add(payload.len() as u64);
+                                    p.primer.lock().unwrap().feed(&payload, gen_at_connect, offset_total);
+                                    p.header_sent.store(true, Ordering::SeqCst);
+                                    p.broadcast_started.store(true, Ordering::SeqCst);
+                                    let _ = tx.send((gen_at_connect, offset_before, payload));
+                                }
+                            }
                             while pending_out.first().map_or(true, |(t, _, _)| t.elapsed() >= release_delay)
                                 && !pending_out.is_empty()
                             {
@@ -1002,32 +1015,24 @@ fn ensure_pump(store: StreamUrlStore) {
                                 // 有客户端且会话已起量时才判定，避免起播/切换瞬间误报。
                                 let watching = CLIENT_COUNT.load(Ordering::Relaxed) > 0
                                     && session_bytes > 5_000_000;
-                                if watching && rate_windows >= 3 {
+                                if watching && rate_windows >= 2 {
                                     let absolute = w < STARVE_WINDOW_MIN_BYTES as f64;
                                     let relative = w < rate_ema * STARVE_EMA_RATIO;
                                     if absolute || relative {
                                         starve_strikes += 1;
                                         crate::tl!(
                                             "proxy",
-                                            "pump #{} upstream slowed: {:.1}KB in last {}s (ema {:.1}KB, strike {}/2, absolute={} relative={})",
+                                            "pump #{} upstream slowed: {:.1}KB in last {}s (ema {:.1}KB, absolute={} relative={}) -> dropping the starved connection and renewing",
                                             pump_id,
                                             w / 1024.0,
                                             STARVE_WINDOW.as_secs(),
                                             rate_ema / 1024.0,
-                                            starve_strikes,
                                             absolute,
                                             relative
                                         );
-                                        if starve_strikes >= 2 || absolute {
-                                            crate::tl!(
-                                                "proxy",
-                                                "pump #{} -> dropping the starved connection and renewing",
-                                                pump_id
-                                            );
-                                            starve_strikes = 0;
-                                            silent = true;
-                                            break;
-                                        }
+                                        starve_strikes = 0;
+                                        silent = true;
+                                        break;
                                     } else {
                                         starve_strikes = 0;
                                         rate_ema = rate_ema * 0.7 + w * 0.3;
@@ -1667,10 +1672,12 @@ pub const UPSTREAM_SILENCE_TIMEOUT: Duration = Duration::from_secs(8);
 /// 上游「变慢卡死」看门狗窗口：CDN 有时不静默而是降速滴数据（实测从
 /// 2.5MB/10s 掉到 ~1.5MB/10s），静默看门狗抓不到，播放器缓冲却被慢慢抽干
 /// （圈圈反复转）。用「窗口速率 vs 会话 EMA」的相对判定抓它。
-pub const STARVE_WINDOW: Duration = Duration::from_secs(10);
+pub const STARVE_WINDOW: Duration = Duration::from_secs(6);
 /// 绝对下限：窗口字节低于此值（=400kbps，任何原画直播都不可能）立即换线。
 pub const STARVE_WINDOW_MIN_BYTES: u64 = 512 * 1024;
-/// 相对判定：窗口速率 < EMA 的 45% 记一次饥饿，连续 2 次（20s）换线。
+/// 相对判定：窗口速率 < EMA 的 45% 即换线。实测 CDN 降速是持续性的
+/// （连续多个窗口都只有正常值的 20~30%），单次命中即可判定；EMA 有 3 个
+/// 窗口预热 + 起播保护，误报概率极低（340s 探针 0 误报）。
 pub const STARVE_EMA_RATIO: f64 = 0.45;
 /// 没有任何客户端时，pump 继续拉流这么久后自行退出（下次请求会重新拉起），
 /// 避免后台一直烧带宽。
