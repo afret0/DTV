@@ -797,8 +797,9 @@ fn ensure_pump(store: StreamUrlStore) {
                     let mut starved_since: Option<std::time::Instant> = None;
                     let mut rate_window_at = std::time::Instant::now();
                     let mut rate_window_bytes: u64 = 0;
-                    let mut rate_ema: f64 = 0.0; // bytes per STARVE_WINDOW
-                    let mut rate_windows: u32 = 0;
+                    // 最近 STARVE_HISTORY_LEN 个窗口速率（bytes/窗口），基线取其中位数。
+                    let mut rate_hist: std::collections::VecDeque<f64> =
+                        std::collections::VecDeque::new();
                     let mut starve_strikes: u32 = 0;
 
                     // 硬重同步：bump generation 让所有客户端干净重连（拿 primer），
@@ -1019,32 +1020,69 @@ fn ensure_pump(store: StreamUrlStore) {
                                 // 有客户端且会话已起量时才判定，避免起播/切换瞬间误报。
                                 let watching = CLIENT_COUNT.load(Ordering::Relaxed) > 0
                                     && session_bytes > 5_000_000;
-                                if watching && rate_windows >= 2 {
+                                if watching {
+                                    rate_hist.push_back(w);
+                                    if rate_hist.len() > STARVE_HISTORY_LEN {
+                                        rate_hist.pop_front();
+                                    }
+                                }
+                                // 采样不足 = 预热期（起播突发还没被投掉），不判定。
+                                if watching && rate_hist.len() == STARVE_HISTORY_LEN {
+                                    let mut samples = [0.0f64; STARVE_HISTORY_LEN];
+                                    for (i, v) in rate_hist.iter().enumerate() {
+                                        samples[i] = *v;
+                                    }
+                                    samples.sort_by(|a, b| a.total_cmp(b));
+                                    let median = samples[STARVE_HISTORY_LEN / 2];
                                     let absolute = w < STARVE_WINDOW_MIN_BYTES as f64;
-                                    let relative = w < rate_ema * STARVE_EMA_RATIO;
+                                    let relative = w < median * STARVE_MEDIAN_RATIO;
                                     if absolute || relative {
                                         starve_strikes += 1;
+                                        if starve_strikes >= STARVE_STRIKES_REQUIRED {
+                                            crate::tl!(
+                                                "proxy",
+                                                "pump #{} upstream slowed: {:.1}KB in last {}s (median {:.1}KB, absolute={} relative={}), {} strikes in a row -> dropping the starved connection and renewing",
+                                                pump_id,
+                                                w / 1024.0,
+                                                STARVE_WINDOW.as_secs(),
+                                                median / 1024.0,
+                                                absolute,
+                                                relative,
+                                                starve_strikes
+                                            );
+                                            starve_strikes = 0;
+                                            silent = true;
+                                            break;
+                                        }
                                         crate::tl!(
                                             "proxy",
-                                            "pump #{} upstream slowed: {:.1}KB in last {}s (ema {:.1}KB, absolute={} relative={}) -> dropping the starved connection and renewing",
+                                            "pump #{} slow window {}/{}: {:.1}KB in last {}s (median {:.1}KB, absolute={} relative={}) -> strike counted, connection kept",
                                             pump_id,
+                                            starve_strikes,
+                                            STARVE_STRIKES_REQUIRED,
                                             w / 1024.0,
                                             STARVE_WINDOW.as_secs(),
-                                            rate_ema / 1024.0,
+                                            median / 1024.0,
                                             absolute,
                                             relative
                                         );
-                                        starve_strikes = 0;
-                                        silent = true;
-                                        break;
                                     } else {
+                                        if starve_strikes > 0 {
+                                            crate::tl!(
+                                                "proxy",
+                                                "pump #{} upstream back to normal: {:.1}KB in last {}s (median {:.1}KB) -> clearing {} strike(s)",
+                                                pump_id,
+                                                w / 1024.0,
+                                                STARVE_WINDOW.as_secs(),
+                                                median / 1024.0,
+                                                starve_strikes
+                                            );
+                                        }
                                         starve_strikes = 0;
-                                        rate_ema = rate_ema * 0.7 + w * 0.3;
                                     }
-                                } else if watching {
-                                    rate_ema = rate_ema * 0.7 + w * 0.3;
+                                } else if starve_strikes > 0 {
+                                    starve_strikes = 0;
                                 }
-                                rate_windows += 1;
                             }
                             if beat_at.elapsed() >= Duration::from_secs(60) {
                                 crate::tl!(
@@ -1712,14 +1750,27 @@ pub const UPSTREAM_SILENCE_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// 上游「变慢卡死」看门狗窗口：CDN 有时不静默而是降速滴数据（实测从
 /// 2.5MB/10s 掉到 ~1.5MB/10s），静默看门狗抓不到，播放器缓冲却被慢慢抽干
-/// （圈圈反复转）。用「窗口速率 vs 会话 EMA」的相对判定抓它。
+/// （圈圈反复转）。用「窗口速率 vs 最近窗口中位数」的相对判定抓它。
 pub const STARVE_WINDOW: Duration = Duration::from_secs(6);
 /// 绝对下限：窗口字节低于此值（=400kbps，任何原画直播都不可能）立即换线。
 pub const STARVE_WINDOW_MIN_BYTES: u64 = 512 * 1024;
-/// 相对判定：窗口速率 < EMA 的 45% 即换线。实测 CDN 降速是持续性的
-/// （连续多个窗口都只有正常值的 20~30%），单次命中即可判定；EMA 有 3 个
-/// 窗口预热 + 起播保护，误报概率极低（340s 探针 0 误报）。
-pub const STARVE_EMA_RATIO: f64 = 0.45;
+/// 相对判定：窗口速率 < 中位数基线的 45%。实测 CDN 降速是持续性的（连续多个
+/// 窗口都只有正常值的 20~30%），而 VBR 内容的**单个**窗口经常凹到 44%：现场
+/// 3.1.64 日志里斗鱼 71415 一次 1113.5KB/6s（基线 2512.3KB），播放器 11s 前
+/// 还是 ahead=4.0s readyState=4（缓冲满），换线却触发 HARD RESYNC → 自己制造
+/// 了一次转圈。所以单次命中只记 strike，连续命中才换线。
+pub const STARVE_MEDIAN_RATIO: f64 = 0.45;
+/// 连续这么多个窗口命中（绝对或相对）才换线。真降速（持续 20~30%）第 2 个
+/// 窗口必然继续命中，检出只慢一个窗口（6s→12s，且播放器缓冲 4s 一旦抽干，
+/// 前端 waiting 会直接 force renew，更快）；单次 VBR 凹陷则被滤掉。
+pub const STARVE_STRIKES_REQUIRED: u32 = 2;
+/// 基线采样窗口数，同时也是预热期：起播阶段 CDN 先吐 GOP cache，速率是稳定
+/// 1x 的数倍（现场 3.1.64 日志：虎牙 13579 头 5s 就灌进 33MB，稳态只有
+/// 1507.8KB/6s）。EMA 会把这种突发吃进基线、几十秒收敛不掉，于是稳态反被判
+/// 「变慢」；中位数天然抗单个极端值 —— 5 个窗口里那个突发窗口被直接投掉，
+/// 采样数不足 5 个时不判定。预热期内的硬停顿仍由 UPSTREAM_SILENCE_TIMEOUT /
+/// STARVE_TIMEOUT 兜住。
+pub const STARVE_HISTORY_LEN: usize = 5;
 /// 没有任何客户端时，pump 继续拉流这么久后自行退出（下次请求会重新拉起），
 /// 避免后台一直烧带宽。
 pub const IDLE_PUMP_SHUTDOWN: Duration = Duration::from_secs(90);
