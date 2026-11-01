@@ -366,6 +366,7 @@ pub fn run_app() {
                 proxy::start_proxy,
                 proxy::stop_proxy,
                 proxy::proxy_renew_upstream,
+                proxy::report_client_buffer,
                 proxy::start_static_proxy_server,
                 cast::get_cast_info,
                 dlna::discover_dlna_devices,

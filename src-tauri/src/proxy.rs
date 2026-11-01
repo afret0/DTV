@@ -5,7 +5,7 @@ use serde::Deserialize;
 use std::io::ErrorKind;
 use std::net::TcpStream;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use crate::flv_relay;
 use tokio::sync::broadcast;
 use std::time::Duration;
@@ -947,6 +947,7 @@ fn ensure_pump(store: StreamUrlStore) {
                         // 上游静默 / 无客户端 两个看门狗都靠 chunk 循环里判定。
                         #[allow(unused_assignments)]
                         let mut silent = false; // true = 静默超时断开（不是正常 EOF）
+                        let mut starved = false; // true = 速率看门狗判的饿死（不是 8s 零字节）
                         loop {
                             let chunk = match tokio::time::timeout(
                                 UPSTREAM_SILENCE_TIMEOUT,
@@ -1049,7 +1050,26 @@ fn ensure_pump(store: StreamUrlStore) {
                                     let median = samples[STARVE_HISTORY_LEN / 2];
                                     let absolute = w < STARVE_WINDOW_MIN_BYTES as f64;
                                     let relative = w < median * STARVE_MEDIAN_RATIO;
-                                    if absolute || relative {
+                                    let (client_ahead, ahead_age) = client_ahead_report();
+                                    let buffer_full = strike_suppressed_by_client_buffer(client_ahead);
+                                    if buffer_full {
+                                        crate::tl!(
+                                            "proxy",
+                                            "pump #{} skip, rate dropped but the client buffer is deep enough, verdict: ahead >= {}ms, ahead: {}ms, {} clients, rate: {:.1}KB in last {}s, median: {:.1}KB, absolute={} relative={}, ahead report age: {}ms, cleared {} strike(s)",
+                                            pump_id,
+                                            STARVE_CLIENT_MIN_AHEAD_MS,
+                                            client_ahead.unwrap_or(0),
+                                            CLIENT_COUNT.load(Ordering::Relaxed),
+                                            w / 1024.0,
+                                            STARVE_WINDOW.as_secs(),
+                                            median / 1024.0,
+                                            absolute,
+                                            relative,
+                                            ahead_age,
+                                            starve_strikes
+                                        );
+                                        starve_strikes = 0;
+                                    } else if absolute || relative {
                                         starve_strikes += 1;
                                         if starve_strikes >= STARVE_STRIKES_REQUIRED {
                                             crate::tl!(
@@ -1065,6 +1085,7 @@ fn ensure_pump(store: StreamUrlStore) {
                                             );
                                             starve_strikes = 0;
                                             silent = true;
+                                            starved = true;
                                             break;
                                         }
                                         crate::tl!(
@@ -1561,7 +1582,15 @@ fn ensure_pump(store: StreamUrlStore) {
 
                         // ---- 上游段结束（正常 EOF 或静默超时）----
                         // 切换/重连逻辑会把队列发完或清空；这里只处理直接退出的情况。
-                        if silent {
+                        if starved {
+                            crate::tl!(
+                                "proxy",
+                                "[proxy] pump #{} upstream starved by the rate watchdog, {} clients, lived {:?} -> dropping the connection and renewing",
+                                pump_id,
+                                CLIENT_COUNT.load(Ordering::Relaxed),
+                                connected_at.elapsed()
+                            );
+                        } else if silent {
                             crate::tl!(
                                 "proxy",
                                 "[proxy] pump #{} upstream silent for {}s, {} clients, lived {:?} -> dropping the connection and renewing",
@@ -1900,6 +1929,16 @@ pub const STARVE_HISTORY_LEN: usize = 5;
 /// 没有任何客户端时，pump 继续拉流这么久后自行退出（下次请求会重新拉起），
 /// 避免后台一直烧带宽。
 pub const IDLE_PUMP_SHUTDOWN: Duration = Duration::from_secs(90);
+/// 播放器真实缓冲（bufferedEnd - currentTime）不小于这个毫秒数时，速率掉了也
+/// **不换线**：现场 3.1.67 日志里虎牙 13579 四次「换台 → 弹重播层 → 重载」，
+/// 每次之前播放器都是 ahead=7.2~7.7s readyState=4（缓冲满、播放正常）。虎牙
+/// CDN 是突发投递（6~11Mbps 的窗口夹着 0.7~1.6Mbps 的窗口），代理只看自己的
+/// 下载速率必然把 VBR/突发误判成饿死，而用户看到的就是每两分钟转圈一次。
+/// 4s ≈ 一个 GOP + 余量：真饿死时缓冲会在几秒内掉破它，那时才该换线。
+pub const STARVE_CLIENT_MIN_AHEAD_MS: u64 = 4_000;
+/// 前端缓冲上报（跟着 5s 心跳 tick 走）超过这个时长没有更新就视为「未知」，
+/// 退回原有的纯速率判定，避免旧房间的残留读数长期压住看门狗。
+pub const CLIENT_AHEAD_STALE: Duration = Duration::from_secs(15);
 
 pub const BROADCAST_RING_CAP: usize = 1024;
 
@@ -1926,6 +1965,32 @@ fn release_delay() -> Duration {
 }
 
 pub static CLIENT_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// 播放器缓冲余量（毫秒）与上报时刻（epoch ms）。u64::MAX = 从未上报。
+pub static CLIENT_AHEAD_MS: AtomicU64 = AtomicU64::new(u64::MAX);
+pub static CLIENT_AHEAD_AT_MS: AtomicU64 = AtomicU64::new(0);
+
+/// 播放器缓冲够深时，速率看门狗不许换线（宁可信播放器的实测缓冲，也不要
+/// 代理自己的下载速率推断——突发投递的 CDN 会让速率窗口大幅摆动）。
+fn strike_suppressed_by_client_buffer(client_ahead: Option<u64>) -> bool {
+    client_ahead.is_some_and(|a| a >= STARVE_CLIENT_MIN_AHEAD_MS)
+}
+
+/// 返回 (缓冲毫秒数, 上报年龄毫秒数)；上报过期或从未上报时缓冲为 None。
+fn client_ahead_report() -> (Option<u64>, u64) {
+    let reported_at = CLIENT_AHEAD_AT_MS.load(Ordering::Relaxed);
+    if reported_at == 0 {
+        return (None, u64::MAX);
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let age = now.saturating_sub(reported_at);
+    let ahead = CLIENT_AHEAD_MS.load(Ordering::Relaxed);
+    let fresh = age <= CLIENT_AHEAD_STALE.as_millis() as u64 && ahead != u64::MAX;
+    (if fresh { Some(ahead) } else { None }, age)
+}
 
 /// Epoch-ms when the store URL was last signed (by the frontend or the pump's
 /// re-sign). Douyu signatures live ~300s; knowing
@@ -2583,6 +2648,19 @@ pub async fn proxy_renew_upstream() -> Result<bool, String> {
     Ok(true)
 }
 
+/// 前端每 5s 上报一次播放器真实缓冲余量：代理的换线判定以此为准，
+/// 缓冲充足时不换线（只有代理自己知道下载速率，它不知道用户其实看得很顺）。
+#[tauri::command]
+pub fn report_client_buffer(ahead_ms: u64) -> Result<(), String> {
+    CLIENT_AHEAD_MS.store(ahead_ms.min(u64::MAX - 1), Ordering::Relaxed);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    CLIENT_AHEAD_AT_MS.store(now, Ordering::Relaxed);
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn stop_proxy(
     server_handle_state: State<'_, ProxyServerHandle>,
@@ -2656,6 +2734,56 @@ pub async fn start_static_proxy_server(
 mod tests {
     use super::*;
     use futures_util::StreamExt;
+
+    /// 缓冲上报的三态：从未上报 / 已上报 / 过期。过期必须回到「未知」，
+    /// 否则上一个房间的健康读数会长期压住速率看门狗。
+    #[test]
+    fn client_buffer_report_states() {
+        CLIENT_AHEAD_AT_MS.store(0, Ordering::Relaxed);
+        CLIENT_AHEAD_MS.store(u64::MAX, Ordering::Relaxed);
+        let (ahead, age) = client_ahead_report();
+        assert_eq!(ahead, None, "never reported must be unknown");
+        assert_eq!(age, u64::MAX);
+
+        report_client_buffer(7_200).expect("report");
+        let (ahead, age) = client_ahead_report();
+        assert_eq!(ahead, Some(7_200), "fresh report must be visible");
+        assert!(age < 1_000, "fresh report age should be ~0, got {}ms", age);
+
+        let stale_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap()
+            - (CLIENT_AHEAD_STALE.as_millis() as u64 + 5_000);
+        CLIENT_AHEAD_AT_MS.store(stale_at, Ordering::Relaxed);
+        let (ahead, age) = client_ahead_report();
+        assert_eq!(ahead, None, "stale report must count as unknown");
+        assert!(age > CLIENT_AHEAD_STALE.as_millis() as u64);
+    }
+
+    /// 换线抑制的阈值：4000ms 刚好达标，3999ms 不达标（现场误报时播放器
+    /// 缓冲是 7200~7700ms，真饿死时会掉到 1000~2000ms）。
+    #[test]
+    fn deep_client_buffer_suppresses_the_rate_watchdog() {
+        let cases: [(Option<u64>, bool, &str); 6] = [
+            (None, false, "未知缓冲按速率判定"),
+            (Some(0), false, "缓冲为 0 必须换线"),
+            (Some(1_500), false, "缓冲 1.5s 必须换线"),
+            (Some(3_999), false, "刚好不达标(3999ms)"),
+            (Some(4_000), true, "刚好达标(4000ms)"),
+            (Some(7_200), true, "现场实测的健康缓冲"),
+        ];
+        for (ahead, expected, scene) in cases {
+            assert_eq!(
+                strike_suppressed_by_client_buffer(ahead),
+                expected,
+                "{}: ahead={:?} 期望抑制={}",
+                scene,
+                ahead,
+                expected
+            );
+        }
+    }
 
     /// Mock CDN: streams FLV header + 3x20KB per connection, then drops.
     async fn mock_cdn() -> u16 {
@@ -3499,6 +3627,136 @@ mod live_tests {
         assert_eq!(&first3[..3], b"FLV", "must start with FLV header");
         println!("HTTP endpoint delivered {} bytes in 20s, starts with FLV", total);
         assert!(total > 500_000, "too little data via HTTP: {}", total);
+    }
+
+    /// 现场复现用（真实网络）：虎牙这类突发投递的 CDN，速率窗口会周期性凹到
+    /// 中位数的一半以下，而播放器缓冲其实一直是 7s 满的。3.1.67 在现场 10 分钟内
+    /// 因此换了 4 次台（clean channel change），每次都让玩家 ended → 弹重播层 →
+    /// 重载，用户看到的就是「每两分钟转圈一下」。
+    ///
+    /// 本测试模拟前端每 5s 上报一次健康缓冲，然后断言：
+    /// 1. 整段时间客户端连接**一次都没断**（没有换台/重同步）；
+    /// 2. 日志里出现过「缓冲足够所以不换线」的抑制记录（说明确实命中过慢窗口）；
+    /// 3. 日志里没有 clean channel change；
+    /// 4. 字节流一直在走（最大 chunk 间隔 < 10s）。
+    ///
+    /// 跑法（日志路径必须是本测试独占的新文件）：
+    ///   DTV_TEST_ROOM=13579 DTV_LONGRUN_SECS=300 \
+    ///   DTV_LOG_PATH=/tmp/dtv_buf.log DTV_LOG_QUIET=1 \
+    ///   cargo +nightly test --lib live_huya_deep_buffer -- --ignored --nocapture
+    #[actix_web::test]
+    #[ignore = "long live network test (~5min) against a real Huya room"]
+    async fn live_huya_deep_buffer_suppresses_channel_change() {
+        std::env::set_var("DTV_RELEASE_DELAY_MS", "2000");
+        let room = std::env::var("DTV_TEST_ROOM").unwrap_or_else(|_| "13579".to_string());
+        let quality = std::env::var("DTV_TEST_QUALITY").unwrap_or_else(|_| "原画".to_string());
+        let duration: u64 = std::env::var("DTV_LONGRUN_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300);
+        let log_path = std::env::var("DTV_LOG_PATH")
+            .unwrap_or_else(|_| "/tmp/dtv_buffer_test.log".to_string());
+        let _ = std::fs::remove_file(&log_path);
+
+        let follow = crate::platforms::common::FollowHttpClient::new().expect("follow client");
+        let url = match crate::platforms::huya::stream_url::fetch_huya_flv_url(
+            &follow,
+            &room,
+            Some(quality.as_str()),
+            None,
+        )
+        .await
+        {
+            Ok(u) => u,
+            Err(err) => {
+                println!("[buffer-live] skip, 取不到虎牙流(可能没开播), room: {}, err: {}", room, err);
+                return;
+            }
+        };
+        println!("[buffer-live] room={} quality={} duration={}s log={}", room, quality, duration, log_path);
+
+        let store = StreamUrlStore::default();
+        *store.url.lock().unwrap() = url;
+        *store.platform.lock().unwrap() = Some("huya".into());
+        *store.room_id.lock().unwrap() = Some(room.clone());
+        *store.quality.lock().unwrap() = Some(quality.clone());
+        const BUFFER_LIVE_PORT: u16 = 39937;
+        super::tests::spawn_test_server(store.clone(), BUFFER_LIVE_PORT).await;
+        let local_url = format!("http://127.0.0.1:{}/live.flv", BUFFER_LIVE_PORT);
+
+        let client = Client::builder()
+            .no_proxy()
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        let resp = client.get(&local_url).send().await.expect("connect");
+        assert_eq!(resp.status(), 200, "proxy status");
+        let mut stream = resp.bytes_stream();
+
+        let start = std::time::Instant::now();
+        let deadline = start + Duration::from_secs(duration);
+        let mut total_bytes = 0usize;
+        let mut session_breaks = 0usize;
+        let mut reports = 0usize;
+        let mut last_report_at = std::time::Instant::now();
+        let mut last_chunk_at = std::time::Instant::now();
+        let mut max_chunk_gap = Duration::ZERO;
+        while std::time::Instant::now() < deadline {
+            if last_report_at.elapsed() >= Duration::from_secs(5) {
+                last_report_at = std::time::Instant::now();
+                reports += 1;
+                // 和前端一样上报「缓冲 7s」：现场实测误报时播放器就是这个深度。
+                report_client_buffer(7_000).expect("report");
+            }
+            match tokio::time::timeout(Duration::from_secs(6), stream.next()).await {
+                Ok(Some(Ok(b))) => {
+                    let gap = last_chunk_at.elapsed();
+                    if gap > max_chunk_gap {
+                        max_chunk_gap = gap;
+                    }
+                    last_chunk_at = std::time::Instant::now();
+                    total_bytes += b.len();
+                }
+                Ok(Some(Err(e))) => panic!("stream error after {} bytes: {:#}", total_bytes, e),
+                Ok(None) => {
+                    session_breaks += 1;
+                    println!(
+                        "[buffer-live] fail, 客户端连接被切断 (第 {} 次) at t={}s, total: {} bytes -> 和播放器一样重新 GET",
+                        session_breaks,
+                        start.elapsed().as_secs(),
+                        total_bytes
+                    );
+                    let resp = client.get(&local_url).send().await.expect("reconnect");
+                    stream = resp.bytes_stream();
+                    last_chunk_at = std::time::Instant::now();
+                }
+                Err(_) => continue,
+            }
+        }
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        let suppressed = log.matches("client buffer is deep enough").count();
+        let channel_changes = log.matches("clean channel change").count();
+        let starved = log.matches("starved by the rate watchdog").count();
+        println!(
+            "[buffer-live] done, t={}s bytes={} breaks={} reports={} suppressed={} starved={} channelChanges={} maxChunkGap={:.1}s",
+            start.elapsed().as_secs(),
+            total_bytes,
+            session_breaks,
+            reports,
+            suppressed,
+            starved,
+            channel_changes,
+            max_chunk_gap.as_secs_f64()
+        );
+        assert!(total_bytes > 1_000_000, "stream barely flowed: {} bytes", total_bytes);
+        assert_eq!(channel_changes, 0, "deep client buffer must prevent channel changes");
+        assert_eq!(session_breaks, 0, "client connection must never be cut");
+        assert!(suppressed >= 1, "expected the slow-window suppression to kick in at least once");
+        assert!(
+            max_chunk_gap < Duration::from_secs(10),
+            "playback must stay continuous, max gap {:?}",
+            max_chunk_gap
+        );
     }
 
     /// Long-running (real network) check for the fix that stops mosaic on

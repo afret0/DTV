@@ -1545,6 +1545,19 @@ export function MainPlayer({
         return;
       }
       const cur = video.currentTime || 0;
+      // 把播放器真实缓冲报给代理：代理只看得见自己的下载速率，而 CDN 是突发
+      // 投递（虎牙实测 6~11Mbps 的窗口夹着 0.7~1.6Mbps 的窗口），单看速率会把
+      // 缓冲满着的好端端播放判成饿死 → 换台 → 弹重播层重载（用户看到的就是
+      // 每两分钟转圈一次）。缓冲充足时代理不换线。
+      {
+        let bufEnd = 0;
+        try {
+          const b = video.buffered;
+          if (b.length) bufEnd = b.end(b.length - 1);
+        } catch {}
+        const aheadMs = Math.max(0, Math.round((bufEnd - cur) * 1000));
+        invoke("report_client_buffer", { aheadMs }).catch(() => {});
+      }
       if (lastTime >= 0 && Math.abs(cur - lastTime) < 0.15) {
         staleSamples++;
       } else {
