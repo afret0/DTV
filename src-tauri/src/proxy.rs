@@ -801,6 +801,8 @@ fn ensure_pump(store: StreamUrlStore) {
                     let mut rate_hist: std::collections::VecDeque<f64> =
                         std::collections::VecDeque::new();
                     let mut starve_strikes: u32 = 0;
+                    // hard_resync! 发现中继无内容时置位：调用点据此 break 走干净换台。
+                    let mut resync_empty = false;
 
                     // 硬重同步：bump generation 让所有客户端干净重连（拿 primer），
                     // 同时重放 init（文件头+配置）并从 IDR 恢复内容。用于两种绝境：
@@ -894,6 +896,17 @@ fn ensure_pump(store: StreamUrlStore) {
                                     capture_init_from(&p, &drained);
                                     segment = flv_relay::Segment::new_with_preage(true, preage);
                                     demuxer.reset();
+                                    if kept == 0 {
+                                        // 理论上到不了这里（EOF 路径已保证有内容）；万一到了，
+                                        // 绝不广播空 init：走干净换台（调用点 break）。
+                                        crate::tl!(
+                                            "proxy",
+                                            "pump #{} hard resync found no decodable tags in relay -> clean channel change instead",
+                                            pump_id
+                                        );
+                                        commit_new_source(&store);
+                                        resync_empty = true;
+                                    }
                                 }
                             }
                         }};
@@ -1066,6 +1079,22 @@ fn ensure_pump(store: StreamUrlStore) {
                                             absolute,
                                             relative
                                         );
+                                        // 第一次 strike 就预热中继：真到断开那一刻，
+                                        // 后台连接已经有几秒积压，恢复路径才有内容可用
+                                        // （今晚 4 次黑屏都是恢复时中继积压为空造成的）。
+                                        if renewal && relay.is_none() && !staging {
+                                            staging = true;
+                                            last_stage_attempt = Some(tokio::time::Instant::now());
+                                            if let Some(ctx) = renew_ctx.clone() {
+                                                let c = client.clone();
+                                                let txc = stage_tx.clone();
+                                                let want = flv_relay::url_variant_sig(&store.url.lock().unwrap());
+                                                tokio::spawn(async move {
+                                                    let r = flv_relay::open_staged_relay(&ctx, &c, Some(want)).await;
+                                                    let _ = txc.send(r);
+                                                });
+                                            }
+                                        }
                                     } else {
                                         if starve_strikes > 0 {
                                             crate::tl!(
@@ -1549,6 +1578,18 @@ fn ensure_pump(store: StreamUrlStore) {
                                 p.primer.lock().unwrap().feed(&payload, gen_at_connect, offset_total);
                                 let _ = tx.send((gen_at_connect, offset_before, payload));
                             }
+                            // 虎牙/抖音/B站：上游静默死亡时同 gen 重连会在 GOP 中途
+                            // 接出时间轴空洞（直播的空洞永远填不上 -> 冻结转圈）。
+                            // bump gen 让客户端带新流 primer 重连 = 干净换台（~1s）。
+                            // 自然 EOF（下播/地址到期）不 bump，保持原有重连语义。
+                            if silent && CLIENT_COUNT.load(Ordering::Relaxed) > 0 {
+                                crate::tl!(
+                                    "proxy",
+                                    "pump #{} non-renewable platform upstream died silently -> clean channel change (gen bump)",
+                                    pump_id
+                                );
+                                commit_new_source(&store);
+                            }
                             break;
                         }
                         if store.generation.load(Ordering::SeqCst) != gen_at_connect {
@@ -1592,6 +1633,38 @@ fn ensure_pump(store: StreamUrlStore) {
                                 }
                             };
                         }
+                        // 旧中继可能连在同一个冻结边缘上（积压为空，v=None）：重新签名
+                        // 开一条新中继并等它拿出第一个关键帧 —— 恢复路径必须有内容，
+                        // 广播空 init 就是用户看到的黑屏/重播按钮。
+                        if seg.as_ref().map_or(true, |st0| st0.last_keyframe().is_none()) {
+                            if let Some(ctx) = renew_ctx.clone() {
+                                let want = flv_relay::url_variant_sig(&store.url.lock().unwrap());
+                                match flv_relay::open_staged_relay(&ctx, &client, Some(want)).await {
+                                    Ok(st0) => {
+                                        crate::tl!(
+                                            "proxy",
+                                            "pump #{} previous relay had no content; opened a fresh one for recovery",
+                                            pump_id
+                                        );
+                                        seg = Some(st0);
+                                    }
+                                    Err(e) => crate::tl!(
+                                        "proxy",
+                                        "pump #{} recovery relay open failed: {}",
+                                        pump_id, e
+                                    ),
+                                }
+                            }
+                        }
+                        if let Some(st0) = seg.as_mut() {
+                            let deadline = std::time::Instant::now() + RELAY_CONTENT_WAIT;
+                            while st0.last_keyframe().is_none() && std::time::Instant::now() < deadline {
+                                st0.poll();
+                                if st0.last_keyframe().is_none() {
+                                    tokio::time::sleep(Duration::from_millis(100)).await;
+                                }
+                            }
+                        }
                         if seg.is_none() {
                             let want = flv_relay::url_variant_sig(&store.url.lock().unwrap());
                             match flv_relay::open_staged_relay(renew_ctx.as_ref().unwrap(), &client, Some(want)).await {
@@ -1634,6 +1707,29 @@ fn ensure_pump(store: StreamUrlStore) {
                                 // 配置不同却拿不到 K：普通去重拼接会把旧配置的帧喂给
                                 // 新配置的解码器（花屏/解码错误），宁可硬重同步。
                                 let config_differs = relay_config_differs(&p, &st);
+                                // 中继有内容但落后标记 behind ms：同变体的帧字节逐位相同
+                                // （探针实测 151/151 identical），去重拼接参考链安全；
+                                // behind 的小空洞会被播放器缓冲（4~5s）吸收 = 零打断。
+                                // behind 太大则缓冲吸收不了，走硬重同步（~1s 换台）。
+                                // 注意：落后量不会随等待缩小（1x 速率），等是白等。
+                                let behind = last_video_fwd.saturating_sub(st.video_ts().unwrap_or(0));
+                                if cut.is_none()
+                                    && !config_differs
+                                    && !relay_incompatible
+                                    && st.last_keyframe().is_some()
+                                    && behind > 0
+                                    && behind <= DEDUP_SPLICE_MAX_BEHIND_MS
+                                {
+                                    crate::tl!(
+                                        "proxy",
+                                        "pump #{} relay {}ms behind marker -> dedup splice (hole absorbed by player buffer, no client disruption)",
+                                        pump_id, behind
+                                    );
+                                    if switch_to_relay!(st, None, false) {
+                                        continue 'segments;
+                                    }
+                                    break;
+                                }
                                 if !relay_incompatible
                                     && (cut.is_some()
                                         || (!config_differs
@@ -1651,7 +1747,28 @@ fn ensure_pump(store: StreamUrlStore) {
                                         pump_id
                                     );
                                     hard_resync!(st);
+                                    if resync_empty {
+                                        break 'segments;
+                                    }
                                     continue 'segments;
+                                }
+                                // 等了 RELAY_CONTENT_WAIT 新中继仍无内容（整条线路冻住）：
+                                // 绝不广播空 init（= 黑屏），bump generation 让客户端带
+                                // 真实 primer 重连（约 1s 换台感）。
+                                if st.last_keyframe().is_none() {
+                                    crate::tl!(
+                                        "proxy",
+                                        "pump #{} recovery relay still empty after {}s -> clean channel change (gen bump), no empty-init broadcast",
+                                        pump_id, RELAY_CONTENT_WAIT.as_secs()
+                                    );
+                                    for (_, payload, _) in pending_out.drain(..) {
+                                        let offset_before = offset_total;
+                                        offset_total = offset_total.wrapping_add(payload.len() as u64);
+                                        p.primer.lock().unwrap().feed(&payload, gen_at_connect, offset_total);
+                                        let _ = tx.send((gen_at_connect, offset_before, payload));
+                                    }
+                                    commit_new_source(&store);
+                                    break 'segments;
                                 }
                                 // 中继仍落后于标记：去重拼接会先饿几秒再从中途接 GOP，
                                 // 参考链必断（5103 解码错误）。改为硬重同步：客户端带
@@ -1671,11 +1788,12 @@ fn ensure_pump(store: StreamUrlStore) {
                                     p.primer.lock().unwrap().feed(&payload, gen_at_connect, offset_total);
                                     let _ = tx.send((gen_at_connect, offset_before, payload));
                                 }
+                                // 拿不到任何中继：同 gen 重连会在 GOP 中途接出空洞
+                                // （直播的空洞永远填不上 -> 冻结转圈），bump gen 走干净换台。
+                                commit_new_source(&store);
                                 if renew_failures >= flv_relay::MAX_CONSECUTIVE_FAILURES {
                                     renewal = false;
-                                    break;
                                 }
-                                tokio::time::sleep(flv_relay::RETRY_DELAY).await;
                                 break;
                             }
                         }
@@ -1747,6 +1865,14 @@ fn ensure_pump(store: StreamUrlStore) {
 /// 上游静默看门狗：连接还开着但这么久没有任何字节 -> 判定为 CDN 卡死，主动断开重连。
 /// 8s 已远超正常 chunk 间隔（毫秒级），又比播放器缓冲（~5s）+转圈容忍快得多。
 pub const UPSTREAM_SILENCE_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// EOF 恢复时等新中继拿出第一个关键帧的上限。超过说明新连接也落在冻结的
+/// 边缘上，改走「bump generation + 客户端重连」的干净换台路径。
+pub const RELAY_CONTENT_WAIT: Duration = Duration::from_secs(8);
+
+/// 中继落后标记不超过这个毫秒数时，直接去重拼接（同变体帧字节逐位相同，
+/// 参考链安全；小空洞被播放器缓冲吸收）。超过则硬重同步换台。
+pub const DEDUP_SPLICE_MAX_BEHIND_MS: u32 = 2500;
 
 /// 上游「变慢卡死」看门狗窗口：CDN 有时不静默而是降速滴数据（实测从
 /// 2.5MB/10s 掉到 ~1.5MB/10s），静默看门狗抓不到，播放器缓冲却被慢慢抽干
