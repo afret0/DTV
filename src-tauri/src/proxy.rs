@@ -4373,3 +4373,102 @@ mod live_config_probe {
         }
     }
 }
+
+#[cfg(test)]
+mod live_douyin_variant_probe {
+    use super::*;
+
+    /// 列出抖音房间各清晰度变体的 URL / 编码 / 画布分辨率（onMetaData）。
+    #[tokio::test]
+    #[ignore]
+    async fn live_douyin_variants() {
+        let room = std::env::var("DTV_TEST_ROOM").unwrap_or_else(|_| "108335413560".into());
+        let client = Client::builder().no_proxy().build().unwrap();
+        for quality in ["原画", "蓝光", "超清"] {
+            let url = match crate::platforms::douyin::douyin_streamer_detail::fetch_douyin_stream_core(
+                room.clone(),
+                quality.to_string(),
+            )
+            .await
+            {
+                Ok(info) => match info.stream_url {
+                    Some(u) => u,
+                    None => {
+                        println!("[probe] {} -> no url", quality);
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    println!("[probe] {} -> ERR {}", quality, e);
+                    continue;
+                }
+            };
+            let resp = match client.get(&url).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    println!("[probe] {} connect err {}", quality, e);
+                    continue;
+                }
+            };
+            use futures_util::StreamExt;
+            let mut stream = resp.bytes_stream();
+            let mut buf = Vec::new();
+            while buf.len() < 400_000 {
+                match stream.next().await {
+                    Some(Ok(c)) => buf.extend_from_slice(&c),
+                    _ => break,
+                }
+            }
+            let codec = scan_codec_and_size(&buf);
+            println!("[probe] {} url={} => {:?}", quality, &url[..url.len().min(90)], codec);
+        }
+    }
+
+    fn scan_codec_and_size(buf: &[u8]) -> String {
+        let mut out = String::new();
+        let mut pos = 13usize;
+        let mut meta = false;
+        let mut codec = "none";
+        while pos + 11 <= buf.len() {
+            let t = buf[pos] & 0x1f;
+            let size = ((buf[pos + 1] as usize) << 16)
+                | ((buf[pos + 2] as usize) << 8)
+                | buf[pos + 3] as usize;
+            if size > 4 * 1024 * 1024 || pos + 11 + size + 4 > buf.len() {
+                break;
+            }
+            let body = &buf[pos + 11..pos + 11 + size];
+            if t == 18 && !meta {
+                meta = true;
+                if let (Some(w), Some(h)) = (amf_double(body, b"width"), amf_double(body, b"height")) {
+                    out.push_str(&format!("meta {}x{} ", w, h));
+                }
+            }
+            if t == 9 && size >= 2 {
+                codec = match body[0] {
+                    0x17 | 0x27 => "AVC",
+                    0x1c | 0x2c => "HEVC",
+                    _ => "other",
+                };
+                if meta {
+                    break;
+                }
+            }
+            pos += 11 + size + 4;
+        }
+        format!("{}{}", out, codec)
+    }
+
+    fn amf_double(body: &[u8], key: &[u8]) -> Option<u32> {
+        let at = body.windows(key.len()).position(|w| w == key)?;
+        let mut i = at + key.len();
+        while i < body.len() && body[i] != 0x00 {
+            i += 1;
+        }
+        if i + 9 > body.len() {
+            return None;
+        }
+        let bytes: [u8; 8] = body[i + 1..i + 9].try_into().ok()?;
+        Some(f64::from_be_bytes(bytes) as u32)
+    }
+}
