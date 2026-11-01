@@ -923,6 +923,7 @@ export class SourceBadgeControl extends Plugin {
   };
 
   private labelEl: HTMLElement | null = null;
+  private lastLabel = '';
 
   override render() {
     if (this.config.disable) {
@@ -937,21 +938,41 @@ export class SourceBadgeControl extends Plugin {
     if (this.config.disable) {
       return;
     }
-    this.labelEl = this.find('.source-badge-text') as HTMLElement | null;
     this.refresh();
+    // 全屏/控制条重排会把控件 DOM 换掉或克隆一份，缓存的节点会变成脱离文档的
+    // 孤儿：写进去用户也看不见（现场就是切到虎牙后标记还停在「斗鱼」）。
+    // 挂几个事件保证任何一次 DOM 重建后文案都会重新落上去。
+    const rerender = () => this.refresh();
+    this.player?.on?.('fullscreen_change', rerender);
+    this.player?.on?.('css_fullscreen_change', rerender);
+    this.player?.on?.('play', rerender);
   }
 
-  /** 平台/房间软切换时由外部调用刷新文案。 */
+  /** 平台/房间切换（软切换或重建）时由外部调用刷新文案。 */
   updateLabel() {
     this.refresh();
   }
 
   private refresh() {
-    if (!this.labelEl) {
-      return;
-    }
     const label = typeof this.config.getLabel === 'function' ? this.config.getLabel() : '';
-    this.labelEl.textContent = label;
+    // 不缓存节点：每次从播放器根上现找，控制条被重排/克隆也不会写错地方。
+    const scope = (this.player?.root ?? this.root) as HTMLElement | null;
+    const nodes = scope
+      ? Array.from(scope.querySelectorAll<HTMLElement>('.source-badge-text'))
+      : [];
+    if (this.labelEl && this.labelEl.isConnected && !nodes.includes(this.labelEl)) {
+      nodes.push(this.labelEl);
+    }
+    for (const node of nodes) {
+      node.textContent = label;
+    }
+    if (label !== this.lastLabel) {
+      this.lastLabel = label;
+      invoke("frontend_log", {
+        msg: `[player] source badge label -> ${label || "(empty)"} (nodes=${nodes.length})`
+      }).catch(() => {});
+    }
+    this.labelEl = nodes[0] ?? null;
     const root = this.root as HTMLElement | null;
     if (root) {
       root.style.display = label ? '' : 'none';

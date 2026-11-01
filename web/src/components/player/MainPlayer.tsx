@@ -668,6 +668,16 @@ export function MainPlayer({
     } catch {
       // ignore
     }
+    // xgplayer 的 destroy 不保证把容器里的控件 DOM 清干净：残留的控制条会盖在
+    // 新播放器上面（现场表现：人在虎牙，右下角来源标记还停在「斗鱼」）。
+    try {
+      const container = playerContainerRef.current;
+      if (container) {
+        container.innerHTML = "";
+      }
+    } catch {
+      // ignore
+    }
     playerRef.current = null;
     playbackKindRef.current = null;
 
@@ -1206,6 +1216,12 @@ export function MainPlayer({
         index: 5.6,
         getLabel: () => PLATFORM_CN_LABEL[streamLabelRef.current?.platform ?? ""] ?? ""
       });
+      // 挂载这一刻就把文案落上去：别等软切换/全屏事件才刷新。
+      try {
+        sourceBadgeRef.current?.updateLabel?.();
+      } catch {
+        // ignore
+      }
 
       arrangeControlClusters(player);
 
