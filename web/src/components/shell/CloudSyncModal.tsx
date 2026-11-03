@@ -11,7 +11,6 @@ import {
   loadCloudSyncSettings,
   loadCloudSyncState,
   saveCloudSyncSettings,
-  SYNC_INTERVAL_OPTIONS,
   type CloudSyncSettings,
   type CloudSyncState
 } from "@/services/cloudSync";
@@ -182,23 +181,35 @@ export function CloudSyncPanel({ appVersion }: { appVersion?: string }) {
                     checked={settings.autoSync}
                     onChange={(e) => patch({ autoSync: e.target.checked })}
                   />
-                  自动同步（定时把本机配置上传到云端）
+                  自动同步（定时读云端配置，哪个新就覆盖另一个）
                 </label>
-                <select
-                  className={styles.syncInput}
-                  value={settings.intervalMinutes}
-                  disabled={!settings.autoSync}
-                  onChange={(e) => patch({ intervalMinutes: Number(e.target.value) })}
-                >
-                  {SYNC_INTERVAL_OPTIONS.map((opt) => (
-                    <option key={opt.value} value={opt.value}>
-                      {opt.label}
-                    </option>
-                  ))}
-                </select>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <input
+                    className={styles.syncInput}
+                    style={{ width: 88 }}
+                    type="number"
+                    min={1}
+                    step={1}
+                    value={settings.intervalHours}
+                    disabled={!settings.autoSync}
+                    onChange={(e) => {
+                      const hours = Number(e.target.value);
+                      patch({ intervalHours: Number.isFinite(hours) && hours >= 1 ? Math.floor(hours) : 1 });
+                    }}
+                  />
+                  <span className={styles.syncMetaKey}>小时同步一次</span>
+                </div>
               </div>
 
               <div className={styles.syncMetaGrid}>
+                <div className={styles.syncMetaItem}>
+                  <span className={styles.syncMetaKey}>本机配置时间</span>
+                  <span className={styles.syncMetaVal}>{formatTime(state.localConfigAt)}</span>
+                </div>
+                <div className={styles.syncMetaItem}>
+                  <span className={styles.syncMetaKey}>云端配置时间</span>
+                  <span className={styles.syncMetaVal}>{formatTime(state.cloudConfigAt)}</span>
+                </div>
                 <div className={styles.syncMetaItem}>
                   <span className={styles.syncMetaKey}>上次上传</span>
                   <span className={styles.syncMetaVal}>{formatTime(state.lastPushAt)}</span>
@@ -209,7 +220,7 @@ export function CloudSyncPanel({ appVersion }: { appVersion?: string }) {
                 </div>
                 <div className={styles.syncMetaItem}>
                   <span className={styles.syncMetaKey}>上次自动同步</span>
-                  <span className={styles.syncMetaVal}>{formatTime(state.lastAutoPushAt)}</span>
+                  <span className={styles.syncMetaVal}>{formatTime(state.lastAutoSyncAt)}</span>
                 </div>
               </div>
 

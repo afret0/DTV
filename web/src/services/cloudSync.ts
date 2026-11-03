@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 
-import { applyIncrementalLanSyncImport, createLanSyncPayload, type LanSyncPayload } from "./lanSync";
+import { applyFullLanSyncOverwrite, createLanSyncPayload, LAN_SYNC_KEYS, parseLanSyncPayload, type LanSyncPayload } from "./lanSync";
 
 export const CLOUD_SYNC_SETTINGS_KEY = "dtv_cloud_sync_settings_v1";
 export const CLOUD_SYNC_STATE_KEY = "dtv_cloud_sync_state_v1";
@@ -24,13 +24,16 @@ export interface CloudSyncSettings {
   oss: OssSettings;
   webdav: WebDavSettings;
   autoSync: boolean;
-  intervalMinutes: number;
+  intervalHours: number;
 }
 
 export interface CloudSyncState {
   lastPushAt: number | null;
   lastPullAt: number | null;
-  lastAutoPushAt: number | null;
+  lastAutoSyncAt: number | null;
+  localConfigAt: number | null;
+  cloudConfigAt: number | null;
+  lastConfigFingerprint: string | null;
   lastError: string | null;
 }
 
@@ -45,18 +48,8 @@ export const DEFAULT_CLOUD_SYNC_SETTINGS: CloudSyncSettings = {
   },
   webdav: { url: "", username: "", password: "" },
   autoSync: false,
-  intervalMinutes: 60
+  intervalHours: 1
 };
-
-export const SYNC_INTERVAL_OPTIONS = [
-  { value: 15, label: "每 15 分钟" },
-  { value: 30, label: "每 30 分钟" },
-  { value: 60, label: "每 1 小时" },
-  { value: 180, label: "每 3 小时" },
-  { value: 360, label: "每 6 小时" },
-  { value: 720, label: "每 12 小时" },
-  { value: 1440, label: "每 24 小时" }
-] as const;
 
 function readJson<T>(key: string): T | null {
   if (typeof window === "undefined" || !window.localStorage) return null;
@@ -70,11 +63,18 @@ function readJson<T>(key: string): T | null {
 }
 
 export function loadCloudSyncSettings(): CloudSyncSettings {
-  const stored = readJson<Partial<CloudSyncSettings>>(CLOUD_SYNC_SETTINGS_KEY);
+  const stored = readJson<Partial<CloudSyncSettings> & { intervalMinutes?: number }>(CLOUD_SYNC_SETTINGS_KEY);
   if (!stored) return { ...DEFAULT_CLOUD_SYNC_SETTINGS, oss: { ...DEFAULT_CLOUD_SYNC_SETTINGS.oss }, webdav: { ...DEFAULT_CLOUD_SYNC_SETTINGS.webdav } };
+  const intervalHours =
+    typeof stored.intervalHours === "number" && Number.isFinite(stored.intervalHours)
+      ? stored.intervalHours
+      : typeof stored.intervalMinutes === "number" && Number.isFinite(stored.intervalMinutes)
+        ? Math.max(1, Math.round(stored.intervalMinutes / 60))
+        : DEFAULT_CLOUD_SYNC_SETTINGS.intervalHours;
   return {
     ...DEFAULT_CLOUD_SYNC_SETTINGS,
     ...stored,
+    intervalHours,
     oss: { ...DEFAULT_CLOUD_SYNC_SETTINGS.oss, ...(stored.oss ?? {}) },
     webdav: { ...DEFAULT_CLOUD_SYNC_SETTINGS.webdav, ...(stored.webdav ?? {}) }
   };
@@ -86,14 +86,16 @@ export function saveCloudSyncSettings(settings: CloudSyncSettings) {
 }
 
 export function loadCloudSyncState(): CloudSyncState {
-  return (
-    readJson<CloudSyncState>(CLOUD_SYNC_STATE_KEY) ?? {
-      lastPushAt: null,
-      lastPullAt: null,
-      lastAutoPushAt: null,
-      lastError: null
-    }
-  );
+  const stored = readJson<Partial<CloudSyncState> & { lastAutoPushAt?: number | null }>(CLOUD_SYNC_STATE_KEY);
+  return {
+    lastPushAt: stored?.lastPushAt ?? null,
+    lastPullAt: stored?.lastPullAt ?? null,
+    lastAutoSyncAt: stored?.lastAutoSyncAt ?? stored?.lastAutoPushAt ?? null,
+    localConfigAt: stored?.localConfigAt ?? null,
+    cloudConfigAt: stored?.cloudConfigAt ?? null,
+    lastConfigFingerprint: stored?.lastConfigFingerprint ?? null,
+    lastError: stored?.lastError ?? null
+  };
 }
 
 export function saveCloudSyncState(state: CloudSyncState) {
@@ -118,7 +120,8 @@ export async function cloudSyncPush(appVersion?: string | null): Promise<string>
     settings,
     payloadJson: JSON.stringify(payload)
   })) as string;
-  patchState({ lastPushAt: Date.now(), lastError: null });
+  const now = Date.now();
+  patchState({ lastPushAt: now, localConfigAt: now, lastConfigFingerprint: configFingerprint(), lastError: null });
   return message;
 }
 
@@ -128,17 +131,18 @@ export async function cloudSyncPull(appVersion?: string | null): Promise<string>
   if (!remote) {
     return "远端还没有配置文件，先点「上传到云端」";
   }
-  const payload = JSON.parse(remote) as LanSyncPayload;
-  const result = applyIncrementalLanSyncImport(window.localStorage, payload.entries);
-  patchState({ lastPullAt: Date.now(), lastError: null });
-  const parts: string[] = [];
-  if (result.addedStreamers) parts.push(`关注 +${result.addedStreamers}`);
-  if (result.addedFolderCount) parts.push(`分组 +${result.addedFolderCount}`);
-  if (result.addedCustomCategories) parts.push(`自定义分类 +${result.addedCustomCategories}`);
-  if (result.addedDanmuBlockKeywords) parts.push(`屏蔽词 +${result.addedDanmuBlockKeywords}`);
-  if (result.appliedDanmuPreferences) parts.push("弹幕偏好");
+  const payload = parseLanSyncPayload(JSON.parse(remote));
+  const result = applyFullLanSyncOverwrite(window.localStorage, payload.entries);
+  const now = Date.now();
+  patchState({
+    lastPullAt: now,
+    localConfigAt: now,
+    cloudConfigAt: Date.parse(payload.exportedAt),
+    lastConfigFingerprint: configFingerprint(),
+    lastError: null
+  });
   void appVersion;
-  return `已从云端应用：${parts.length ? parts.join("、") : "无变化"}`;
+  return `已从云端完整覆盖：写入 ${result.appliedKeys} 项、删除 ${result.removedKeys} 项`;
 }
 
 export async function cloudSyncTest(): Promise<string> {
@@ -146,20 +150,76 @@ export async function cloudSyncTest(): Promise<string> {
   return (await invoke<string>("cloud_sync_test", { settings })) as string;
 }
 
-/** 自动同步心跳：到点就把本地配置推上云。返回是否真的推了。 */
-export async function maybeAutoCloudSync(appVersion?: string | null): Promise<boolean> {
-  const settings = loadCloudSyncSettings();
-  if (!settings.provider || !settings.autoSync) return false;
+function configFingerprint(): string {
+  const parts = LAN_SYNC_KEYS.map((key) => `${key}=${window.localStorage.getItem(key) ?? ""}`);
+  let hash = 5381;
+  const text = parts.join("\u0001");
+  for (let i = 0; i < text.length; i += 1) {
+    hash = ((hash << 5) + hash + text.charCodeAt(i)) | 0;
+  }
+  return `${text.length}:${hash}`;
+}
+
+/** 本地配置内容被改过（指纹变化）时把本地时间戳推到 now，让本机的修改能参与「谁新覆盖谁」。 */
+export function refreshLocalConfigTimestamp(): boolean {
+  const fingerprint = configFingerprint();
   const state = loadCloudSyncState();
-  const intervalMs = Math.max(5, settings.intervalMinutes) * 60_000;
-  const last = state.lastAutoPushAt ?? 0;
-  if (Date.now() - last < intervalMs) return false;
+  if (state.lastConfigFingerprint === fingerprint) return false;
+  if (state.localConfigAt == null) {
+    patchState({ lastConfigFingerprint: fingerprint });
+    return false;
+  }
+  patchState({ localConfigAt: Date.now(), lastConfigFingerprint: fingerprint });
+  return true;
+}
+
+/**
+ * 自动同步心跳：定时读云端配置，比较云端 exportedAt 与本地时间戳，新的覆盖旧的。
+ * 云端新 → 完整覆盖本地；本地新 → 整份推上云；相等或读不到时间戳 → 不动。
+ */
+export async function autoCloudSyncTick(appVersion?: string | null): Promise<string | null> {
+  const settings = loadCloudSyncSettings();
+  if (!settings.provider || !settings.autoSync) return null;
+  refreshLocalConfigTimestamp();
+  const state = loadCloudSyncState();
+  const intervalMs = Math.max(1, Math.round(settings.intervalHours)) * 3_600_000;
+  if (Date.now() - (state.lastAutoSyncAt ?? 0) < intervalMs) return null;
   try {
-    await cloudSyncPush(appVersion);
-    patchState({ lastAutoPushAt: Date.now() });
-    return true;
+    const remote = (await invoke<string | null>("cloud_sync_pull", { settings })) as string | null;
+    const now = Date.now();
+    if (!remote) {
+      await cloudSyncPush(appVersion);
+      patchState({ lastAutoSyncAt: now, cloudConfigAt: now });
+      return "云端还没有配置文件，已把本机配置上传";
+    }
+    const payload = parseLanSyncPayload(JSON.parse(remote));
+    const cloudAt = Date.parse(payload.exportedAt);
+    const localAt = loadCloudSyncState().localConfigAt;
+    patchState({ cloudConfigAt: cloudAt });
+    if (localAt == null) {
+      patchState({ lastAutoSyncAt: now, localConfigAt: cloudAt, lastError: null });
+      return "本地还没有时间戳，以云端配置时间初始化基线，本轮不覆盖";
+    }
+    if (cloudAt > localAt) {
+      const result = applyFullLanSyncOverwrite(window.localStorage, payload.entries);
+      patchState({
+        lastPullAt: now,
+        lastAutoSyncAt: now,
+        localConfigAt: now,
+        lastConfigFingerprint: configFingerprint(),
+        lastError: null
+      });
+      return `云端配置更新，已覆盖本机：写入 ${result.appliedKeys} 项、删除 ${result.removedKeys} 项`;
+    }
+    if (localAt > cloudAt) {
+      await cloudSyncPush(appVersion);
+      patchState({ lastAutoSyncAt: now, cloudConfigAt: now, lastError: null });
+      return "本机配置更新，已上传覆盖云端";
+    }
+    patchState({ lastAutoSyncAt: now, lastError: null });
+    return "两端时间戳一致，无需同步";
   } catch (error) {
     patchState({ lastError: String((error as any)?.message ?? error) });
-    return false;
+    return null;
   }
 }

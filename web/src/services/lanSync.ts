@@ -480,3 +480,26 @@ export function applyIncrementalLanSyncImport(storage: Storage, remoteEntries: P
     appliedDanmuPreferences
   };
 }
+
+export type LanSyncOverwriteResult = {
+  appliedKeys: number;
+  removedKeys: number;
+};
+
+export function applyFullLanSyncOverwrite(storage: Storage, remoteEntries: PortableEntries): LanSyncOverwriteResult {
+  let appliedKeys = 0;
+  let removedKeys = 0;
+  for (const key of LAN_SYNC_KEYS) {
+    const remote = remoteEntries[key];
+    if (typeof remote === "string") {
+      if (storage.getItem(key) !== remote) {
+        storage.setItem(key, remote);
+        appliedKeys += 1;
+      }
+    } else if (storage.getItem(key) !== null) {
+      storage.removeItem(key);
+      removedKeys += 1;
+    }
+  }
+  return { appliedKeys, removedKeys };
+}

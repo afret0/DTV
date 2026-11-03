@@ -9,7 +9,7 @@ import { invoke } from "@tauri-apps/api/core";
 
 import styles from "./Navbar.module.css";
 import { LanSyncModal } from "./LanSyncModal";
-import { maybeAutoCloudSync } from "@/services/cloudSync";
+import { autoCloudSyncTick } from "@/services/cloudSync";
 import { searchAnchors, type SearchAnchorResult, type SearchPlatform } from "@/services/search";
 import { usePlayerUi } from "@/state/playerUi/PlayerUiProvider";
 import { useFollow, type Platform as FollowPlatform } from "@/state/follow/FollowProvider";
@@ -101,10 +101,10 @@ export function Navbar({
   const [versionInfo, setVersionInfo] = useState<VersionInfo | null>(null);
   const [hasUpdate, setHasUpdate] = useState(false);
   const [localVersion, setLocalVersion] = useState<string>("");
-  // 云同步心跳：每分钟检查一次是否到了自动上传周期。
+  // 云同步心跳：每分钟检查一次是否到了自动同步周期（到点读云端，谁新覆盖谁）。
   useEffect(() => {
     const tick = () => {
-      void maybeAutoCloudSync(localVersion).catch(() => {});
+      void autoCloudSyncTick(localVersion).catch(() => {});
     };
     const id = window.setInterval(tick, 60_000);
     tick();
