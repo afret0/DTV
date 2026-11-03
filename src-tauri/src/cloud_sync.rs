@@ -6,6 +6,7 @@ use base64::Engine;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha1::Sha1;
+use url::Url;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
@@ -42,8 +43,10 @@ fn client() -> reqwest::Client {
 }
 
 fn oss_object_url(cfg: &OssSettings) -> Result<String, String> {
-    let endpoint = cfg.endpoint.trim().trim_end_matches('/');
-    if endpoint.is_empty() || cfg.bucket.trim().is_empty() || cfg.object_key.trim().is_empty() {
+    let endpoint = cfg.endpoint.trim();
+    let bucket = cfg.bucket.trim();
+    let key = cfg.object_key.trim().trim_start_matches('/');
+    if endpoint.is_empty() || bucket.is_empty() || key.is_empty() {
         return Err("OSS 配置不完整：endpoint / bucket / objectKey 都要填".into());
     }
     let endpoint = if endpoint.contains("://") {
@@ -51,8 +54,27 @@ fn oss_object_url(cfg: &OssSettings) -> Result<String, String> {
     } else {
         format!("https://{endpoint}")
     };
-    let key = cfg.object_key.trim().trim_start_matches('/');
-    Ok(format!("{endpoint}/{key}"))
+    let mut url =
+        Url::parse(&endpoint).map_err(|_| format!("OSS endpoint 无法解析: {endpoint}"))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| format!("OSS endpoint 缺少域名: {endpoint}"))?
+        .to_string();
+    let host_lower = host.to_ascii_lowercase();
+    let bucket_lower = bucket.to_ascii_lowercase();
+    let is_oss_domain =
+        host_lower.ends_with(".aliyuncs.com") || host_lower.ends_with(".aliyun-inc.com");
+    if is_oss_domain && !host_lower.starts_with(&format!("{bucket_lower}.")) {
+        url.set_host(Some(&format!("{bucket}.{host}")))
+            .map_err(|_| format!("OSS endpoint 无法解析: {endpoint}"))?;
+    } else {
+        log::info!("skip, 不再拼 bucket 前缀, 判定: host 已以 {bucket_lower}. 开头, 或不是 aliyuncs 域名按 CNAME 处理, host: {host_lower}");
+    }
+    let path_prefix = url.path().trim_end_matches('/');
+    url.set_path(&format!("{path_prefix}/{key}"));
+    let object_url = url.to_string();
+    log::info!("done, 拼出 OSS 对象地址, url: {object_url}");
+    Ok(object_url)
 }
 
 /// OSS V1 签名的签名体：base64(hmac-sha1(secret, stringToSign))。
@@ -260,9 +282,40 @@ mod tests {
             access_key_secret: "s".into(),
             object_key: "/k.json".into(),
         };
-        assert_eq!(oss_object_url(&cfg).unwrap(), "https://oss-cn-hangzhou.aliyuncs.com/k.json");
+        assert_eq!(
+            oss_object_url(&cfg).unwrap(),
+            "https://b.oss-cn-hangzhou.aliyuncs.com/k.json"
+        );
         let bad = OssSettings { endpoint: "".into(), ..cfg.clone() };
         assert!(oss_object_url(&bad).is_err());
+    }
+
+    #[test]
+    fn oss_object_url_keeps_existing_bucket_prefix() {
+        let cfg = OssSettings {
+            endpoint: "https://b.oss-cn-hangzhou.aliyuncs.com".into(),
+            bucket: "b".into(),
+            object_key: "k.json".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            oss_object_url(&cfg).unwrap(),
+            "https://b.oss-cn-hangzhou.aliyuncs.com/k.json"
+        );
+    }
+
+    #[test]
+    fn oss_object_url_keeps_cname_host() {
+        let cfg = OssSettings {
+            endpoint: "https://sync.example.com/dav/".into(),
+            bucket: "b".into(),
+            object_key: "k.json".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            oss_object_url(&cfg).unwrap(),
+            "https://sync.example.com/dav/k.json"
+        );
     }
 
     #[test]
