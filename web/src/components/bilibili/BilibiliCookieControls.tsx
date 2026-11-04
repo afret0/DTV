@@ -9,10 +9,12 @@ export type BilibiliCookieControlsVariant = "player" | "category";
 type Props = {
   variant?: BilibiliCookieControlsVariant;
   onCookieChanged?: (cookie: string | null) => void;
+  /** 未登录时跟在按钮后面的说明（B 站服务端对游客限 720P）。 */
+  guestHint?: string;
 };
 
 export function BilibiliCookieControls(props: Props) {
-  const { variant = "player", onCookieChanged } = props;
+  const { variant = "player", onCookieChanged, guestHint } = props;
   const { hasRequired, isLoggingIn, error, login, logout } = useBilibiliCookie({
     autoBootstrap: true,
     onChanged: onCookieChanged
@@ -50,6 +52,9 @@ export function BilibiliCookieControls(props: Props) {
       <button type="button" className="cookie-status-btn" onClick={() => void login()} disabled={isLoggingIn} title={loginTitle}>
         <span className={hasRequired && !isLoggingIn ? "cookie-configured" : "cookie-unset"}>{loginLabel}</span>
       </button>
+      {!hasRequired && !isLoggingIn && guestHint ? (
+        <span className="cookie-guest-hint">{guestHint}</span>
+      ) : null}
       {hasRequired && !isLoggingIn ? (
         <button type="button" className="cookie-clear-btn" onClick={() => void logout()} title="退出登录">
           退出

@@ -1071,6 +1071,14 @@
 }
 
 /* Cookie / login status (Bilibili) */
+.cookie-guest-hint {
+  margin-left: 6px;
+  font-size: 11px;
+  color: var(--secondary-text, #9aa0a6);
+  opacity: 0.85;
+  white-space: nowrap;
+}
+
 .cookie-status {
   display: inline-flex;
   align-items: center;

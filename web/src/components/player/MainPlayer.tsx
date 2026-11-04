@@ -33,6 +33,7 @@ import { stopHuyaProxy } from "@/platforms/huya/playerHelper";
 import { fetchAndPrepareDouyinStreamConfig, stopDouyinProxy } from "@/platforms/douyin/playerHelper";
 import { getHuyaStreamConfig } from "@/platforms/huya/playerHelper";
 import { getBilibiliStreamConfig, stopBilibiliProxy } from "@/platforms/bilibili/playerHelper";
+import { BilibiliCookieControls } from "@/components/bilibili/BilibiliCookieControls";
 import { useDlnaDiscovery } from "@/hooks/useDlnaDiscovery";
 import { CastDialog } from "@/components/player/CastDialog";
 import { useImageProxy } from "@/hooks/useImageProxy";
@@ -1854,6 +1855,17 @@ export function MainPlayer({
                     <div className={`player-topbar-status ${playerIsLive === false ? "is-offline" : "is-live"}`}>
                       {isLoadingStream ? "加载中" : playerIsLive === false ? "未开播" : "直播中"}
                     </div>
+                    {platform === Platform.BILIBILI ? (
+                      <BilibiliCookieControls
+                        variant="player"
+                        guestHint="未登录最高 720P"
+                        onCookieChanged={() => {
+                          // 登录态一变就按当前档位（默认原画）重新取流：
+                          // 登录后 B 站才兑现 1080p 原画。
+                          void reloadStreamRef.current?.("refresh");
+                        }}
+                      />
+                    ) : null}
                     <button
                       type="button"
                       className={`player-topbar-follow ${isFollowed ? "is-following" : ""}`}
