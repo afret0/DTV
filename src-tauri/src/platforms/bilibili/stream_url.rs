@@ -83,8 +83,9 @@ pub async fn fetch_bilibili_stream_core(
             ("room_id", room_id.to_string()),
             ("protocol", "0,1".to_string()),
             ("format", "0,1,2".to_string()),
-            // 与参考 Python 版本保持一致：codec 使用 0，platform 使用 html5
-            ("codec", "0".to_string()),
+            // codec 0=avc 1=hevc：同清晰度下 hevc 编码效率高约 40%（实测 720p
+            // hevc 1.6Mbps 观感好于 avc 2.7Mbps），必须把 hevc 也请求回来才有得选。
+            ("codec", "0,1".to_string()),
             ("platform", "html5".to_string()),
             ("dolby", "5".to_string()),
         ];
@@ -271,14 +272,28 @@ pub async fn fetch_bilibili_stream_core(
         Hls(String),
     }
 
+    /// 返回 (全部变体, 选中的 flv(url, 实授 qn, codec), hls 候选)。
+    /// flv 选择两条规矩（现场实测 room 22961145）：
+    /// 1. 服务器对未登录用户经常不兑现请求的 qn（请求 10000 原画，avc/hevc 只给
+    ///    current_qn=250 超清）——优先取 current_qn 与请求一致的条目，没有才退回
+    ///    全部 flv 里实授最高的那档；
+    /// 2. 同档内 hevc 优先：实测同为 720p，hevc 1.6Mbps 的观感好于 avc 2.7Mbps
+    ///    （HEVC 编码效率约高 40%，抖音 HEVC 流在本 app 已长期验证可播）。
     fn parse_stream_variants(
         playurl: &Value,
         selected_desc: &Option<String>,
         selected_qn: Option<i32>,
-    ) -> (Vec<StreamVariant>, Option<String>, Vec<String>) {
+        qn_map: &[(i32, String)],
+    ) -> (Vec<StreamVariant>, Option<(String, i32, String)>, Vec<String>) {
+        let desc_of = |qn: i32| {
+            qn_map
+                .iter()
+                .find(|(q, _)| *q == qn)
+                .map(|(_, d)| d.clone())
+        };
         let mut variants: Vec<StreamVariant> = Vec::new();
         let mut hls_candidates: Vec<String> = Vec::new();
-        let mut flv_candidate: Option<String> = None;
+        let mut flv_entries: Vec<(String, i32, String)> = Vec::new();
 
         if let Some(streams) = playurl.get("stream").and_then(|v| v.as_array()) {
             for stream_item in streams {
@@ -312,11 +327,20 @@ pub async fn fetch_bilibili_stream_core(
                                             continue;
                                         }
 
+                                        let granted_qn = codec_item
+                                            .get("current_qn")
+                                            .and_then(|v| v.as_i64())
+                                            .unwrap_or(0) as i32;
+                                        let codec_name = codec_item
+                                            .get("codec_name")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("")
+                                            .to_string();
                                         variants.push(StreamVariant {
                                             url: composed.clone(),
                                             format: Some(format_name.to_string()),
-                                            desc: selected_desc.clone(),
-                                            qn: selected_qn,
+                                            desc: desc_of(granted_qn).or_else(|| selected_desc.clone()),
+                                            qn: Some(granted_qn),
                                             protocol: if protocol_name.is_empty() {
                                                 None
                                             } else {
@@ -332,8 +356,12 @@ pub async fn fetch_bilibili_stream_core(
                                         if is_hls_format || is_hls_protocol {
                                             hls_candidates.push(composed.clone());
                                         }
-                                        if format_name == "flv" && flv_candidate.is_none() {
-                                            flv_candidate = Some(composed.clone());
+                                        if format_name == "flv" {
+                                            flv_entries.push((
+                                                composed.clone(),
+                                                granted_qn,
+                                                codec_name,
+                                            ));
                                         }
                                     }
                                 }
@@ -343,6 +371,21 @@ pub async fn fetch_bilibili_stream_core(
                 }
             }
         }
+
+        let exact: Vec<&(String, i32, String)> = flv_entries
+            .iter()
+            .filter(|e| Some(e.1) == selected_qn)
+            .collect();
+        let pool: Vec<&(String, i32, String)> = if exact.is_empty() {
+            flv_entries.iter().collect()
+        } else {
+            exact
+        };
+        let flv_candidate = pool
+            .iter()
+            .find(|e| e.2.eq_ignore_ascii_case("hevc"))
+            .or_else(|| pool.iter().max_by_key(|e| e.1))
+            .map(|e| (*e).clone());
 
         (variants, flv_candidate, hls_candidates)
     }
@@ -392,15 +435,40 @@ pub async fn fetch_bilibili_stream_core(
         let playinfo_attempt = request_playinfo(&client, &room_id, selected_qn).await?;
         let playurl_attempt = playinfo_attempt["data"]["playurl_info"]["playurl"].clone();
         let (variants, flv_candidate, hls_candidates) =
-            parse_stream_variants(&playurl_attempt, &selected_desc, selected_qn);
+            parse_stream_variants(&playurl_attempt, &selected_desc, selected_qn, &qn_map);
 
         variants_for_response = variants.clone();
 
-        if let Some(flv_url) = flv_candidate {
-            eprintln!(
-                "[Bilibili] Attempt {} obtained FLV stream for room {}, stop retrying",
-                attempt_display, room_id
-            );
+        if let Some((flv_url, granted_qn, codec_name)) = flv_candidate {
+            if Some(granted_qn) == selected_qn {
+                eprintln!(
+                    "[Bilibili] Attempt {} obtained FLV stream for room {}, granted qn={} ({}) codec={}, stop retrying",
+                    attempt_display,
+                    room_id,
+                    granted_qn,
+                    qn_map
+                        .iter()
+                        .find(|(q, _)| *q == granted_qn)
+                        .map(|(_, d)| d.as_str())
+                        .unwrap_or("?"),
+                    codec_name
+                );
+            } else {
+                eprintln!(
+                    "[Bilibili] Attempt {} obtained FLV stream for room {}, 请求画质 {:?}(qn={:?}) 但 B 站只授予 qn={} ({}), codec={} —— 未登录的上限, 登录后带 SESSDATA 才能拿原画; stop retrying",
+                    attempt_display,
+                    room_id,
+                    selected_desc,
+                    selected_qn,
+                    granted_qn,
+                    qn_map
+                        .iter()
+                        .find(|(q, _)| *q == granted_qn)
+                        .map(|(_, d)| d.as_str())
+                        .unwrap_or("?"),
+                    codec_name
+                );
+            }
             selected_stream = Some(SelectedStream::Flv(flv_url));
             break;
         }

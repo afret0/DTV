@@ -337,10 +337,14 @@ async fn fetch_origin_flv_from_live_page(
 }
 
 const ORIGIN_PAGE_WINDOW: usize = 20_000;
+/// 横屏游戏源最好的模板不低于这个档位（hd）时才优先它；只给低清模板的横屏源
+/// 会让「原画」比低档还糊，此时回退合成源的高清模板。
+const DOUYIN_HIGH_DEF_RANK: i32 = 40;
 
 fn douyin_template_rank(tpl: &str) -> i32 {
     let low = tpl.to_ascii_lowercase();
-    let low_latency = low.contains("ls");
+    // 低延迟转码两套前缀都见过：ls*（lssd5）与 hiq*（hiqsd5/hiquhd5）。
+    let low_latency = low.contains("ls") || low.contains("hiq");
     let base = if low.contains("uhd") {
         50
     } else if tpl.is_empty() {
@@ -417,11 +421,12 @@ fn extract_origin_flv_candidates_from_html(html: &str) -> Vec<String> {
             .nth(1)
             .and_then(|rest| rest.split('/').next())
             .unwrap_or("");
+        // 抖音 flv 边缘既有 pull-flv-qX 也有 pull-qX（不带 flv 字样），只能用黑名单：
+        // 排掉 hls/lls 边缘与纯音频/签名 ws 地址，其余都当 flv 候选。
         if url.contains("only_audio=1")
-            || url.contains("pull-hls")
-            || url.contains("pull-lls")
             || url.contains("wsSecret")
-            || !host.contains("flv")
+            || host.contains("hls")
+            || host.contains("lls")
         {
             continue;
         }
@@ -454,6 +459,7 @@ fn extract_origin_flv_candidates_from_html(html: &str) -> Vec<String> {
         width: u32,
         height: u32,
         urls: Vec<String>,
+        best_rank: i32,
     }
     let mut groups: Vec<Group> = Vec::new();
     for id in ids.iter().cloned().collect::<Vec<String>>() {
@@ -493,36 +499,55 @@ fn extract_origin_flv_candidates_from_html(html: &str) -> Vec<String> {
                 .then(a.order.cmp(&b.order))
         });
         let urls: Vec<String> = group.iter().map(|c| c.url.clone()).collect();
+        let best_rank = urls
+            .first()
+            .map(|u| douyin_template_rank(&douyin_template_of(u)))
+            .unwrap_or(i32::MIN);
         groups.push(Group {
             id,
             first_pos,
             width,
             height,
             urls,
+            best_rank,
         });
     }
-    // 横画布优先；同为横画布时取最接近 16:9 的（竖屏合成源 1920x1810 的
-    // |9w-16h| 远大于游戏源 1920x1080 的 0），保证拿到「游戏全屏 + 摄像头 PIP」。
+    // 排序四层：① 横画布且有 hd 及以上模板（游戏全屏 + 摄像头 PIP 的高清源）；
+    // ② 有高清模板的其它源（竖屏合成源 1080p：布局是上下堆叠，但比 360p 的横屏
+    // 源清楚得多 —— 现场房间 511309230149 的横屏源只给 _md 360p，旧规则让原画
+    // 比低档还糊）；③ 只有低清模板的横屏源；④ 其余。同层内取最接近 16:9 的
+    // （合成源 1920x1810 的 |9w-16h| 远大于游戏源 1920x1080 的 0）。
     groups.sort_by(|a, b| {
         let landscape = |g: &Group| g.width > g.height && g.width > 0;
+        let tier = |g: &Group| match (landscape(g), g.best_rank >= DOUYIN_HIGH_DEF_RANK) {
+            (true, true) => 0u8,
+            (false, true) => 1,
+            (true, false) => 2,
+            (false, false) => 3,
+        };
         let skew = |g: &Group| {
             let lhs = 9u64 * g.width as u64;
             let rhs = 16u64 * g.height as u64;
             lhs.abs_diff(rhs)
         };
-        landscape(b)
-            .cmp(&landscape(a))
+        tier(a)
+            .cmp(&tier(b))
             .then(skew(a).cmp(&skew(b)))
             .then(a.first_pos.cmp(&b.first_pos))
     });
     let mut out = Vec::new();
     for group in groups {
         println!(
-            "[Douyin Stream Detail] page scrape id={} canvas={}x{} landscape={} candidates={}",
+            "[Douyin Stream Detail] page scrape id={} canvas={}x{} landscape={} best_tpl={} candidates={}",
             group.id,
             group.width,
             group.height,
             group.width > group.height && group.width > 0,
+            group
+                .urls
+                .first()
+                .map(|u| douyin_template_of(u))
+                .unwrap_or_default(),
             group.urls.len()
         );
         for url in group.urls {
@@ -630,6 +655,25 @@ mod douyin_page_extract_tests {
             "composite must not be first, pos={}",
             composite_pos
         );
+    }
+
+    /// 横屏游戏源只给低清模板时（现场房间 511309230149：横屏源只有 _md 360p，
+    /// 合成源有 _uhd 1080p），原画必须回退合成源的高清，而不是拿 360p 横屏。
+    #[test]
+    fn lowres_landscape_source_loses_to_highres_composite() {
+        let page = concat!(
+            r#"<script>"flv_pull_url":{"ORIGIN":"https://pull-flv-q13.douyincdn.com/thirdgame/stream-111_md.flv?expire=1"},"#,
+            r#""sdk_params":"{"resolution":"1920x1080"}"#,
+            r#";"flv_pull_url":{"ORIGIN":"https://pull-flv-q11.douyincdn.com/live/stream-222_uhd.flv?expire=1"},"#,
+            r#""sdk_params":"{"resolution":"1920x1810"}"</script>"#
+        );
+        let cands = extract_origin_flv_candidates_from_html(page);
+        assert!(
+            cands[0].contains("stream-222_uhd.flv"),
+            "composite 1080p must beat landscape 360p, got '{}'",
+            cands[0]
+        );
+        assert!(cands[1].contains("stream-111_md.flv"), "game source stays as fallback");
     }
 
     /// 只有竖屏源（普通秀场房间）时不能一个都不返回，否则原画档位会整体失效。
