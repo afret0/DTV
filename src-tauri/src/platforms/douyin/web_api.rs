@@ -1,5 +1,8 @@
 use crate::platforms::common::http_client::HttpClient;
 use crate::platforms::douyin::a_bogus::generate_a_bogus;
+use crate::platforms::douyin::douyin_streamer_detail::{
+    douyin_template_of, douyin_template_rank, DOUYIN_HIGH_DEF_RANK,
+};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT_ENCODING, COOKIE, REFERER, USER_AGENT};
 use serde_json::Value;
 
@@ -63,7 +66,22 @@ fn merge_origin_stream(room: &mut Value) {
     let origin_flv = origin_main
         .get("flv")
         .and_then(|v| v.as_str())
-        .map(|s| format!("{}&codec={}", s, origin_codec));
+        .map(|s| format!("{}&codec={}", s, origin_codec))
+        .filter(|u| {
+            let tpl = douyin_template_of(u);
+            let rank = douyin_template_rank(&tpl);
+            if rank < DOUYIN_HIGH_DEF_RANK {
+                log::info!(
+                    "[Douyin Stream Detail] API origin slot is a low-tier transcode, skipping: template='{}' rank={} url='{}'",
+                    tpl,
+                    rank,
+                    u
+                );
+                false
+            } else {
+                true
+            }
+        });
 
     if let Some(hls_origin) = origin_hls {
         match stream_url.get_mut("hls_pull_url_map") {
@@ -272,4 +290,77 @@ pub fn choose_flv_stream(room: &Value, desired_quality: &str) -> Option<(String,
         .get(idx)
         .cloned()
         .or_else(|| entries.last().cloned())
+}
+
+#[cfg(test)]
+mod douyin_merge_origin_tests {
+    use super::merge_origin_stream;
+    use serde_json::{json, Value};
+
+    fn room_with_origin_flv(origin_flv: &str) -> Value {
+        let stream_data = json!({
+            "data": {
+                "origin": {
+                    "main": {
+                        "flv": origin_flv,
+                        "sdk_params": "{\"VCodec\":\"264\"}"
+                    }
+                }
+            }
+        })
+        .to_string();
+        json!({
+            "stream_url": {
+                "flv_pull_url": {
+                    "FULL_HD1": "http://pull-q5.douyincdn.com/thirdgame/stream-1_uhd.flv?expire=1"
+                },
+                "live_core_sdk_data": {
+                    "pull_data": {
+                        "stream_data": stream_data
+                    }
+                }
+            }
+        })
+    }
+
+    /// 现场房间 932584152016：抖音 API 的 origin 槽偶尔塞的是最低档 _md 转码流，
+    /// 直接当「原画」会比自动画质还糊，必须拒收并让 FULL_HD1 兜底。
+    #[test]
+    fn low_tier_api_origin_slot_is_rejected() {
+        let mut room = room_with_origin_flv(
+            "http://pull-flv-q5-admin.douyincdn.com/thirdgame/stream-1_md.flv?expire=1",
+        );
+        merge_origin_stream(&mut room);
+        let map = room
+            .get("stream_url")
+            .and_then(|v| v.get("flv_pull_url"))
+            .and_then(|v| v.as_object())
+            .unwrap();
+        assert!(
+            !map.contains_key("ORIGIN"),
+            "low-tier origin must not enter the map: {:?}",
+            map.keys().collect::<Vec<_>>()
+        );
+        assert!(map.contains_key("FULL_HD1"), "existing keys must stay");
+    }
+
+    #[test]
+    fn untouched_api_origin_slot_is_merged_first() {
+        let mut room = room_with_origin_flv(
+            "http://pull-flv-q5-admin.douyincdn.com/thirdgame/stream-1.flv?expire=1",
+        );
+        merge_origin_stream(&mut room);
+        let map = room
+            .get("stream_url")
+            .and_then(|v| v.get("flv_pull_url"))
+            .and_then(|v| v.as_object())
+            .unwrap();
+        let origin = map.get("ORIGIN").and_then(|v| v.as_str()).unwrap();
+        assert!(origin.contains("stream-1.flv"), "got '{}'", origin);
+        assert_eq!(
+            map.keys().next().map(|k| k.as_str()),
+            Some("ORIGIN"),
+            "ORIGIN must keep the head position"
+        );
+    }
 }

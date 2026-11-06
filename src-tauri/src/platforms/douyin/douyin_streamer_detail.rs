@@ -339,9 +339,9 @@ async fn fetch_origin_flv_from_live_page(
 const ORIGIN_PAGE_WINDOW: usize = 20_000;
 /// 横屏游戏源最好的模板不低于这个档位（hd）时才优先它；只给低清模板的横屏源
 /// 会让「原画」比低档还糊，此时回退合成源的高清模板。
-const DOUYIN_HIGH_DEF_RANK: i32 = 40;
+pub(crate) const DOUYIN_HIGH_DEF_RANK: i32 = 40;
 
-fn douyin_template_rank(tpl: &str) -> i32 {
+pub(crate) fn douyin_template_rank(tpl: &str) -> i32 {
     let low = tpl.to_ascii_lowercase();
     // 低延迟转码两套前缀都见过：ls*（lssd5）与 hiq*（hiqsd5/hiquhd5）。
     let low_latency = low.contains("ls") || low.contains("hiq");
@@ -369,7 +369,7 @@ fn douyin_template_rank(tpl: &str) -> i32 {
     }
 }
 
-fn douyin_template_of(url: &str) -> String {
+pub(crate) fn douyin_template_of(url: &str) -> String {
     let Some(tail) = url.rsplit('/').next() else {
         return String::new();
     };
@@ -416,6 +416,7 @@ fn extract_origin_flv_candidates_from_html(html: &str) -> Vec<String> {
         let m = cap.get(0).expect("whole match");
         let mut url = unescape_js_escapes(m.as_str());
         url = url.replace("&amp;", "&");
+        url = url.trim_end_matches('\\').to_string();
         let host = url
             .split("://")
             .nth(1)
@@ -683,6 +684,25 @@ mod douyin_page_extract_tests {
         let cands = extract_origin_flv_candidates_from_html(page);
         assert_eq!(cands.len(), 1, "expected the single portrait url");
         assert!(cands[0].contains("stream-333_uhd.flv"), "got {}", cands[0]);
+    }
+
+    /// 页面内嵌 JSON 里 URL 以 \" 收尾，正则会连带吃掉结尾的裸反斜杠；
+    /// 混进拉流地址会让播放器拿到非法 URL（现场房间 932584152016 实测复现）。
+    #[test]
+    fn escaped_json_url_loses_trailing_backslash() {
+        let page = r#"<script>"flv_pull_url":{"ORIGIN":"https://pull-q5.douyincdn.com/thirdgame/stream-444_uhd.flv?expire=1\u0026sign=abc123\"}</script>"#;
+        let cands = extract_origin_flv_candidates_from_html(page);
+        assert_eq!(cands.len(), 1, "expected the single escaped url");
+        assert!(
+            !cands[0].ends_with('\\'),
+            "trailing backslash leaked into url: '{}'",
+            cands[0]
+        );
+        assert!(
+            cands[0].ends_with("sign=abc123"),
+            "query part lost or polluted: '{}'",
+            cands[0]
+        );
     }
 
     /// 在播房间实测：打印每个房间页面暴露的 stream id、画布与首选模板，
