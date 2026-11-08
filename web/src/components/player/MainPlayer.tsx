@@ -38,7 +38,7 @@ import { useDlnaDiscovery } from "@/hooks/useDlnaDiscovery";
 import { CastDialog } from "@/components/player/CastDialog";
 import { useImageProxy } from "@/hooks/useImageProxy";
 import { useFollow, type FollowedStreamer, type Platform as FollowPlatform } from "@/state/follow/FollowProvider";
-import { usePlayerUi } from "@/state/playerUi/PlayerUiProvider";
+import { usePlayerUi, roomSwitchKey } from "@/state/playerUi/PlayerUiProvider";
 
 declare global {
   // Used to guard against React StrictMode(dev) mount/unmount cycles accidentally stopping a newer player session.
@@ -210,7 +210,7 @@ export function MainPlayer({
 }) {
   const router = useRouter();
   const follow = useFollow();
-  const { setIsland, clearIsland, setFullscreen } = usePlayerUi();
+  const { setIsland, clearIsland, setFullscreen, endRoomSwitch } = usePlayerUi();
   const { ensureProxyStarted, getAvatarSrc } = useImageProxy();
   const pageRef = useRef<HTMLDivElement | null>(null);
   const dragStartArmedRef = useRef(false);
@@ -1009,6 +1009,7 @@ export function MainPlayer({
         player.on?.("playing", () => {
           const { platform: p, roomId: r } = streamLabelRef.current;
           invoke("frontend_log", { msg: `player PLAYING [${p}/${r}] kind=${playbackKindRef.current}` }).catch(() => {});
+          endRoomSwitch(roomSwitchKey(String(p), String(r)), "playing");
         });
         player.on?.("error", (err: any) => {
           // MediaError 的属性是 getter，JSON.stringify 会得到 {}；显式取 code/message。
@@ -1241,7 +1242,7 @@ export function MainPlayer({
       await startDanmaku(sessionId, overlay, platform, backendRoomId, filterRoomId);
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [currentLine, currentQuality, danmuSettings, isDanmuEnabled, isSessionActive, lineOptions, platform, roomId, startDanmaku]
+    [currentLine, currentQuality, danmuSettings, endRoomSwitch, isDanmuEnabled, isSessionActive, lineOptions, platform, roomId, startDanmaku]
   );
 
   const reloadStream = useCallback(
@@ -1461,6 +1462,7 @@ export function MainPlayer({
         // offline was what forced users to refresh rooms that were actually live.
         const offline = isOfflineMessage(msg);
         setIsOfflineError(offline);
+        endRoomSwitch(roomSwitchKey(platform, roomId), offline ? "offline" : "load failed");
         setPlayerIsLive(offline ? false : null);
         if (!offline) {
           // Transient failure: keep retrying in the background with backoff.
@@ -1498,7 +1500,7 @@ export function MainPlayer({
         }
       }
     },
-    [currentLine, currentQuality, destroyPlayer, isSessionActive, lineOptions, mountPlayer, platform, roomId, stopAllDanmakuBackends, stopAllProxies]
+    [currentLine, currentQuality, destroyPlayer, endRoomSwitch, isSessionActive, lineOptions, mountPlayer, platform, roomId, stopAllDanmakuBackends, stopAllProxies]
   );
 
   useEffect(() => {
@@ -1884,6 +1886,14 @@ export function MainPlayer({
 
               {isLoadingStream ? (
                 <div className="loading-player" style={{ position: "absolute", inset: 0, zIndex: 20 }}>
+                  <div className="spinner" aria-hidden="true">
+                    <div className="spinner-track" />
+                    <div className="spinner-head" />
+                    <div className="spinner-dot" />
+                  </div>
+                  <div className="loading-text" role="status" aria-live="polite">
+                    {`加载中 · ${PLATFORM_CN_LABEL[platform] ?? platform} ${roomId}`}
+                  </div>
                 </div>
               ) : null}
 

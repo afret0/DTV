@@ -12,6 +12,7 @@ import { Platform as PlatformEnum } from "@/platforms/common/types";
 import { useFollow, type FollowListItem, type FollowedStreamer, type Platform as FollowPlatform } from "@/state/follow/FollowProvider";
 import { useImageProxy } from "@/hooks/useImageProxy";
 import { usePlayerOverlay } from "@/state/playerOverlay/PlayerOverlayProvider";
+import { roomSwitchKey, usePlayerUi } from "@/state/playerUi/PlayerUiProvider";
 
 const FOLLOW_REFRESH_CONCURRENCY = 2;
 const REFRESH_INITIAL_DELAY_MS = 1500;
@@ -105,6 +106,7 @@ export function FollowsList() {
   const follow = useFollow();
   const { ensureProxyStarted, getAvatarSrc } = useImageProxy();
   const playerOverlay = usePlayerOverlay();
+  const playerUi = usePlayerUi();
 
   const listRef = useRef<HTMLDivElement | null>(null);
   const streamersListRef = useRef<HTMLDivElement | null>(null);
@@ -658,6 +660,7 @@ export function FollowsList() {
     const avatarSrc = getAvatarSrc(s.platform, s.avatarUrl);
     const dragEnabled = opts.fromFolder || opts.index >= 0;
     const inFolder = !!opts.fromFolder;
+    const isSwitching = playerUi.roomSwitch?.key === roomSwitchKey(s.platform, s.id);
     return (
       <div
         key={itemKey}
@@ -675,9 +678,10 @@ export function FollowsList() {
         }
       >
         <div
-          className={`${styles.streamerItem} ${inFolder ? styles.streamerItemInFolder : ""}`}
+          className={`${styles.streamerItem} ${inFolder ? styles.streamerItemInFolder : ""} ${isSwitching ? styles.streamerItemSwitching : ""}`}
           role="button"
           tabIndex={0}
+          aria-busy={isSwitching}
           onClick={() => handleStreamerClick(s.platform, s.id)}
         >
           <span className={styles.avatarWrap} aria-hidden="true">
@@ -699,6 +703,12 @@ export function FollowsList() {
               {s.roomTitle || "暂无直播标题"}
             </div>
           </div>
+          {isSwitching ? (
+            <span className={styles.switchChip} role="status" aria-live="polite">
+              <span className={styles.spinner} aria-hidden="true" />
+              切换中
+            </span>
+          ) : null}
         </div>
       </div>
     );
@@ -928,10 +938,14 @@ export function FollowsList() {
                         const liveDotClass = s.liveStatus === "LIVE" ? styles.liveDotLive : s.liveStatus === "UNKNOWN" ? styles.liveDotUnknown : styles.liveDotOffline;
                         const liveText = s.liveStatus === "LIVE" ? "直播中" : s.liveStatus === "OFFLINE" ? "离线" : "未知";
                         const roomTitle = s.roomTitle || "暂无直播标题";
+                        const isSwitching = playerUi.roomSwitch?.key === roomSwitchKey(s.platform, s.id);
                         return (
                           <div
                             key={`${s.platform}:${s.id}`}
-                            className={`${styles.followOverlayCard} ${overlayDeleteMode ? styles.followOverlayCardManage : ""}`}
+                            className={`${styles.followOverlayCard} ${overlayDeleteMode ? styles.followOverlayCardManage : ""} ${
+                              isSwitching ? styles.followOverlayCardSwitching : ""
+                            }`}
+                            aria-busy={isSwitching}
                             onMouseDown={(e) => e.preventDefault()}
                             onClick={() => {
                               if (overlayDeleteMode) return;
@@ -939,6 +953,12 @@ export function FollowsList() {
                               closeOverlay();
                             }}
                           >
+                            {isSwitching ? (
+                              <span className={styles.switchBadge} role="status" aria-live="polite">
+                                <span className={styles.spinner} aria-hidden="true" />
+                                切换中
+                              </span>
+                            ) : null}
                             {overlayDeleteMode ? (
                               <button
                                 type="button"

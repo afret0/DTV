@@ -5,6 +5,7 @@ import dynamic from "next/dynamic";
 import { AnimatePresence, m } from "framer-motion";
 
 import styles from "./PlayerOverlayProvider.module.css";
+import { roomSwitchKey, usePlayerUi } from "@/state/playerUi/PlayerUiProvider";
 
 const PlayerPage = dynamic(() => import("@/screens/PlayerPage").then((m) => m.PlayerPage), {
   ssr: false,
@@ -92,19 +93,25 @@ export function PlayerOverlayHost() {
 }
 
 export function PlayerOverlayProvider({ children }: { children: React.ReactNode }) {
+  const { beginRoomSwitch, cancelRoomSwitch } = usePlayerUi();
   const [state, setState] = useState<{ isOpen: boolean; platform: string; roomId: string }>({
     isOpen: false,
     platform: "douyu",
     roomId: ""
   });
 
-  const openPlayer = useCallback((payload: PlayerOverlayOpenPayload) => {
-    setState({ isOpen: true, platform: payload.platform, roomId: payload.roomId });
-  }, []);
+  const openPlayer = useCallback(
+    (payload: PlayerOverlayOpenPayload) => {
+      if (!beginRoomSwitch(roomSwitchKey(payload.platform, payload.roomId))) return;
+      setState({ isOpen: true, platform: payload.platform, roomId: payload.roomId });
+    },
+    [beginRoomSwitch]
+  );
 
   const closePlayer = useCallback(() => {
+    cancelRoomSwitch("player closed");
     setState((s) => ({ ...s, isOpen: false }));
-  }, []);
+  }, [cancelRoomSwitch]);
 
   const value = useMemo<PlayerOverlayContextValue>(
     () => ({

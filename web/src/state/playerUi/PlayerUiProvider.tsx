@@ -1,8 +1,26 @@
 "use client";
 
-import React, { createContext, useCallback, useContext, useMemo, useRef, useState } from "react";
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 
 import { Platform } from "@/platforms/common/types";
+
+export const ROOM_SWITCH_TIMEOUT_MS = 8000;
+
+export type RoomSwitchState = {
+  key: string;
+  startedAt: number;
+};
+
+function logRoomSwitch(msg: string) {
+  try {
+    void invoke("frontend_log", { msg }).catch(() => {});
+  } catch {}
+}
+
+export function roomSwitchKey(platform: string, roomId: string) {
+  return `${(platform || "").toLowerCase()}:${roomId || ""}`;
+}
 
 export type PlayerIslandState = {
   visible: boolean;
@@ -28,6 +46,10 @@ type PlayerUiContextValue = {
   setDanmuPanel: (next: DanmuPanelState) => void;
   registerDanmuPanelSetter: (setter: ((visible: boolean) => void) | null) => void;
   requestShowDanmuPanel: () => void;
+  roomSwitch: RoomSwitchState | null;
+  beginRoomSwitch: (key: string) => boolean;
+  endRoomSwitch: (key: string, reason: string) => void;
+  cancelRoomSwitch: (reason: string) => void;
 };
 
 const PlayerUiContext = createContext<PlayerUiContextValue | null>(null);
@@ -51,6 +73,50 @@ export function PlayerUiProvider({ children }: { children: React.ReactNode }) {
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [danmuPanel, setDanmuPanelState] = useState<DanmuPanelState>(emptyDanmuPanel);
   const danmuSetterRef = useRef<((visible: boolean) => void) | null>(null);
+  const [roomSwitch, setRoomSwitch] = useState<RoomSwitchState | null>(null);
+  const roomSwitchRef = useRef<RoomSwitchState | null>(null);
+
+  const beginRoomSwitch = useCallback((key: string) => {
+    const prev = roomSwitchRef.current;
+    const now = Date.now();
+    if (prev && now - prev.startedAt < ROOM_SWITCH_TIMEOUT_MS) {
+      if (prev.key === key) {
+        logRoomSwitch(`[ui] room switch ignored, 同一房间正在切换中, key: ${key}, elapsed: ${now - prev.startedAt}ms`);
+        return false;
+      }
+      logRoomSwitch(`[ui] room switch retarget, ${prev.key} -> ${key}, elapsed: ${now - prev.startedAt}ms`);
+    }
+    const next: RoomSwitchState = { key, startedAt: now };
+    roomSwitchRef.current = next;
+    setRoomSwitch(next);
+    logRoomSwitch(`[ui] room switch begin, key: ${key}`);
+    return true;
+  }, []);
+
+  const endRoomSwitch = useCallback((key: string, reason: string) => {
+    const prev = roomSwitchRef.current;
+    if (!prev || prev.key !== key) return;
+    roomSwitchRef.current = null;
+    setRoomSwitch(null);
+    logRoomSwitch(`[ui] room switch end, key: ${key}, reason: ${reason}, cost: ${Date.now() - prev.startedAt}ms`);
+  }, []);
+
+  const cancelRoomSwitch = useCallback((reason: string) => {
+    const prev = roomSwitchRef.current;
+    roomSwitchRef.current = null;
+    setRoomSwitch(null);
+    if (prev) logRoomSwitch(`[ui] room switch cancel, key: ${prev.key}, reason: ${reason}`);
+  }, []);
+
+  useEffect(() => {
+    const pending = roomSwitchRef.current;
+    if (!roomSwitch || !pending || pending.key !== roomSwitch.key) return;
+    const remain = ROOM_SWITCH_TIMEOUT_MS - (Date.now() - pending.startedAt);
+    const timer = window.setTimeout(() => {
+      endRoomSwitch(pending.key, "timeout");
+    }, Math.max(0, remain));
+    return () => window.clearTimeout(timer);
+  }, [endRoomSwitch, roomSwitch]);
 
   const setIsland = useCallback((next: Partial<PlayerIslandState>) => {
     setIslandState((prev) => ({ ...prev, ...next, visible: true }));
@@ -82,9 +148,26 @@ export function PlayerUiProvider({ children }: { children: React.ReactNode }) {
       danmuPanel,
       setDanmuPanel,
       registerDanmuPanelSetter,
-      requestShowDanmuPanel
+      requestShowDanmuPanel,
+      roomSwitch,
+      beginRoomSwitch,
+      endRoomSwitch,
+      cancelRoomSwitch
     };
-  }, [clearIsland, danmuPanel, island, isFullscreen, registerDanmuPanelSetter, requestShowDanmuPanel, setDanmuPanel, setIsland]);
+  }, [
+    beginRoomSwitch,
+    cancelRoomSwitch,
+    clearIsland,
+    danmuPanel,
+    endRoomSwitch,
+    island,
+    isFullscreen,
+    registerDanmuPanelSetter,
+    requestShowDanmuPanel,
+    roomSwitch,
+    setDanmuPanel,
+    setIsland
+  ]);
 
   return <PlayerUiContext.Provider value={value}>{children}</PlayerUiContext.Provider>;
 }

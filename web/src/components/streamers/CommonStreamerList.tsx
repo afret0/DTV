@@ -14,6 +14,7 @@ import { useDouyinLiveRooms } from "@/hooks/liveRooms/useDouyinLiveRooms";
 import { useBilibiliLiveRooms } from "@/hooks/liveRooms/useBilibiliLiveRooms";
 import { useDouyuLiveRooms } from "@/hooks/liveRooms/useDouyuLiveRooms";
 import { usePlayerOverlay } from "@/state/playerOverlay/PlayerOverlayProvider";
+import { roomSwitchKey, usePlayerUi } from "@/state/playerUi/PlayerUiProvider";
 
 type DouyuCategorySelection = {
   type: "cate2" | "cate3";
@@ -35,6 +36,7 @@ export function CommonStreamerList({
   douyuCategory?: DouyuCategorySelection | null;
 }) {
   const playerOverlay = usePlayerOverlay();
+  const playerUi = usePlayerUi();
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const bottomSentinelRef = useRef<HTMLDivElement | null>(null);
   const scrollRafRef = useRef(0);
@@ -45,6 +47,7 @@ export function CommonStreamerList({
   const loadMoreGateRef = useRef<{ key: string; lastLen: number; lastAt: number }>({ key: "", lastLen: -1, lastAt: 0 });
 
   const platform = platformName ?? "huya";
+  const pendingSwitchKey = playerUi.roomSwitch?.key ?? null;
   const categoryHref = selectedCategory?.cate2Href ?? null;
   const douyuCategoryId = douyuCategory?.id ?? null;
   const douyuCategoryType = douyuCategory?.type ?? null;
@@ -397,20 +400,23 @@ export function CommonStreamerList({
             animate={{ opacity: 1, transition: { duration: 0.14 } }}
             exit={{ opacity: 0, transition: { duration: 0.12 } }}
           >
-            {uniqueRooms.map((room, idx) => (
-              <m.div
-                key={room.room_id}
-                className={styles.cardOuter}
-                role="button"
-                tabIndex={0}
-                ref={nativeCardRef(room.room_id)}
-                onClick={() => onCardClick(room.room_id)}
-                onTap={() => onCardClick(room.room_id)}
-                onKeyDown={(e) => onCardKeyDown(e, room.room_id)}
-                initial="rest"
-                animate="rest"
-                whileHover={isScrolling ? undefined : "hover"}
-              >
+            {uniqueRooms.map((room, idx) => {
+              const isSwitching = pendingSwitchKey === roomSwitchKey(platform, room.room_id);
+              return (
+                <m.div
+                  key={room.room_id}
+                  className={`${styles.cardOuter} ${isSwitching ? styles.cardOuterSwitching : ""}`}
+                  role="button"
+                  tabIndex={0}
+                  aria-busy={isSwitching}
+                  ref={nativeCardRef(room.room_id)}
+                  onClick={() => onCardClick(room.room_id)}
+                  onTap={() => onCardClick(room.room_id)}
+                  onKeyDown={(e) => onCardKeyDown(e, room.room_id)}
+                  initial="rest"
+                  animate="rest"
+                  whileHover={isScrolling ? undefined : "hover"}
+                >
                 <Card className={styles.card}>
                   <div className={styles.preview}>
                     <div className={styles.imageWrapper}>
@@ -427,6 +433,15 @@ export function CommonStreamerList({
                           <Play size={22} />
                         </m.div>
                       </m.div>
+
+                      {isSwitching ? (
+                        <div className={styles.switchVeil} role="status" aria-live="polite">
+                          <span className={styles.switchChip}>
+                            <Spinner size="sm" />
+                            切换中
+                          </span>
+                        </div>
+                      ) : null}
 
                       <div className={styles.viewerBadge} aria-label={`观看人数 ${room.viewer_count_str || "0"}`}>
                         <span className={styles.viewerPill}>
@@ -451,7 +466,8 @@ export function CommonStreamerList({
                   </div>
                 </Card>
               </m.div>
-            ))}
+              );
+            })}
           </m.div>
         </AnimatePresence>
 
