@@ -255,6 +255,18 @@ export function MainPlayer({
   const loadFailureCountRef = useRef(0);
   const lastLoadKeyRef = useRef<string | null>(null);
 
+  // 音量按直播间记忆：房间一变就要跟着换 key。软切换（switchURL）不重建播放器，
+  // 插件自己发现不了房间变了，于是上一个房间的 key 一直留着——新房间的记忆音量
+  // 用不上，而在新房间里调音量会写进上一个房间的 key（用户看到的就是「调了音量，
+  // 别的直播间也被覆盖」）。放在这里对四个平台的软切换/重建两条路径都生效。
+  useEffect(() => {
+    try {
+      volumePluginRef.current?.setRoomKey?.(`${platform}/${roomId}`);
+    } catch {
+      // ignore
+    }
+  }, [platform, roomId]);
+
   const [isLoadingStream, setIsLoadingStream] = useState(false);
   const [streamError, setStreamError] = useState<string | null>(null);
   const [isOfflineError, setIsOfflineError] = useState(false);
