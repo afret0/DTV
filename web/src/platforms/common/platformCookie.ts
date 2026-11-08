@@ -152,6 +152,16 @@ export const ensurePlatformLoginWindow = async (platform: LoginPlatform): Promis
 
 export const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// capabilities 的 windows 只放行 main，前端关不掉登录窗口，交给 Rust 关。
+export const closeWindowByLabel = async (label: string): Promise<boolean> => {
+  try {
+    return await invoke<boolean>('close_webview_window_by_label', { label });
+  } catch (err) {
+    console.warn(`[login] 关闭登录窗口失败(${label}):`, err);
+    return false;
+  }
+};
+
 // Rust 侧的 cookie 只在进程内存里，解析流地址（含代理续签）时从注册表读。
 // 所以在模块加载时就把 localStorage 里的登录态推回去，避免冷启动第一路流
 // 按游客解析（斗鱼游客只会给到蓝光4M）。

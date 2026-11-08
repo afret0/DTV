@@ -11,6 +11,7 @@ import {
   hasRequiredCookies,
   sleep
 } from "@/platforms/bilibili/cookieHelper";
+import { closeWindowByLabel } from "@/platforms/common/platformCookie";
 
 const STORAGE_KEY = "bilibili_cookie";
 
@@ -129,10 +130,14 @@ export function useBilibiliCookie(options: Options = {}) {
         const result = await getBilibiliCookies([loginWindow.label]);
         if (hasRequiredCookies(result)) {
           persist(result.cookie);
-          try {
-            await loginWindow.close();
-          } catch (closeErr) {
-            console.warn("[BilibiliCookie] Failed to close login window:", closeErr);
+          // 前端对非 main 窗口没有 close 权限，登录窗口要靠 Rust 关。
+          const closedByRust = await closeWindowByLabel(loginWindow.label);
+          if (!closedByRust) {
+            try {
+              await loginWindow.close();
+            } catch (closeErr) {
+              console.warn("[BilibiliCookie] Failed to close login window:", closeErr);
+            }
           }
           return;
         }

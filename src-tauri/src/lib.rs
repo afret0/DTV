@@ -393,6 +393,7 @@ pub fn run_app() {
                 platforms::bilibili::cookie::bootstrap_bilibili_cookie,
                 platforms::common::platform_cookie::get_platform_cookie,
                 platforms::common::platform_cookie::set_platform_cookie,
+                platforms::common::platform_cookie::close_webview_window_by_label,
                 platforms::bilibili::search::search_bilibili_rooms,
                 platforms::huya::search::search_huya_anchors,
                 open_in_default_browser,

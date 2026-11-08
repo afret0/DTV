@@ -297,6 +297,36 @@ pub async fn get_platform_cookie(
     })
 }
 
+/// 前端对非 main 窗口没有 core:window 权限（capabilities 的 windows 只列了 main），
+/// 登录窗口的关闭只能走 Rust 侧，否则扫码完成后窗口会一直挂着。
+#[tauri::command]
+pub fn close_webview_window_by_label(app_handle: AppHandle, label: String) -> bool {
+    let trimmed = label.trim();
+    if trimmed.is_empty() {
+        crate::tl!("web", "[login] skip, 窗口 label 为空不关闭");
+        return false;
+    }
+    let Some(window) = app_handle.get_webview_window(trimmed) else {
+        crate::tl!("web", "[login] skip, 窗口已不存在无需关闭, label: {}", trimmed);
+        return false;
+    };
+    match window.close() {
+        Ok(()) => {
+            crate::tl!("web", "[login] done, 已关闭登录窗口, label: {}", trimmed);
+            true
+        }
+        Err(err) => {
+            crate::tl!(
+                "web",
+                "[login] fail, 关闭登录窗口失败, label: {}, err: {}",
+                trimmed,
+                err
+            );
+            false
+        }
+    }
+}
+
 /// 前端把 localStorage 里的 cookie 推进注册表：Rust 侧解析流地址时直接读，
 /// 同时覆盖代理续签与 relay 这些拿不到前端参数的内部路径。
 #[tauri::command]

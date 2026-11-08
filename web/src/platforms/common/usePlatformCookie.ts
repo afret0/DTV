@@ -4,6 +4,7 @@ import { type UnlistenFn } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
+  closeWindowByLabel,
   ensurePlatformLoginWindow,
   extractLoginFlags,
   getPlatformCookies,
@@ -113,10 +114,14 @@ export function usePlatformCookie(platform: LoginPlatform, options: Options = {}
         const result = await getPlatformCookies(platform);
         if (hasRequiredCookies(result)) {
           persist(result.cookie);
-          try {
-            await loginWindow.close();
-          } catch (closeErr) {
-            console.warn(`[${platform}] 关闭登录窗口失败:`, closeErr);
+          // 登录完成就关窗：前端对非 main 窗口没有 close 权限，走 Rust 兜底。
+          const closedByRust = await closeWindowByLabel(loginWindow.label);
+          if (!closedByRust) {
+            try {
+              await loginWindow.close();
+            } catch (closeErr) {
+              console.warn(`[${platform}] 关闭登录窗口失败:`, closeErr);
+            }
           }
           return;
         }
