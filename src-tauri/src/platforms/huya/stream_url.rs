@@ -9,7 +9,7 @@ use md5::{Digest, Md5};
 use rand::Rng;
 use regex::Regex;
 use reqwest::header::{
-    HeaderMap, HeaderValue, ACCEPT, ORIGIN, REFERER, USER_AGENT,
+    HeaderMap, HeaderValue, ACCEPT, COOKIE, ORIGIN, REFERER, USER_AGENT,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -623,6 +623,10 @@ async fn fetch_profile_room(
     headers.insert(ORIGIN, HeaderValue::from_static("https://www.huya.com"));
     headers.insert(REFERER, HeaderValue::from_static("https://www.huya.com/"));
     headers.insert(USER_AGENT, HeaderValue::from_static(DESKTOP_UA));
+    // 虎牙的可用档位由 profileRoom 下发，带登录态才可能给到更高档。
+    if let Some(cookie) = crate::platforms::common::platform_cookie::header("huya") {
+        headers.insert(COOKIE, cookie);
+    }
 
     let resp = client.get(&url).headers(headers).send().await?;
     let text = resp.text().await?;
@@ -1024,6 +1028,17 @@ pub async fn get_huya_unified_cmd(
             .map(|c| c.cdn.clone())
     );
 
+    crate::tl!(
+        "web",
+        "[huya] 首播取流 room={} quality={:?} availableTiers={:?} ratio={:?} line={:?} loggedIn={}",
+        room_id,
+        quality,
+        available,
+        ratio,
+        preferred_line,
+        crate::platforms::common::platform_cookie::is_logged_in("huya")
+    );
+
     Ok(HuyaUnifiedResponse {
         title: detail.title.clone(),
         nick: detail.nick.clone(),
@@ -1035,6 +1050,7 @@ pub async fn get_huya_unified_cmd(
         selected_url: Some(selected_url),
     })
 }
+
 #[allow(dead_code)]
 const HEARTBEAT_BASE64: &str = "ABQdAAwsNgBM"; // same as Python
 
@@ -1077,6 +1093,17 @@ pub async fn fetch_huya_flv_url(
         candidate.stream_name,
         anti
     ));
+    crate::tl!(
+        "web",
+        "[huya] 取流 room={} quality={:?} availableTiers={:?} ratio={:?} line={:?} cdn={} loggedIn={}",
+        room_id,
+        quality,
+        available,
+        ratio,
+        preferred_line,
+        candidate.cdn,
+        crate::platforms::common::platform_cookie::is_logged_in("huya")
+    );
     Ok(match ratio {
         Some(r) => format!("{}&ratio={}", base_url, r),
         None => base_url,

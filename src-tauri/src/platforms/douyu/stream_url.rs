@@ -116,6 +116,10 @@ impl DouYu {
             "Accept-Language",
             HeaderValue::from_static("zh-CN,zh;q=0.9"),
         );
+        // 登录后斗鱼才兑现 rate=0 原画：匿名 getH5Play 会 rateSwitch 降成蓝光4M。
+        if let Some(cookie) = crate::platforms::common::platform_cookie::header("douyu") {
+            default_headers.insert(reqwest::header::COOKIE, cookie);
+        }
         let client = Client::builder()
             .redirect(Policy::limited(10))
             .no_proxy()
@@ -397,6 +401,31 @@ impl DouYu {
             .and_then(|v| v.as_str())
             .ok_or("No rtmp_live field")?;
         let rtmp_live = decode_html_entities(rtmp_live).to_string();
+        let served_rate = data.get("rate").and_then(value_to_i32);
+        let rate_switch = data.get("rateSwitch").and_then(value_to_i32);
+        crate::tl!(
+            "web",
+            "[douyu] 取流 room={} cdn={} requestedRate={} servedRate={:?} rateSwitch={:?} loggedIn={} file={}",
+            room_id,
+            cdn,
+            rate,
+            served_rate,
+            rate_switch,
+            crate::platforms::common::platform_cookie::is_logged_in("douyu"),
+            rtmp_live.split(['?', '&']).next().unwrap_or("")
+        );
+        if let Some(served) = served_rate {
+            if served != rate {
+                crate::tl!(
+                    "web",
+                    "[douyu] skip, 画质被服务端降档, 判定: 请求 rate != 返回 rate, room: {}, requested: {}, served: {}, rateSwitch: {:?}, 未登录时只给转码档",
+                    room_id,
+                    rate,
+                    served,
+                    rate_switch
+                );
+            }
+        }
         Ok(format!("{}/{}", rtmp_url, rtmp_live))
     }
 

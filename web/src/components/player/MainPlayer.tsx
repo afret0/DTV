@@ -34,6 +34,7 @@ import { fetchAndPrepareDouyinStreamConfig, stopDouyinProxy } from "@/platforms/
 import { getHuyaStreamConfig } from "@/platforms/huya/playerHelper";
 import { getBilibiliStreamConfig, stopBilibiliProxy } from "@/platforms/bilibili/playerHelper";
 import { BilibiliCookieControls } from "@/components/bilibili/BilibiliCookieControls";
+import { PlatformCookieControls } from "@/components/common/PlatformCookieControls";
 import { useDlnaDiscovery } from "@/hooks/useDlnaDiscovery";
 import { CastDialog } from "@/components/player/CastDialog";
 import { useImageProxy } from "@/hooks/useImageProxy";
@@ -1876,6 +1877,18 @@ export function MainPlayer({
                         onCookieChanged={() => {
                           // 登录态一变就按当前档位（默认原画）重新取流：
                           // 登录后 B 站才兑现 1080p 原画。
+                          void reloadStreamRef.current?.("refresh");
+                        }}
+                      />
+                    ) : null}
+                    {platform === Platform.DOUYU || platform === Platform.HUYA ? (
+                      <PlatformCookieControls
+                        platform={platform === Platform.DOUYU ? "douyu" : "huya"}
+                        variant="player"
+                        guestHint={platform === Platform.DOUYU ? "未登录最高蓝光4M" : undefined}
+                        onCookieChanged={() => {
+                          // 登录后按当前档位（默认原画）重新取流：
+                          // 斗鱼游客 getH5Play 会 rateSwitch 降档，带 cookie 才可能兑现原画。
                           void reloadStreamRef.current?.("refresh");
                         }}
                       />

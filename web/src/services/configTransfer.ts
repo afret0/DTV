@@ -19,6 +19,7 @@ export interface DtvConfigPayload {
 const EXACT_EXPORTABLE_KEYS = new Set<string>([
   'bilibili_cookie',
   'danmu_block_keywords',
+  'douyu_cookie',
   'dtv_custom_categories_v1',
   'dtv_danmu_preferences_v1',
   'dtv_player_danmu_collapsed',
@@ -26,6 +27,7 @@ const EXACT_EXPORTABLE_KEYS = new Set<string>([
   'followedStreamers',
   'followFolders',
   'followListOrder',
+  'huya_cookie',
   'theme_preference',
 ]);
 

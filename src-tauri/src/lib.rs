@@ -391,6 +391,8 @@ pub fn run_app() {
                 platforms::bilibili::streamer_info::fetch_bilibili_streamer_info,
                 platforms::bilibili::cookie::get_bilibili_cookie,
                 platforms::bilibili::cookie::bootstrap_bilibili_cookie,
+                platforms::common::platform_cookie::get_platform_cookie,
+                platforms::common::platform_cookie::set_platform_cookie,
                 platforms::bilibili::search::search_bilibili_rooms,
                 platforms::huya::search::search_huya_anchors,
                 open_in_default_browser,

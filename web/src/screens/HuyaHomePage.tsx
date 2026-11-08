@@ -4,6 +4,7 @@ import React, { useMemo, useState } from "react";
 import { m } from "framer-motion";
 
 import { CommonCategory } from "@/components/categories/CommonCategory";
+import { PlatformCookieControls } from "@/components/common/PlatformCookieControls";
 import { CommonStreamerList } from "@/components/streamers/CommonStreamerList";
 import { huyaCategoriesData } from "@/platforms/huya/huyaCategoriesData";
 import type { CategorySelectedEvent } from "@/platforms/common/categoryTypes";
@@ -26,21 +27,24 @@ export function HuyaHomePage() {
           categoriesData={huyaCategoriesData as any}
           onCategorySelected={(e) => setSelected(e)}
           actions={
-            <m.button
-              type="button"
-              className="category-subscribe-btn"
-              disabled={!canSubscribe}
-              whileHover={{ y: -1 }}
-              whileTap={{ scale: 0.98 }}
-              onClick={() => {
-                if (!selected?.cate2Href) return;
-                const href = selected.cate2Href;
-                if (custom.isSubscribed("huya", href)) custom.removeByKey(`huya:${href}`);
-                else custom.addCommonCate2("huya", href, selected.cate2Name, selected.cate1Name, selected.cate1Href);
-              }}
-            >
-              {isSubscribed ? "取消订阅" : "订阅分区"}
-            </m.button>
+            <div style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+              <PlatformCookieControls platform="huya" variant="category" />
+              <m.button
+                type="button"
+                className="category-subscribe-btn"
+                disabled={!canSubscribe}
+                whileHover={{ y: -1 }}
+                whileTap={{ scale: 0.98 }}
+                onClick={() => {
+                  if (!selected?.cate2Href) return;
+                  const href = selected.cate2Href;
+                  if (custom.isSubscribed("huya", href)) custom.removeByKey(`huya:${href}`);
+                  else custom.addCommonCate2("huya", href, selected.cate2Name, selected.cate1Name, selected.cate1Href);
+                }}
+              >
+                {isSubscribed ? "取消订阅" : "订阅分区"}
+              </m.button>
+            </div>
           }
         />
       </div>

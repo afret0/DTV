@@ -5,6 +5,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { m } from "framer-motion";
 
 import { CommonCategory } from "@/components/categories/CommonCategory";
+import { PlatformCookieControls } from "@/components/common/PlatformCookieControls";
 import { CommonStreamerList } from "@/components/streamers/CommonStreamerList";
 import type { Category1 } from "@/platforms/common/categoryTypes";
 import type { CategorySelectedEvent } from "@/platforms/common/categoryTypes";
@@ -174,21 +175,24 @@ export function DouyuHomePage() {
           categoriesData={categories}
           onCategorySelected={(e) => setSelected(e)}
           actions={
-            <m.button
-              type="button"
-              className="category-subscribe-btn"
-              disabled={!canSubscribe || loading}
-              whileHover={{ y: -1 }}
-              whileTap={{ scale: 0.98 }}
-              onClick={() => {
-                if (!selected?.cate2Href) return;
-                const id = selected.cate2Href;
-                if (custom.isSubscribed("douyu", id)) custom.removeByKey(`douyu:${id}`);
-                else custom.addDouyuCate2(id, selected.cate2Name);
-              }}
-            >
-              {isSubscribed ? "取消订阅" : "订阅分区"}
-            </m.button>
+            <div style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+              <PlatformCookieControls platform="douyu" variant="category" />
+              <m.button
+                type="button"
+                className="category-subscribe-btn"
+                disabled={!canSubscribe || loading}
+                whileHover={{ y: -1 }}
+                whileTap={{ scale: 0.98 }}
+                onClick={() => {
+                  if (!selected?.cate2Href) return;
+                  const id = selected.cate2Href;
+                  if (custom.isSubscribed("douyu", id)) custom.removeByKey(`douyu:${id}`);
+                  else custom.addDouyuCate2(id, selected.cate2Name);
+                }}
+              >
+                {isSubscribed ? "取消订阅" : "订阅分区"}
+              </m.button>
+            </div>
           }
         />
         {selected?.cate2Href && cate3List.length > 0 ? (
