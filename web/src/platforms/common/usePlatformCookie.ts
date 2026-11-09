@@ -1,6 +1,5 @@
 "use client";
 
-import { type UnlistenFn } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
@@ -9,6 +8,7 @@ import {
   extractLoginFlags,
   getPlatformCookies,
   hasRequiredCookies,
+  isLoginWindowOpen,
   pushPlatformCookie,
   readStoredPlatformCookie,
   sleep,
@@ -95,26 +95,27 @@ export function usePlatformCookie(platform: LoginPlatform, options: Options = {}
     setError(null);
     setIsLoggingIn(true);
 
-    let unlisten: UnlistenFn | null = null;
     try {
       const loginWindow = await ensurePlatformLoginWindow(platform);
       let windowClosed = false;
-
-      unlisten = await loginWindow.listen("tauri://close-requested", () => {
-        windowClosed = true;
-      });
 
       const timeoutMs = 180_000;
       const intervalMs = 1_500;
       const deadline = Date.now() + timeoutMs;
 
-      while (!windowClosed && Date.now() < deadline) {
+      while (Date.now() < deadline) {
+        // 用户手动关窗只能轮询后端确认；不注册 tauri://close-requested 监听，
+        // 否则 Tauri v2 会自动 prevent_close，登录窗口永远销毁不掉。
+        if (!(await isLoginWindowOpen(loginWindow.label))) {
+          windowClosed = true;
+          break;
+        }
         // 不限定窗口：虎牙/斗鱼的扫码页可能在新 webview 里打开，
         // 全窗口扫一遍才拿得到登录 cookie。
         const result = await getPlatformCookies(platform);
         if (hasRequiredCookies(result)) {
           persist(result.cookie);
-          // 登录完成就关窗：前端对非 main 窗口没有 close 权限，走 Rust 兜底。
+          // 登录完成就关窗：前端对非 main 窗口没有 close 权限，走 Rust 强制 destroy。
           const closedByRust = await closeWindowByLabel(loginWindow.label);
           if (!closedByRust) {
             try {
@@ -137,13 +138,6 @@ export function usePlatformCookie(platform: LoginPlatform, options: Options = {}
       if (mountedRef.current) setError(msg);
       console.error(`[${platform}] 登录失败:`, e);
     } finally {
-      if (unlisten) {
-        try {
-          unlisten();
-        } catch {
-          // ignore
-        }
-      }
       if (mountedRef.current) setIsLoggingIn(false);
     }
   }, [isLoggingIn, persist, platform]);

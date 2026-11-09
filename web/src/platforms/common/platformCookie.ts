@@ -34,9 +34,11 @@ export const PLATFORM_COOKIE_STORAGE_KEY: Record<LoginPlatform, string> = {
 
 // 与 Rust 侧 platforms/common/platform_cookie.rs 的 login_names 保持一致：
 // 这些 cookie 只有登录成功后才会下发，游客没有。
+// 虎牙走 UDB 扫码登录，确认后只下发 yyuid / udb_* 凭据（旧名单
+// huya_nickname/yyb/_mk 实测 37 个登录 cookie 里一个都没有，导致永远判未登录）。
 const LOGIN_COOKIE_NAMES: Record<LoginPlatform, string[]> = {
   douyu: ['acf_uid', 'acf_stk', 'acf_nickname'],
-  huya: ['huya_nickname', 'yyb', '_mk'],
+  huya: ['yyuid', 'udb_uid', 'udb_n', 'udb_cred', 'udb_biztoken'],
 };
 
 const normalizeResult = (platform: LoginPlatform, result: any): PlatformCookieResult => ({
@@ -151,6 +153,19 @@ export const ensurePlatformLoginWindow = async (platform: LoginPlatform): Promis
 };
 
 export const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// 窗口是否还活着只能查后端（getByLabel 走 get_all_webviews）。
+// 不能靠监听 tauri://close-requested 判断用户手动关窗：Tauri v2 里窗口上
+// 只要存在 close-requested 的 JS 监听，就会自动 prevent_close ——
+// Rust close() 和原生 ✕ 都会返回成功但窗口不销毁（斗鱼登录页关不掉的根因）。
+export const isLoginWindowOpen = async (label: string): Promise<boolean> => {
+  try {
+    return (await WebviewWindow.getByLabel(label)) !== null;
+  } catch {
+    // 查询失败时按还在处理，让轮询继续，避免误报「窗口已关闭」。
+    return true;
+  }
+};
 
 // capabilities 的 windows 只放行 main，前端关不掉登录窗口，交给 Rust 关。
 export const closeWindowByLabel = async (label: string): Promise<boolean> => {

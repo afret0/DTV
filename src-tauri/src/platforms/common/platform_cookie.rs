@@ -19,10 +19,12 @@ const DOUYU_SPEC: Spec = Spec {
     login_names: &["acf_uid", "acf_stk", "acf_nickname"],
 };
 
+// 虎牙走 UDB 扫码登录（udblgn.huya.com/qrLgn），确认扫码后 cookie 交换只下发
+// yyuid / udb_* 这组凭据；游客态没有这些名字。
 const HUYA_SPEC: Spec = Spec {
     webview_url: "https://www.huya.com/",
     domain: "huya.com",
-    login_names: &["huya_nickname", "yyb", "_mk"],
+    login_names: &["yyuid", "udb_uid", "udb_n", "udb_cred", "udb_biztoken"],
 };
 
 fn normalize(platform: &str) -> Option<String> {
@@ -282,12 +284,21 @@ pub async fn get_platform_cookie(
         .join("; ");
     let flags = cookie_flags(Some(spec), Some(&cookie));
     let has_required = flags.values().any(|flag| *flag);
+    // 未命中时必须能看到实际取到了哪些名字（名字不是敏感信息），
+    // 否则换 cookie 名单这种问题只能靠猜（虎牙旧名单三个名字实测全不下发）。
+    let names = if has_required {
+        String::from("-")
+    } else {
+        collected.keys().cloned().collect::<Vec<String>>().join(",")
+    };
     crate::tl!(
         "web",
-        "[login] hit, 登录窗口取到 cookie, platform: {}, count: {}, hasRequired: {}",
+        "[login] hit, 登录窗口取到 cookie, platform: {}, count: {}, hasRequired: {}, flags: {:?}, names: {}",
         platform_name,
         collected.len(),
-        has_required
+        has_required,
+        flags,
+        names
     );
     Ok(PlatformCookieResult {
         platform: platform_name,
@@ -299,6 +310,8 @@ pub async fn get_platform_cookie(
 
 /// 前端对非 main 窗口没有 core:window 权限（capabilities 的 windows 只列了 main），
 /// 登录窗口的关闭只能走 Rust 侧，否则扫码完成后窗口会一直挂着。
+/// 必须用 destroy 而不是 close：close 只发 tauri://close-requested，窗口上存在
+/// 任何 JS 监听时 Tauri v2 会自动 prevent_close（命令返回 Ok 但窗口不销毁）。
 #[tauri::command]
 pub fn close_webview_window_by_label(app_handle: AppHandle, label: String) -> bool {
     let trimmed = label.trim();
@@ -310,15 +323,15 @@ pub fn close_webview_window_by_label(app_handle: AppHandle, label: String) -> bo
         crate::tl!("web", "[login] skip, 窗口已不存在无需关闭, label: {}", trimmed);
         return false;
     };
-    match window.close() {
+    match window.destroy() {
         Ok(()) => {
-            crate::tl!("web", "[login] done, 已关闭登录窗口, label: {}", trimmed);
+            crate::tl!("web", "[login] done, 已销毁登录窗口, label: {}", trimmed);
             true
         }
         Err(err) => {
             crate::tl!(
                 "web",
-                "[login] fail, 关闭登录窗口失败, label: {}, err: {}",
+                "[login] fail, 销毁登录窗口失败, label: {}, err: {}",
                 trimmed,
                 err
             );
@@ -374,10 +387,20 @@ mod tests {
         set("huya", Some("PHPSESSID=guest-session".to_string()));
         assert_eq!(value("huya").as_deref(), Some("PHPSESSID=guest-session"));
         assert!(!is_logged_in("huya"));
+        // 旧名单（huya_nickname/yyb/_mk）登录后实测不下发，必须判为未登录。
         set("huya", Some("huya_nickname=%E4%B8%BB%E6%92%AD; yyb=9527".to_string()));
+        assert!(!is_logged_in("huya"));
+        set(
+            "huya",
+            Some("udb_uid=9527; udb_n=%E4%B8%BB%E6%92%AD; guid=abc".to_string()),
+        );
         assert!(is_logged_in("huya"));
         let header = header("huya").expect("percent-encoded value is ascii");
-        assert!(header.to_str().unwrap().contains("huya_nickname=%E4%B8%BB%E6%92%AD"));
+        let text = header.to_str().unwrap().to_string();
+        assert!(text.contains("udb_uid=9527"), "text: {}", text);
+        assert!(text.contains("udb_n=%E4%B8%BB%E6%92%AD"), "text: {}", text);
+        set("huya", Some("yyuid=8888".to_string()));
+        assert!(is_logged_in("huya"));
         set("huya", None);
     }
 }

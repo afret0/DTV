@@ -1,6 +1,5 @@
 "use client";
 
-import { type UnlistenFn } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
@@ -11,7 +10,7 @@ import {
   hasRequiredCookies,
   sleep
 } from "@/platforms/bilibili/cookieHelper";
-import { closeWindowByLabel } from "@/platforms/common/platformCookie";
+import { closeWindowByLabel, isLoginWindowOpen } from "@/platforms/common/platformCookie";
 
 const STORAGE_KEY = "bilibili_cookie";
 
@@ -113,24 +112,25 @@ export function useBilibiliCookie(options: Options = {}) {
     setError(null);
     setIsLoggingIn(true);
 
-    let unlisten: UnlistenFn | null = null;
     try {
       const loginWindow = await ensureBilibiliLoginWindow();
       let windowClosed = false;
-
-      unlisten = await loginWindow.listen("tauri://close-requested", () => {
-        windowClosed = true;
-      });
 
       const timeoutMs = 120_000;
       const intervalMs = 1_500;
       const deadline = Date.now() + timeoutMs;
 
-      while (!windowClosed && Date.now() < deadline) {
+      while (Date.now() < deadline) {
+        // 用户手动关窗只能轮询后端确认；不注册 tauri://close-requested 监听，
+        // 否则 Tauri v2 会自动 prevent_close，登录窗口永远销毁不掉。
+        if (!(await isLoginWindowOpen(loginWindow.label))) {
+          windowClosed = true;
+          break;
+        }
         const result = await getBilibiliCookies([loginWindow.label]);
         if (hasRequiredCookies(result)) {
           persist(result.cookie);
-          // 前端对非 main 窗口没有 close 权限，登录窗口要靠 Rust 关。
+          // 前端对非 main 窗口没有 close 权限，登录窗口要靠 Rust 强制 destroy。
           const closedByRust = await closeWindowByLabel(loginWindow.label);
           if (!closedByRust) {
             try {
@@ -153,13 +153,6 @@ export function useBilibiliCookie(options: Options = {}) {
       if (mountedRef.current) setError(msg);
       console.error("[BilibiliCookie] Login failed:", e);
     } finally {
-      if (unlisten) {
-        try {
-          unlisten();
-        } catch {
-          // ignore
-        }
-      }
       if (mountedRef.current) setIsLoggingIn(false);
     }
   }, [isLoggingIn, persist]);
