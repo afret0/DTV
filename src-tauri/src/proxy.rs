@@ -2567,57 +2567,116 @@ pub async fn start_proxy_inner(
         return Err("Stream URL is not set in store. Cannot start proxy.".to_string());
     }
 
-    let stream_url_data_for_actix = web::Data::new(stream_url_store.clone());
+    let proxy_url = |store: &StreamUrlStore| -> String {
+        let gen = store.generation.load(Ordering::SeqCst);
+        format!("http://127.0.0.1:{}/live.flv?v={}", port, gen)
+    };
 
-    let existing_handle_to_stop = { server_handle.lock().unwrap().take() };
-    if let Some(existing_handle) = existing_handle_to_stop {
-        existing_handle.stop(false).await;
+    // 端口固定的代理服务器改成「常驻 + 健康校验」。历史上每次切房/切画质都会
+    // stop(false) 旧 server 再重绑同一固定端口(34719)：旧 socket 尚未完全释放，
+    // 新 server 的 actix worker 起不来（日志里那句 "A worker exited during
+    // startup"），可 start_proxy 仍旧把这个死端口的 URL 直接返回给播放器 →
+    // 首帧 GET 无人 accept → code=2100「网络错误」，必须等前端 2s 自动重试
+    // 重建代理才播（首次进房间耗时 6s+）。这里两件事修掉它：
+    //   1) 已有活着的 server 直接复用（不再 stop+重绑，天然无竞态）；
+    //   2) 新建 server 后做就绪探测，确认端口真的能 connect 才返回 URL；
+    //      worker 起不来/端口被旧 socket 占用时退避重绑，绝不返回死端口。
+    let handle_present = { server_handle.lock().unwrap().is_some() };
+    if handle_present && TcpStream::connect(("127.0.0.1", port)).is_ok() {
+        let url = proxy_url(&stream_url_store);
+        crate::tl!("proxy", "复用常驻代理服务器: {}", url);
+        return Ok(url);
     }
 
-    let server = match HttpServer::new(move || {
-        let app_data_stream_url = stream_url_data_for_actix.clone();
-        let app_data_reqwest_client = web::Data::new(
-            Client::builder()
-                .no_proxy()
-                .http1_only()
-                .gzip(false)
-                .brotli(false)
-                .no_deflate()
-                .pool_idle_timeout(None)
-                .pool_max_idle_per_host(4)
-                .tcp_keepalive(Duration::from_secs(60))
-                .timeout(Duration::from_secs(7200))
-                .build()
-                .expect("failed to build client"),
-        );
-        App::new()
-            .app_data(app_data_stream_url)
-            .app_data(app_data_reqwest_client)
-            .wrap(actix_cors::Cors::permissive())
-            .route("/live.flv", web::get().to(flv_proxy_handler))
-            .route("/image", web::get().to(image_proxy_handler))
-    })
-    .keep_alive(Duration::from_secs(86400))
-    .bind(("0.0.0.0", port))
-    {
-        Ok(srv) => srv,
-        Err(e) => {
-            return Err(format!("[Rust/proxy.rs] Failed to bind server to port {}: {}", port, e));
+    const MAX_BIND_ATTEMPTS: usize = 4;
+    let mut last_err = String::new();
+    for attempt in 0..MAX_BIND_ATTEMPTS {
+        let stream_url_data_for_actix = web::Data::new(stream_url_store.clone());
+
+        let existing_handle_to_stop = { server_handle.lock().unwrap().take() };
+        if let Some(existing_handle) = existing_handle_to_stop {
+            existing_handle.stop(false).await;
         }
+
+        // 先 bind 再 map 成 actix 的 Server（Send）；非 Send 的 HttpServer 临时值
+        // 在这一步就被 .run() 消费掉，绝不跨越下面的 await 存活。
+        let bind_result = HttpServer::new(move || {
+            let app_data_stream_url = stream_url_data_for_actix.clone();
+            let app_data_reqwest_client = web::Data::new(
+                Client::builder()
+                    .no_proxy()
+                    .http1_only()
+                    .gzip(false)
+                    .brotli(false)
+                    .no_deflate()
+                    .pool_idle_timeout(None)
+                    .pool_max_idle_per_host(4)
+                    .tcp_keepalive(Duration::from_secs(60))
+                    .timeout(Duration::from_secs(7200))
+                    .build()
+                    .expect("failed to build client"),
+            );
+            App::new()
+                .app_data(app_data_stream_url)
+                .app_data(app_data_reqwest_client)
+                .wrap(actix_cors::Cors::permissive())
+                .route("/live.flv", web::get().to(flv_proxy_handler))
+                .route("/image", web::get().to(image_proxy_handler))
+        })
+        .keep_alive(Duration::from_secs(86400))
+        .bind(("0.0.0.0", port))
+        .map(|srv| srv.run());
+
+        let server = match bind_result {
+            Ok(srv) => srv,
+            Err(e) if e.kind() == ErrorKind::AddrInUse => {
+                // 端口还被（刚 stop 或外部残留的）socket 占着：退避后重绑，
+                // 不返回 URL，避免把播放器指向一个正在消失的 server。
+                last_err = format!("port {} AddrInUse", port);
+                crate::tl!("proxy", "端口占用, 退避重绑: attempt={}", attempt);
+                tokio::time::sleep(Duration::from_millis(120)).await;
+                continue;
+            }
+            Err(e) => {
+                return Err(format!("[Rust/proxy.rs] Failed to bind server to port {}: {}", port, e));
+            }
+        };
+
+        let server_handle_for_state = server.handle();
+        *server_handle.lock().unwrap() = Some(server_handle_for_state);
+
+        tauri::async_runtime::spawn(async move {
+            if let Err(e) = server.await {
+                crate::tl!("proxy", "[Rust/proxy.rs] Proxy server run error: {}", e);
+            }
+        });
+
+        // 就绪探测：给 worker 一点时间启动（或暴露启动即退出），确认真能
+        // accept 连接才返回 URL。连不上就说明这次启动失败，退避后重绑。
+        let mut ready = false;
+        for _ in 0..10 {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                ready = true;
+                break;
+            }
+        }
+        if ready {
+            let url = proxy_url(&stream_url_store);
+            crate::tl!("proxy", "代理服务器就绪: attempt={}, url={}", attempt, url);
+            return Ok(url);
+        }
+
+        last_err = format!("proxy server not accepting after spawn (attempt {})", attempt);
+        crate::tl!("proxy", "代理服务器启动后未就绪, 重建: attempt={}", attempt);
+        let dead_handle = { server_handle.lock().unwrap().take() };
+        if let Some(dead) = dead_handle {
+            dead.stop(false).await;
+        }
+        tokio::time::sleep(Duration::from_millis(120)).await;
     }
-    .run();
 
-    let server_handle_for_state = server.handle();
-    *server_handle.lock().unwrap() = Some(server_handle_for_state);
-
-    tauri::async_runtime::spawn(async move {
-        if let Err(e) = server.await {
-            crate::tl!("proxy", "[Rust/proxy.rs] Proxy server run error: {}", e);
-        }
-    });
-
-    let gen = stream_url_store.generation.load(Ordering::SeqCst);
-    Ok(format!("http://127.0.0.1:{}/live.flv?v={}", port, gen))
+    Err(format!("[Rust/proxy.rs] 代理服务器多次启动失败, port {}: {}", port, last_err))
 }
 
 #[tauri::command]
