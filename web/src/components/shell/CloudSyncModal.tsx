@@ -181,7 +181,7 @@ export function CloudSyncPanel({ appVersion }: { appVersion?: string }) {
                     checked={settings.autoSync}
                     onChange={(e) => patch({ autoSync: e.target.checked })}
                   />
-                  自动同步（定时读云端配置，哪个新就覆盖另一个）
+                  自动同步（配置一变就同步，并按设定周期校对云端，哪个新就保留哪个）
                 </label>
                 <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                   <input
@@ -221,6 +221,10 @@ export function CloudSyncPanel({ appVersion }: { appVersion?: string }) {
                 <div className={styles.syncMetaItem}>
                   <span className={styles.syncMetaKey}>上次自动同步</span>
                   <span className={styles.syncMetaVal}>{formatTime(state.lastAutoSyncAt)}</span>
+                </div>
+                <div className={styles.syncMetaItem}>
+                  <span className={styles.syncMetaKey}>上次变更同步</span>
+                  <span className={styles.syncMetaVal}>{formatTime(state.lastChangeSyncAt)}</span>
                 </div>
               </div>
 

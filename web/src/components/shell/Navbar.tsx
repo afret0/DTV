@@ -9,7 +9,7 @@ import { invoke } from "@tauri-apps/api/core";
 
 import styles from "./Navbar.module.css";
 import { LanSyncModal } from "./LanSyncModal";
-import { autoCloudSyncTick } from "@/services/cloudSync";
+import { autoCloudSyncTick, startCloudSyncChangeWatcher } from "@/services/cloudSync";
 import { searchAnchors, type SearchAnchorResult, type SearchPlatform } from "@/services/search";
 import { usePlayerUi } from "@/state/playerUi/PlayerUiProvider";
 import { useFollow, type Platform as FollowPlatform } from "@/state/follow/FollowProvider";
@@ -109,6 +109,10 @@ export function Navbar({
     const id = window.setInterval(tick, 60_000);
     tick();
     return () => window.clearInterval(id);
+  }, [localVersion]);
+
+  useEffect(() => {
+    return startCloudSyncChangeWatcher(() => localVersion || null);
   }, [localVersion]);
 
   const playerUi = usePlayerUi();

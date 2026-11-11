@@ -1,9 +1,29 @@
 import { invoke } from "@tauri-apps/api/core";
 
-import { applyFullLanSyncOverwrite, createLanSyncPayload, LAN_SYNC_KEYS, parseLanSyncPayload, type LanSyncPayload } from "./lanSync";
+import {
+  applyFullLanSyncOverwrite,
+  buildCloudLedgerSections,
+  collectSyncItemValues,
+  createLanSyncPayload,
+  CLOUD_LOCAL_ONLY_KEYS,
+  CLOUD_REV_INCREMENTAL,
+  CLOUD_SYNC_KEYS,
+  parseCloudLedger,
+  notifyConfigMerged,
+  parseLanSyncPayload,
+  reconcileCloudSync,
+  stableConfigFingerprint,
+  type CloudLedger,
+  type LanSyncPayload
+} from "./lanSync";
 
 export const CLOUD_SYNC_SETTINGS_KEY = "dtv_cloud_sync_settings_v1";
 export const CLOUD_SYNC_STATE_KEY = "dtv_cloud_sync_state_v1";
+export const CLOUD_SYNC_LEDGER_KEY = "dtv_cloud_sync_ledger_v1";
+
+export const CHANGE_TRIGGER_KEYS: readonly string[] = CLOUD_SYNC_KEYS;
+
+export const CHANGE_SYNC_DEBOUNCE_MS = 5_000;
 
 export interface OssSettings {
   endpoint: string;
@@ -31,6 +51,7 @@ export interface CloudSyncState {
   lastPushAt: number | null;
   lastPullAt: number | null;
   lastAutoSyncAt: number | null;
+  lastChangeSyncAt: number | null;
   localConfigAt: number | null;
   cloudConfigAt: number | null;
   lastConfigFingerprint: string | null;
@@ -91,6 +112,7 @@ export function loadCloudSyncState(): CloudSyncState {
     lastPushAt: stored?.lastPushAt ?? null,
     lastPullAt: stored?.lastPullAt ?? null,
     lastAutoSyncAt: stored?.lastAutoSyncAt ?? stored?.lastAutoPushAt ?? null,
+    lastChangeSyncAt: stored?.lastChangeSyncAt ?? null,
     localConfigAt: stored?.localConfigAt ?? null,
     cloudConfigAt: stored?.cloudConfigAt ?? null,
     lastConfigFingerprint: stored?.lastConfigFingerprint ?? null,
@@ -109,8 +131,53 @@ function patchState(patch: Partial<CloudSyncState>): CloudSyncState {
   return next;
 }
 
+function loadCloudLedger(): CloudLedger {
+  return parseCloudLedger(readJson<unknown>(CLOUD_SYNC_LEDGER_KEY));
+}
+
+export function saveCloudLedger(ledger: CloudLedger) {
+  if (typeof window === "undefined" || !window.localStorage) return;
+  try {
+    window.localStorage.setItem(CLOUD_SYNC_LEDGER_KEY, JSON.stringify(ledger));
+  } catch {
+  }
+}
+
+function ledgerSeedAt(): number | null {
+  const ledger = loadCloudLedger();
+  const hasItems = Object.values(ledger.items).some((bucket) => Object.keys(bucket).length > 0);
+  if (hasItems) return null;
+  return loadCloudSyncState().localConfigAt;
+}
+
 export function buildCloudPayload(appVersion?: string | null): LanSyncPayload {
-  return createLanSyncPayload(window.localStorage, { client: "desktop", appVersion: appVersion ?? null });
+  const base = createLanSyncPayload(window.localStorage, { client: "desktop", appVersion: appVersion ?? null });
+  for (const localOnlyKey of CLOUD_LOCAL_ONLY_KEYS) delete base.entries[localOnlyKey];
+  const now = Date.now();
+  const { ledger, itemAt, deletions } = buildCloudLedgerSections(loadCloudLedger(), collectSyncItemValues(window.localStorage), now, ledgerSeedAt());
+  saveCloudLedger(ledger);
+  return { ...base, rev: CLOUD_REV_INCREMENTAL, itemAt, deletions };
+}
+
+function applyCloudPayload(payload: LanSyncPayload) {
+  const now = Date.now();
+  const result = reconcileCloudSync(window.localStorage, payload, loadCloudLedger(), now, ledgerSeedAt());
+  saveCloudLedger(result.ledger);
+  return { changed: result.changed, ...result.stats, now };
+}
+
+function reStampLedger(now: number) {
+  const { ledger } = buildCloudLedgerSections(loadCloudLedger(), collectSyncItemValues(window.localStorage), now, ledgerSeedAt());
+  saveCloudLedger(ledger);
+}
+
+function summarizeMerge(stats: { addedItems: number; removedItems: number; replacedItems: number; changedKeys: number; tombstones: number }): string {
+  const parts: string[] = [];
+  if (stats.addedItems) parts.push(`新增 ${stats.addedItems}`);
+  if (stats.replacedItems) parts.push(`覆盖 ${stats.replacedItems}`);
+  if (stats.removedItems) parts.push(`删除 ${stats.removedItems}`);
+  const detail = parts.length ? parts.join("、") : "没有条目变化";
+  return `${detail}；写入 ${stats.changedKeys} 个键，墓碑 ${stats.tombstones} 条`;
 }
 
 export async function cloudSyncPush(appVersion?: string | null): Promise<string> {
@@ -134,6 +201,8 @@ export async function cloudSyncPull(appVersion?: string | null): Promise<string>
   const payload = parseLanSyncPayload(JSON.parse(remote));
   const result = applyFullLanSyncOverwrite(window.localStorage, payload.entries);
   const now = Date.now();
+  reStampLedger(now);
+  notifyConfigMerged({ appliedKeys: result.appliedKeys, removedKeys: result.removedKeys });
   patchState({
     lastPullAt: now,
     localConfigAt: now,
@@ -151,13 +220,7 @@ export async function cloudSyncTest(): Promise<string> {
 }
 
 function configFingerprint(): string {
-  const parts = LAN_SYNC_KEYS.map((key) => `${key}=${window.localStorage.getItem(key) ?? ""}`);
-  let hash = 5381;
-  const text = parts.join("\u0001");
-  for (let i = 0; i < text.length; i += 1) {
-    hash = ((hash << 5) + hash + text.charCodeAt(i)) | 0;
-  }
-  return `${text.length}:${hash}`;
+  return stableConfigFingerprint(window.localStorage);
 }
 
 /** 本地配置内容被改过（指纹变化）时把本地时间戳推到 now，让本机的修改能参与「谁新覆盖谁」。 */
@@ -173,10 +236,74 @@ export function refreshLocalConfigTimestamp(): boolean {
   return true;
 }
 
-/**
- * 自动同步心跳：定时读云端配置，比较云端 exportedAt 与本地时间戳，新的覆盖旧的。
- * 云端新 → 完整覆盖本地；本地新 → 整份推上云；相等或读不到时间戳 → 不动。
- */
+type CloudSyncReason = "interval" | "change";
+
+async function runCloudSyncPass(appVersion: string | null | undefined, reason: CloudSyncReason): Promise<string | null> {
+  const settings = loadCloudSyncSettings();
+  if (!settings.provider || !settings.autoSync) return null;
+
+  const localChanged = refreshLocalConfigTimestamp();
+  const seedLocalAt = loadCloudSyncState().localConfigAt;
+
+  try {
+    const remote = (await invoke<string | null>("cloud_sync_pull", { settings })) as string | null;
+    const now = Date.now();
+    if (!remote) {
+      await cloudSyncPush(appVersion);
+      patchState({ cloudConfigAt: now, lastError: null, ...(reason === "interval" ? { lastAutoSyncAt: now } : { lastChangeSyncAt: now }) });
+      return "云端还没有配置文件，已把本机配置上传";
+    }
+
+    const payload = parseLanSyncPayload(JSON.parse(remote));
+    const cloudAt = Date.parse(payload.exportedAt);
+    const merged = applyCloudPayload(payload);
+
+    if (seedLocalAt == null) {
+      patchState({
+        lastPullAt: now,
+        cloudConfigAt: Number.isFinite(cloudAt) ? cloudAt : null,
+        localConfigAt: Number.isFinite(cloudAt) ? cloudAt : now,
+        lastConfigFingerprint: configFingerprint(),
+        lastError: null,
+        ...(reason === "interval" ? { lastAutoSyncAt: now } : { lastChangeSyncAt: now })
+      });
+      return `本地还没有时间戳，以云端配置时间初始化基线（已增量合并：${summarizeMerge(merged)}）`;
+    }
+
+    const localAt = merged.changed || localChanged ? now : seedLocalAt;
+    patchState({
+      lastPullAt: now,
+      cloudConfigAt: Number.isFinite(cloudAt) ? cloudAt : null,
+      localConfigAt: localAt,
+      lastConfigFingerprint: configFingerprint(),
+      lastError: null,
+      ...(reason === "interval" ? { lastAutoSyncAt: now } : { lastChangeSyncAt: now })
+    });
+
+    if (localAt <= cloudAt) {
+      return merged.changed ? `已合并云端配置：${summarizeMerge(merged)}` : "两端配置一致，无需同步";
+    }
+
+    await cloudSyncPush(appVersion);
+    patchState({ cloudConfigAt: Date.now(), lastError: null });
+    return merged.changed ? `已合并云端配置（${summarizeMerge(merged)}），本机较新已回传云端` : "本机配置更新，已上传云端";
+  } catch (error) {
+    patchState({ lastError: String((error as any)?.message ?? error) });
+    return null;
+  }
+}
+
+let passInFlight: Promise<string | null> | null = null;
+
+function guardedCloudSyncPass(appVersion: string | null | undefined, reason: CloudSyncReason): Promise<string | null> {
+  if (passInFlight) return passInFlight;
+  const run = runCloudSyncPass(appVersion, reason).finally(() => {
+    passInFlight = null;
+  });
+  passInFlight = run;
+  return run;
+}
+
 export async function autoCloudSyncTick(appVersion?: string | null): Promise<string | null> {
   const settings = loadCloudSyncSettings();
   if (!settings.provider || !settings.autoSync) return null;
@@ -184,42 +311,80 @@ export async function autoCloudSyncTick(appVersion?: string | null): Promise<str
   const state = loadCloudSyncState();
   const intervalMs = Math.max(1, Math.round(settings.intervalHours)) * 3_600_000;
   if (Date.now() - (state.lastAutoSyncAt ?? 0) < intervalMs) return null;
-  try {
-    const remote = (await invoke<string | null>("cloud_sync_pull", { settings })) as string | null;
-    const now = Date.now();
-    if (!remote) {
-      await cloudSyncPush(appVersion);
-      patchState({ lastAutoSyncAt: now, cloudConfigAt: now });
-      return "云端还没有配置文件，已把本机配置上传";
+  return guardedCloudSyncPass(appVersion, "interval");
+}
+
+let storageHooksInstalled = false;
+const writeListeners = new Set<() => void>();
+
+function notifyConfigWrite(key: string | null | undefined) {
+  if (!key || !CHANGE_TRIGGER_KEYS.includes(key)) return;
+  for (const listener of writeListeners) listener();
+}
+
+function installStorageHooks() {
+  if (storageHooksInstalled) return;
+  if (typeof window === "undefined" || !window.localStorage) return;
+  const proto = Object.getPrototypeOf(window.localStorage) as Storage | null;
+  if (!proto || typeof proto.setItem !== "function") return;
+  const originalSetItem = proto.setItem;
+  const originalRemoveItem = proto.removeItem;
+  proto.setItem = function (key: string, value: string) {
+    originalSetItem.call(this, key, value);
+    notifyConfigWrite(String(key));
+  };
+  proto.removeItem = function (key: string) {
+    originalRemoveItem.call(this, key);
+    notifyConfigWrite(String(key));
+  };
+  storageHooksInstalled = true;
+}
+
+export function startCloudSyncChangeWatcher(getAppVersion: () => string | null, onResult?: (message: string | null) => void): () => void {
+  if (typeof window === "undefined" || !window.localStorage) return () => {};
+  installStorageHooks();
+
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let rerunPending = false;
+  let stopped = false;
+
+  const schedule = () => {
+    if (stopped || timer != null) return;
+    timer = setTimeout(() => {
+      timer = null;
+      void flush();
+    }, CHANGE_SYNC_DEBOUNCE_MS);
+  };
+
+  const flush = async () => {
+    if (stopped) return;
+    const settings = loadCloudSyncSettings();
+    if (!settings.provider || !settings.autoSync) return;
+    if (passInFlight) {
+      rerunPending = true;
+      return;
     }
-    const payload = parseLanSyncPayload(JSON.parse(remote));
-    const cloudAt = Date.parse(payload.exportedAt);
-    const localAt = loadCloudSyncState().localConfigAt;
-    patchState({ cloudConfigAt: cloudAt });
-    if (localAt == null) {
-      patchState({ lastAutoSyncAt: now, localConfigAt: cloudAt, lastError: null });
-      return "本地还没有时间戳，以云端配置时间初始化基线，本轮不覆盖";
+    try {
+      const message = await guardedCloudSyncPass(getAppVersion(), "change");
+      if (message) onResult?.(message);
+    } catch {
+    } finally {
+      if (rerunPending && !stopped) {
+        rerunPending = false;
+        schedule();
+      }
     }
-    if (cloudAt > localAt) {
-      const result = applyFullLanSyncOverwrite(window.localStorage, payload.entries);
-      patchState({
-        lastPullAt: now,
-        lastAutoSyncAt: now,
-        localConfigAt: now,
-        lastConfigFingerprint: configFingerprint(),
-        lastError: null
-      });
-      return `云端配置更新，已覆盖本机：写入 ${result.appliedKeys} 项、删除 ${result.removedKeys} 项`;
+  };
+
+  const listener = () => schedule();
+  writeListeners.add(listener);
+
+  return () => {
+    stopped = true;
+    writeListeners.delete(listener);
+    if (timer != null) {
+      clearTimeout(timer);
+      timer = null;
     }
-    if (localAt > cloudAt) {
-      await cloudSyncPush(appVersion);
-      patchState({ lastAutoSyncAt: now, cloudConfigAt: now, lastError: null });
-      return "本机配置更新，已上传覆盖云端";
-    }
-    patchState({ lastAutoSyncAt: now, lastError: null });
-    return "两端时间戳一致，无需同步";
-  } catch (error) {
-    patchState({ lastError: String((error as any)?.message ?? error) });
-    return null;
-  }
+  };
 }

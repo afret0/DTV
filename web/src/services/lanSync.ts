@@ -16,6 +16,19 @@ export const LAN_SYNC_KEYS = [
 
 type LanSyncKey = (typeof LAN_SYNC_KEYS)[number];
 
+export const CLOUD_LOCAL_ONLY_KEYS = ["dtv_player_volume_v1", "dtv_player_volume_room_v1"] as const;
+
+export const CLOUD_SYNC_KEYS: readonly LanSyncKey[] = LAN_SYNC_KEYS.filter(
+  (key) => !CLOUD_LOCAL_ONLY_KEYS.includes(key as (typeof CLOUD_LOCAL_ONLY_KEYS)[number])
+);
+
+export const CONFIG_MERGED_EVENT = "dtv-config-merged";
+
+export function notifyConfigMerged(detail: Record<string, number> = {}): void {
+  if (typeof window === "undefined") return;
+  window.dispatchEvent(new CustomEvent(CONFIG_MERGED_EVENT, { detail }));
+}
+
 type ConfigSource = {
   appVersion?: string | null;
   client: string;
@@ -23,12 +36,21 @@ type ConfigSource = {
 
 export type PortableEntries = Record<string, string>;
 
+export const CLOUD_REV_LEGACY = 1 as const;
+export const CLOUD_REV_INCREMENTAL = 2 as const;
+
+export type CloudItemStamp = { id: string; at: number };
+export type CloudItemStamps = Record<string, CloudItemStamp[]>;
+
 export interface LanSyncPayload {
   kind: typeof LAN_SYNC_KIND;
   version: typeof LAN_SYNC_VERSION;
   exportedAt: string;
   source: ConfigSource;
   entries: PortableEntries;
+  rev?: number;
+  itemAt?: CloudItemStamps;
+  deletions?: CloudItemStamps;
 }
 
 export interface LanSyncSummary {
@@ -165,6 +187,9 @@ export function parseLanSyncPayload(raw: unknown): LanSyncPayload {
     entries[key] = value;
   });
 
+  const itemAt = parseItemStamps(raw.itemAt);
+  const deletions = parseItemStamps(raw.deletions);
+
   return {
     kind: LAN_SYNC_KIND,
     version: LAN_SYNC_VERSION,
@@ -173,8 +198,28 @@ export function parseLanSyncPayload(raw: unknown): LanSyncPayload {
       client: raw.source.client,
       appVersion: typeof raw.source.appVersion === "string" ? raw.source.appVersion : null
     },
-    entries
+    entries,
+    rev: typeof raw.rev === "number" && Number.isFinite(raw.rev) ? raw.rev : CLOUD_REV_LEGACY,
+    itemAt,
+    deletions
   };
+}
+
+function parseItemStamps(raw: unknown): CloudItemStamps {
+  const out: CloudItemStamps = {};
+  if (!isRecord(raw)) return out;
+  for (const [key, list] of Object.entries(raw)) {
+    if (!CLOUD_SYNC_KEYS.includes(key as LanSyncKey) || !Array.isArray(list)) continue;
+    const stamps: CloudItemStamp[] = [];
+    for (const item of list) {
+      if (!isRecord(item)) continue;
+      const id = typeof item.id === "string" ? item.id : "";
+      const at = typeof item.at === "number" && Number.isFinite(item.at) ? Math.max(0, item.at) : 0;
+      stamps.push({ id, at });
+    }
+    out[key] = stamps;
+  }
+  return out;
 }
 
 type FollowPlatform = "DOUYU" | "DOUYIN" | "HUYA" | "BILIBILI";
@@ -502,4 +547,411 @@ export function applyFullLanSyncOverwrite(storage: Storage, remoteEntries: Porta
     }
   }
   return { appliedKeys, removedKeys };
+}
+
+export const CLOUD_TOMBSTONE_TTL_MS = 180 * 24 * 3600 * 1000;
+
+const STREAMER_SIG_FIELDS = ["id", "platform", "nickname", "avatarUrl", "currentRoomId"] as const;
+const WHOLE_VALUE_SIG = "__whole__";
+const DANMU_PREFERENCES_KEY = "dtv_danmu_preferences_v1";
+const COLLECTION_KEYS = ["followedStreamers", "followFolders", "dtv_custom_categories_v1", "danmu_block_keywords"] as const;
+
+const stringify = (value: unknown): string => {
+  if (value === undefined) return "";
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value) ?? "";
+  } catch {
+    return "";
+  }
+};
+
+function stableSignature(value: unknown): string {
+  if (value === null || value === undefined) return "";
+  if (typeof value !== "object") return String(value);
+  if (Array.isArray(value)) return `[${value.map(stableSignature).join(",")}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .sort()
+    .map((k) => `${k}:${stableSignature(record[k])}`)
+    .join(",")}}`;
+}
+
+function itemSignature(storageKey: string, itemId: string, value: unknown): string {
+  if (storageKey === "followedStreamers") {
+    const record = (isRecord(value) ? value : {}) as Partial<FollowedStreamer>;
+    return stableSignature(STREAMER_SIG_FIELDS.map((field) => stringify(record[field])));
+  }
+  if (storageKey === "followFolders") {
+    const record = (isRecord(value) ? value : {}) as Partial<FollowFolder>;
+    const ids = uniqPreserveOrder((Array.isArray(record.streamerIds) ? record.streamerIds : []).map((x) => normalizeStreamerKey(String(x)).key));
+    return stableSignature({ name: String(record.name ?? ""), ids });
+  }
+  if (storageKey === DANMU_PREFERENCES_KEY && itemId.includes(".")) return stableSignature(value);
+  if (storageKey === "followListOrder") {
+    return stringify(
+      safeParseJsonArray<FollowListItem>(stringify(value)).map((item) =>
+        item?.type === "folder" ? `folder:${String(item?.data?.id || "")}` : `streamer:${normalizeStreamerKey(`${item?.data?.platform}:${item?.data?.id}`).key}`
+      )
+    );
+  }
+  return stableSignature(value);
+}
+
+export function collectSyncItemValues(storage: Storage): Record<string, Record<string, unknown>> {
+  return collectSyncItemValuesFrom((key) => storage.getItem(key));
+}
+
+export function collectSyncItemValuesFromEntries(entries: PortableEntries): Record<string, Record<string, unknown>> {
+  return collectSyncItemValuesFrom((key) => entries[key] ?? null);
+}
+
+export function stableConfigFingerprint(storage: Storage = localStorage): string {
+  const values = collectSyncItemValues(storage);
+  const parts: string[] = [];
+  for (const key of CLOUD_SYNC_KEYS) {
+    const pairs = Object.entries(values[key] ?? {}).sort((left, right) => left[0].localeCompare(right[0]));
+    for (const [id, value] of pairs) parts.push(`${key}/${id}=${itemSignature(key, id, value)}`);
+  }
+  const text = parts.join("\u0000");
+  let hash = 5381;
+  for (let i = 0; i < text.length; i += 1) {
+    hash = ((hash << 5) + hash + text.charCodeAt(i)) | 0;
+  }
+  return `${text.length}:${hash}`;
+}
+
+function collectSyncItemValuesFrom(getItem: (key: string) => string | null): Record<string, Record<string, unknown>> {
+  const values: Record<string, Record<string, unknown>> = {};
+  for (const key of CLOUD_SYNC_KEYS) {
+    const raw = getItem(key);
+    if (raw == null) continue;
+    const bucket: Record<string, unknown> = {};
+    if (key === "followedStreamers") {
+      for (const s of safeParseJsonArray<FollowedStreamer>(raw)) {
+        if (!s?.id) continue;
+        const platform = normalizeStreamerKey(`${String(s.platform || "").toUpperCase()}:${s.id}`).platform;
+        if (!isKnownPlatform(platform)) continue;
+        bucket[normalizeStreamerKey(`${platform}:${s.id}`).key] = s;
+      }
+    } else if (key === "followFolders") {
+      for (const f of safeParseJsonArray<FollowFolder>(raw)) {
+        if (!f?.id) continue;
+        bucket[String(f.id)] = f;
+      }
+    } else if (key === "dtv_custom_categories_v1") {
+      for (const c of safeParseJsonArray<{ key?: unknown }>(raw)) {
+        const id = String((c as any)?.key ?? "").trim();
+        if (!id) continue;
+        bucket[id] = c;
+      }
+    } else if (key === "danmu_block_keywords") {
+      for (const kw of normalizeDanmuBlockKeywords(safeParseJsonArray<string>(raw))) bucket[kw] = kw;
+    } else if (key === DANMU_PREFERENCES_KEY) {
+      const prefs = safeParseJsonObject(raw);
+      if (!prefs) continue;
+      for (const [field, fieldValue] of Object.entries(prefs)) {
+        if (field === "settings" && isRecord(fieldValue)) {
+          for (const [name, nested] of Object.entries(fieldValue)) bucket[`settings.${name}`] = nested;
+          continue;
+        }
+        bucket[field] = fieldValue;
+      }
+    } else {
+      bucket[WHOLE_VALUE_SIG] = raw;
+    }
+    if (Object.keys(bucket).length) values[key] = bucket;
+  }
+  return values;
+}
+
+export type CloudLedgerItem = { at: number; sig: string };
+export type CloudLedger = {
+  items: Record<string, Record<string, CloudLedgerItem>>;
+  deletions: Record<string, Record<string, number>>;
+};
+
+function emptyCloudLedger(): CloudLedger {
+  return { items: {}, deletions: {} };
+}
+
+export function parseCloudLedger(raw: unknown): CloudLedger {
+  const ledger = emptyCloudLedger();
+  if (!isRecord(raw)) return ledger;
+  if (isRecord(raw.items)) {
+    for (const [key, bucket] of Object.entries(raw.items)) {
+      if (!CLOUD_SYNC_KEYS.includes(key as LanSyncKey) || !isRecord(bucket)) continue;
+      const items: Record<string, CloudLedgerItem> = {};
+      for (const [id, value] of Object.entries(bucket)) {
+        if (typeof value === "number") {
+          items[id] = { at: value, sig: "" };
+          continue;
+        }
+        if (!isRecord(value)) continue;
+        items[id] = { at: typeof value.at === "number" && Number.isFinite(value.at) ? value.at : 0, sig: typeof value.sig === "string" ? value.sig : "" };
+      }
+      ledger.items[key] = items;
+    }
+  }
+  if (isRecord(raw.deletions)) {
+    for (const [key, bucket] of Object.entries(raw.deletions)) {
+      if (!CLOUD_SYNC_KEYS.includes(key as LanSyncKey) || !isRecord(bucket)) continue;
+      const deletions: Record<string, number> = {};
+      for (const [id, at] of Object.entries(bucket)) {
+        deletions[id] = typeof at === "number" && Number.isFinite(at) ? at : 0;
+      }
+      ledger.deletions[key] = deletions;
+    }
+  }
+  return ledger;
+}
+
+function stampsToMap(stamps: CloudItemStamp[] | undefined): Map<string, number> {
+  const map = new Map<string, number>();
+  for (const stamp of stamps ?? []) {
+    if (!stamp?.id) continue;
+    const at = typeof stamp.at === "number" && Number.isFinite(stamp.at) ? stamp.at : 0;
+    const prev = map.get(stamp.id);
+    map.set(stamp.id, prev == null ? at : Math.max(prev, at));
+  }
+  return map;
+}
+
+function pruneTombstones(deletions: Record<string, number>, now: number) {
+  const kept: Record<string, number> = {};
+  for (const [id, at] of Object.entries(deletions)) {
+    if (now - at > CLOUD_TOMBSTONE_TTL_MS) continue;
+    kept[id] = at;
+  }
+  return kept;
+}
+
+function stampLedger(
+  ledger: CloudLedger,
+  localValues: Record<string, Record<string, unknown>>,
+  now: number,
+  seedAt: number | null
+): CloudLedger {
+  const next: CloudLedger = { items: {}, deletions: {} };
+  for (const key of CLOUD_SYNC_KEYS) {
+    const bucket = localValues[key] ?? {};
+    const prevItems = ledger.items[key] ?? {};
+    const items: Record<string, CloudLedgerItem> = {};
+    for (const [id, value] of Object.entries(bucket)) {
+      const sig = itemSignature(key, id, value);
+      const prev = prevItems[id];
+      items[id] = prev && prev.sig === sig ? { at: prev.at, sig } : { at: prev ? now : (seedAt ?? now), sig };
+    }
+    next.items[key] = items;
+
+    const prevDeletions = ledger.deletions[key] ?? {};
+    const deletions: Record<string, number> = { ...prevDeletions };
+    for (const id of Object.keys(prevItems)) {
+      if (id in bucket) continue;
+      if (!(id in deletions)) deletions[id] = now;
+    }
+    for (const [id, at] of Object.entries(deletions)) {
+      const item = items[id];
+      if (item && item.at > at) delete deletions[id];
+    }
+    next.deletions[key] = pruneTombstones(deletions, now);
+  }
+  return next;
+}
+
+export function buildCloudLedgerSections(ledger: CloudLedger, localValues: Record<string, Record<string, unknown>>, now: number, seedAt: number | null) {
+  const next = stampLedger(ledger, localValues, now, seedAt);
+  const itemAt: CloudItemStamps = {};
+  const deletions: CloudItemStamps = {};
+  for (const key of CLOUD_SYNC_KEYS) {
+    const stamps = Object.entries(next.items[key] ?? {}).map(([id, item]) => ({ id, at: item.at }));
+    if (stamps.length) itemAt[key] = stamps;
+    const tombstones = Object.entries(next.deletions[key] ?? {}).map(([id, at]) => ({ id, at }));
+    if (tombstones.length) deletions[key] = tombstones;
+  }
+  return { ledger: next, itemAt, deletions };
+}
+
+function rebuildFollowOrder(order: FollowListItem[], folders: FollowFolder[], streamers: FollowedStreamer[]): FollowListItem[] {
+  const folderedKeys = new Set<string>(folders.flatMap((f) => (f?.streamerIds ?? []).map((x) => normalizeStreamerKey(String(x)).key)));
+  const streamerByKey = new Map<string, FollowedStreamer>(streamers.map((s) => [normalizeStreamerKey(`${s.platform}:${s.id}`).key, s]));
+  const next: FollowListItem[] = [];
+  const seen = new Set<string>();
+
+  for (const item of order) {
+    if (item?.type === "folder") {
+      const id = String(item?.data?.id || "");
+      if (!id || seen.has(`folder:${id}`)) continue;
+      const folder = folders.find((f) => String(f?.id || "") === id);
+      if (!folder) continue;
+      seen.add(`folder:${id}`);
+      next.push({ type: "folder", data: folder });
+      continue;
+    }
+    if (item?.type !== "streamer") continue;
+    const key = normalizeStreamerKey(`${item?.data?.platform}:${item?.data?.id}`).key;
+    if (!key || seen.has(`streamer:${key}`) || folderedKeys.has(key)) continue;
+    const streamer = streamerByKey.get(key);
+    if (!streamer) continue;
+    seen.add(`streamer:${key}`);
+    next.push({ type: "streamer", data: streamer });
+  }
+
+  for (const folder of folders) {
+    const id = String(folder?.id || "");
+    if (!id || seen.has(`folder:${id}`)) continue;
+    seen.add(`folder:${id}`);
+    next.push({ type: "folder", data: folder });
+  }
+  for (const streamer of streamers) {
+    const key = normalizeStreamerKey(`${streamer.platform}:${streamer.id}`).key;
+    if (seen.has(`streamer:${key}`) || folderedKeys.has(key)) continue;
+    seen.add(`streamer:${key}`);
+    next.push({ type: "streamer", data: streamer });
+  }
+  return next;
+}
+
+const WHOLE_VALUE_KEYS = ["followListOrder", "dtv_player_volume_v1", "dtv_player_volume_room_v1"] as const;
+
+function serializeMergedKey(
+  key: string,
+  merged: Record<string, unknown>,
+  mergedByKey: Record<string, Record<string, unknown>>,
+  previousRaw: string | null
+): string | null {
+  const isEmpty = !Object.keys(merged).length;
+  if (key === DANMU_PREFERENCES_KEY) {
+    if (isEmpty) return previousRaw == null ? null : "{}";
+    const prefs: Record<string, unknown> = {};
+    const settings: Record<string, unknown> = {};
+    for (const [id, value] of Object.entries(merged)) {
+      if (id.startsWith("settings.")) settings[id.slice("settings.".length)] = value;
+      else prefs[id] = value;
+    }
+    if (Object.keys(settings).length) prefs.settings = settings;
+    return JSON.stringify(prefs);
+  }
+  if (key === "followListOrder") {
+    const rawOrder = typeof merged[WHOLE_VALUE_SIG] === "string" ? (merged[WHOLE_VALUE_SIG] as string) : null;
+    const folders = Object.values(mergedByKey["followFolders"] ?? {}).filter((f): f is FollowFolder => !!f) as FollowFolder[];
+    const streamers = Object.values(mergedByKey["followedStreamers"] ?? {}).filter((s): s is FollowedStreamer => !!s) as FollowedStreamer[];
+    const rebuilt = rebuildFollowOrder(safeParseJsonArray<FollowListItem>(rawOrder), folders, streamers);
+    if (!rebuilt.length && previousRaw == null) return null;
+    return JSON.stringify(rebuilt);
+  }
+  if (WHOLE_VALUE_KEYS.includes(key as (typeof WHOLE_VALUE_KEYS)[number])) {
+    const whole = merged[WHOLE_VALUE_SIG];
+    return typeof whole === "string" && whole.length ? whole : null;
+  }
+  if (isEmpty) return previousRaw == null ? null : "[]";
+  if (key === "danmu_block_keywords") return JSON.stringify(normalizeDanmuBlockKeywords(Object.keys(merged)));
+  return JSON.stringify(Object.values(merged).filter((v) => v !== undefined));
+}
+
+export type CloudReconcileResult = {
+  changed: boolean;
+  ledger: CloudLedger;
+  stats: { addedItems: number; removedItems: number; replacedItems: number; changedKeys: number; tombstones: number };
+};
+
+export function reconcileCloudSync(
+  storage: Storage,
+  payload: LanSyncPayload,
+  ledger: CloudLedger,
+  now: number,
+  seedAt: number | null = null
+): CloudReconcileResult {
+  const localValues = collectSyncItemValues(storage);
+  const remoteValues = collectSyncItemValuesFromEntries(payload.entries);
+
+  const nextLedger: CloudLedger = { items: {}, deletions: {} };
+  const mergedByKey: Record<string, Record<string, unknown>> = {};
+  let addedItems = 0;
+  let removedItems = 0;
+  let replacedItems = 0;
+  let tombstones = 0;
+
+  for (const key of CLOUD_SYNC_KEYS) {
+    const local = localValues[key] ?? {};
+    const remote = remoteValues[key] ?? {};
+    const remoteAt = stampsToMap(payload.itemAt?.[key]);
+    const prevItems = ledger.items[key] ?? {};
+
+    const mergedDeletions: Record<string, number> = { ...(ledger.deletions[key] ?? {}) };
+    for (const stamp of payload.deletions?.[key] ?? []) {
+      if (!stamp?.id) continue;
+      mergedDeletions[stamp.id] = Math.max(mergedDeletions[stamp.id] ?? 0, typeof stamp.at === "number" && Number.isFinite(stamp.at) ? stamp.at : 0);
+    }
+
+    const mergedItems: Record<string, CloudLedgerItem> = {};
+    const merged: Record<string, unknown> = {};
+
+    for (const id of new Set([...Object.keys(local), ...Object.keys(remote), ...Object.keys(prevItems)])) {
+      const hasLocal = id in local;
+      const hasRemote = id in remote;
+      const prevAt = prevItems[id]?.at ?? 0;
+      const localAt = hasLocal ? (prevAt > 0 ? prevAt : (seedAt ?? now)) : 0;
+      const remoteItemAt = remoteAt.get(id) ?? 0;
+      const tombstoneAt = mergedDeletions[id] ?? 0;
+
+      if (!hasLocal && !hasRemote) continue;
+
+      const blocked = tombstoneAt > 0 && (hasLocal ? localAt <= tombstoneAt : true) && (!hasRemote || remoteItemAt <= tombstoneAt);
+      if (blocked) {
+        if (hasLocal) removedItems += 1;
+        mergedDeletions[id] = tombstoneAt;
+        continue;
+      }
+
+      const winnerIsRemote = hasRemote && (!hasLocal || remoteItemAt > localAt);
+      const value = winnerIsRemote ? remote[id] : local[id];
+      const at = Math.max(winnerIsRemote ? remoteItemAt : 0, localAt);
+      merged[id] = value;
+      mergedItems[id] = { at, sig: itemSignature(key, id, value) };
+      delete mergedDeletions[id];
+      if (winnerIsRemote) {
+        if (hasLocal) replacedItems += 1;
+        else addedItems += 1;
+      }
+    }
+
+    for (const id of Object.keys(prevItems)) {
+      if (id in mergedItems || id in mergedDeletions) continue;
+      mergedDeletions[id] = now;
+      removedItems += 1;
+    }
+
+    nextLedger.items[key] = mergedItems;
+    nextLedger.deletions[key] = pruneTombstones(mergedDeletions, now);
+    tombstones += Object.keys(nextLedger.deletions[key]).length;
+    mergedByKey[key] = merged;
+  }
+
+  let changedKeys = 0;
+  for (const key of CLOUD_SYNC_KEYS) {
+    const previousRaw = storage.getItem(key);
+    const nextRaw = serializeMergedKey(key, mergedByKey[key] ?? {}, mergedByKey, previousRaw);
+    if (nextRaw == null) {
+      if (previousRaw != null) {
+        storage.removeItem(key);
+        changedKeys += 1;
+      }
+      continue;
+    }
+    if (previousRaw !== nextRaw) {
+      storage.setItem(key, nextRaw);
+      changedKeys += 1;
+    }
+  }
+
+  const changed = addedItems + removedItems + replacedItems + changedKeys > 0;
+
+  if (changed) notifyConfigMerged({ addedItems, removedItems, replacedItems, changedKeys });
+
+  return {
+    changed,
+    ledger: nextLedger,
+    stats: { addedItems, removedItems, replacedItems, changedKeys, tombstones }
+  };
 }

@@ -25,6 +25,7 @@ import {
   sanitizeDanmuArea,
   sanitizeDanmuOpacity
 } from "@/components/player/constants";
+import { CONFIG_MERGED_EVENT } from "@/services/lanSync";
 import { arrangeControlClusters } from "@/components/player/controlLayout";
 import { Platform } from "@/platforms/common/types";
 
@@ -368,8 +369,21 @@ export function MainPlayer({
       });
     };
 
+    const onConfigMerged = () => {
+      const stored = loadDanmuPreferences();
+      if (stored) {
+        setIsDanmuEnabled(stored.enabled);
+        setDanmuSettings(stored.settings);
+      }
+      onKeywordsChanged();
+    };
+
     window.addEventListener(DANMU_BLOCK_KEYWORDS_CHANGED_EVENT, onKeywordsChanged as EventListener);
-    return () => window.removeEventListener(DANMU_BLOCK_KEYWORDS_CHANGED_EVENT, onKeywordsChanged as EventListener);
+    window.addEventListener(CONFIG_MERGED_EVENT, onConfigMerged as EventListener);
+    return () => {
+      window.removeEventListener(DANMU_BLOCK_KEYWORDS_CHANGED_EVENT, onKeywordsChanged as EventListener);
+      window.removeEventListener(CONFIG_MERGED_EVENT, onConfigMerged as EventListener);
+    };
   }, []);
 
   const [chromeVisible, setChromeVisible] = useState(true);

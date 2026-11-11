@@ -2,6 +2,8 @@
 
 import React, { createContext, useContext, useEffect, useMemo, useState } from "react";
 
+import { CONFIG_MERGED_EVENT } from "@/services/lanSync";
+
 export type CustomPlatform = "douyu" | "douyin" | "huya" | "bilibili";
 
 export interface CustomCategoryEntry {
@@ -57,6 +59,12 @@ export function CustomCategoriesProvider({ children }: { children: React.ReactNo
   useEffect(() => {
     setEntries(loadEntries());
     setHydrated(true);
+  }, []);
+
+  useEffect(() => {
+    const onConfigMerged = () => setEntries(loadEntries());
+    window.addEventListener(CONFIG_MERGED_EVENT, onConfigMerged);
+    return () => window.removeEventListener(CONFIG_MERGED_EVENT, onConfigMerged);
   }, []);
 
   useEffect(() => {

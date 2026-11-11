@@ -3,6 +3,8 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { v4 as uuidv4 } from "uuid";
 
+import { CONFIG_MERGED_EVENT } from "@/services/lanSync";
+
 export type Platform = "DOUYU" | "DOUYIN" | "HUYA" | "BILIBILI";
 
 export type FollowedStreamer = {
@@ -131,7 +133,7 @@ export function FollowProvider({ children }: { children: React.ReactNode }) {
 
   const folders = useMemo(() => listOrder.filter((x): x is { type: "folder"; data: FollowFolder } => x.type === "folder").map((x) => x.data), [listOrder]);
 
-  useEffect(() => {
+  const hydrateFromStorage = useCallback(() => {
     const follows = loadJson<FollowedStreamer[]>("followedStreamers", []);
     const loadedFolders = loadJson<FollowFolder[]>("followFolders", []);
     const loadedOrder = loadJson<FollowListItem[]>("followListOrder", []);
@@ -190,6 +192,16 @@ export function FollowProvider({ children }: { children: React.ReactNode }) {
     setListOrder(normalizeListOrder(nextOrder));
     setHydrated(true);
   }, []);
+
+  useEffect(() => {
+    hydrateFromStorage();
+  }, [hydrateFromStorage]);
+
+  useEffect(() => {
+    const onConfigMerged = () => hydrateFromStorage();
+    window.addEventListener(CONFIG_MERGED_EVENT, onConfigMerged);
+    return () => window.removeEventListener(CONFIG_MERGED_EVENT, onConfigMerged);
+  }, [hydrateFromStorage]);
 
   useEffect(() => {
     if (!hydrated) return;
