@@ -2,12 +2,14 @@
 
 import React, { useCallback, useEffect, useState } from "react";
 import { CloudDownload, CloudUpload, PlugZap } from "lucide-react";
+import { invoke } from "@tauri-apps/api/core";
 
 import styles from "./Navbar.module.css";
 import {
   cloudSyncPull,
   cloudSyncPush,
   cloudSyncTest,
+  HEARTBEAT_MIN_HOURS,
   loadCloudSyncSettings,
   loadCloudSyncState,
   saveCloudSyncSettings,
@@ -82,6 +84,9 @@ export function CloudSyncPanel({ appVersion }: { appVersion?: string }) {
               ? await cloudSyncPush(appVersion)
               : await cloudSyncPull(appVersion);
         setMessage(result);
+        invoke("frontend_log", {
+          msg: `[cloud] done, 手动${kind === "push" ? "上传云端" : kind === "pull" ? "从云端覆盖本机" : "连通性测试"}完成, result: ${result}`
+        }).catch(() => {});
         setState(loadCloudSyncState());
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
@@ -181,23 +186,23 @@ export function CloudSyncPanel({ appVersion }: { appVersion?: string }) {
                     checked={settings.autoSync}
                     onChange={(e) => patch({ autoSync: e.target.checked })}
                   />
-                  自动同步（配置一变就同步，并按设定周期校对云端，哪个新就保留哪个）
+                  自动同步（配置有实际变动才上传，内容没变不发请求；并按设定周期校对云端，哪个新就保留哪个）
                 </label>
                 <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                   <input
                     className={styles.syncInput}
                     style={{ width: 88 }}
                     type="number"
-                    min={1}
+                    min={HEARTBEAT_MIN_HOURS}
                     step={1}
                     value={settings.intervalHours}
                     disabled={!settings.autoSync}
                     onChange={(e) => {
                       const hours = Number(e.target.value);
-                      patch({ intervalHours: Number.isFinite(hours) && hours >= 1 ? Math.floor(hours) : 1 });
+                      patch({ intervalHours: Number.isFinite(hours) && hours >= HEARTBEAT_MIN_HOURS ? Math.floor(hours) : HEARTBEAT_MIN_HOURS });
                     }}
                   />
-                  <span className={styles.syncMetaKey}>小时同步一次</span>
+                  <span className={styles.syncMetaKey}>小时校对一次（最少 {HEARTBEAT_MIN_HOURS} 小时，校对只在云端有别人设备的新配置时才上传）</span>
                 </div>
               </div>
 

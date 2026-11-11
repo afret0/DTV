@@ -24,6 +24,23 @@ export const CLOUD_SYNC_KEYS: readonly LanSyncKey[] = LAN_SYNC_KEYS.filter(
 
 export const CONFIG_MERGED_EVENT = "dtv-config-merged";
 
+const silentWriteKeys = new Set<string>();
+
+/** 合并写回属于同步自己的产物，不该再被当成一次用户改动而触发新一轮同步。 */
+export function isSilentWrite(key: string): boolean {
+  return silentWriteKeys.has(key);
+}
+
+function silentWrite(storage: Storage, key: string, raw: string | null) {
+  silentWriteKeys.add(key);
+  try {
+    if (raw == null) storage.removeItem(key);
+    else storage.setItem(key, raw);
+  } finally {
+    silentWriteKeys.delete(key);
+  }
+}
+
 export function notifyConfigMerged(detail: Record<string, number> = {}): void {
   if (typeof window === "undefined") return;
   window.dispatchEvent(new CustomEvent(CONFIG_MERGED_EVENT, { detail }));
@@ -934,13 +951,13 @@ export function reconcileCloudSync(
     const nextRaw = serializeMergedKey(key, mergedByKey[key] ?? {}, mergedByKey, previousRaw);
     if (nextRaw == null) {
       if (previousRaw != null) {
-        storage.removeItem(key);
+        silentWrite(storage, key, null);
         changedKeys += 1;
       }
       continue;
     }
     if (previousRaw !== nextRaw) {
-      storage.setItem(key, nextRaw);
+      silentWrite(storage, key, nextRaw);
       changedKeys += 1;
     }
   }

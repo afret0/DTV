@@ -91,8 +91,12 @@ export const persistDanmuBlockKeywords = (keywords: string[]): void => {
     return;
   }
   const next = keywords.filter((v) => typeof v === 'string' && v.trim().length > 0).map((v) => v.trim());
+  const nextRaw = JSON.stringify(next);
   try {
-    window.localStorage.setItem(DANMU_BLOCK_KEYWORDS_STORAGE_KEY, JSON.stringify(next));
+    // 进直播间的挂载会用同一份关键词重复写一次，内容没变就别落盘（否则误触发云同步），事件照常派发。
+    if (window.localStorage.getItem(DANMU_BLOCK_KEYWORDS_STORAGE_KEY) !== nextRaw) {
+      window.localStorage.setItem(DANMU_BLOCK_KEYWORDS_STORAGE_KEY, nextRaw);
+    }
     window.localStorage.removeItem(LEGACY_DANMU_KEYWORD_BLOCK_STORAGE_KEY);
   } catch (error) {
     console.warn('[DanmuKeywordBlock] Failed to persist keywords:', error);
@@ -232,7 +236,12 @@ export const persistDanmuPreferences = (payload: { enabled: boolean; settings: D
     return;
   }
   try {
-    window.localStorage.setItem(DANMU_PREFERENCES_STORAGE_KEY, JSON.stringify(payload));
+    const next = JSON.stringify(payload);
+    // 每次进直播间这个 effect 都会跑一遍，内容没变就别落盘，否则会误触发一轮云同步。
+    if (window.localStorage.getItem(DANMU_PREFERENCES_STORAGE_KEY) === next) {
+      return;
+    }
+    window.localStorage.setItem(DANMU_PREFERENCES_STORAGE_KEY, next);
   } catch (error) {
     console.warn('[DanmuPreferences] Failed to persist preferences:', error);
   }
