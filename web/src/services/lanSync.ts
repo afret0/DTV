@@ -869,8 +869,97 @@ function serializeMergedKey(
 export type CloudReconcileResult = {
   changed: boolean;
   ledger: CloudLedger;
-  stats: { addedItems: number; removedItems: number; replacedItems: number; changedKeys: number; tombstones: number };
+  stats: {
+    addedItems: number;
+    removedItems: number;
+    replacedItems: number;
+    changedKeys: number;
+    tombstones: number;
+    skippedItems: number;
+    skippedKeys: string[];
+    foldedFolderIds: string[];
+  };
 };
+
+function normalizeFolderName(name: unknown): string {
+  return String(name ?? "").trim().toLowerCase();
+}
+
+function streamerNickKey(key: string, value: unknown): string | null {
+  const nick = String((value as Partial<FollowedStreamer> | null)?.nickname ?? "").trim().toLowerCase();
+  if (!nick) return null;
+  return `${normalizeStreamerKey(key).platform}|${nick}`;
+}
+
+/** 云端来的分组按名字认身份：同名就折进本机分组（成员取并集、保留本机 id），避免跨设备出现两个同名分组。 */
+function foldRemoteFoldersByName(
+  localValues: Record<string, Record<string, unknown>>,
+  remoteValues: Record<string, Record<string, unknown>>,
+  excludedMemberKeys: Set<string>
+): string[] {
+  const local = localValues["followFolders"] ?? {};
+  const remote = remoteValues["followFolders"] ?? {};
+  const localIdByName = new Map<string, string>();
+  for (const [id, value] of Object.entries(local)) {
+    const name = normalizeFolderName((value as Partial<FollowFolder>)?.name);
+    if (name && !localIdByName.has(name)) localIdByName.set(name, id);
+  }
+  const streamerBuckets = [localValues["followedStreamers"] ?? {}, remoteValues["followedStreamers"] ?? {}];
+  const folded: string[] = [];
+  for (const [remoteId, value] of Object.entries(remote)) {
+    const remoteFolder = value as Partial<FollowFolder>;
+    const name = normalizeFolderName(remoteFolder?.name);
+    const localId = name ? localIdByName.get(name) : undefined;
+    if (!localId || localId === remoteId) continue;
+    if (localId in remote) continue;
+    const memberKeys = (raw: unknown) =>
+      uniqPreserveOrder((Array.isArray(raw) ? (raw as unknown[]) : []).map((x) => normalizeStreamerKey(String(x)).key)).filter(
+        (k) => !excludedMemberKeys.has(k)
+      );
+    const union = uniqPreserveOrder([...memberKeys((local[localId] as Partial<FollowFolder>)?.streamerIds), ...memberKeys(remoteFolder?.streamerIds)]);
+    for (const key of union) {
+      if (streamerBuckets.some((bucket) => key in bucket)) continue;
+      const norm = normalizeStreamerKey(key);
+      if (!norm.id || !isKnownPlatform(norm.platform)) continue;
+      remoteValues["followedStreamers"] = remoteValues["followedStreamers"] ?? {};
+      remoteValues["followedStreamers"][key] = {
+        id: norm.id,
+        platform: norm.platform,
+        nickname: norm.id,
+        avatarUrl: "",
+        roomTitle: "",
+        currentRoomId: norm.id,
+        liveStatus: "UNKNOWN"
+      } as FollowedStreamer;
+    }
+    (local[localId] as FollowFolder).streamerIds = union;
+    remote[localId] = { ...remoteFolder, id: localId, streamerIds: union } as FollowFolder;
+    delete remote[remoteId];
+    folded.push(remoteId);
+  }
+  return folded;
+}
+
+/** 云端来的主播若与本机某条同平台同昵称但 id 不同，视为同一个人的两个 id：不并入远端那条，避免列表里出现重复的人。 */
+function dropRemoteStreamerTwins(localValues: Record<string, Record<string, unknown>>, remoteValues: Record<string, Record<string, unknown>>): string[] {
+  const local = localValues["followedStreamers"] ?? {};
+  const remote = remoteValues["followedStreamers"] ?? {};
+  const localByNick = new Map<string, string>();
+  for (const [key, value] of Object.entries(local)) {
+    const nickKey = streamerNickKey(key, value);
+    if (nickKey && !localByNick.has(nickKey)) localByNick.set(nickKey, key);
+  }
+  const skipped: string[] = [];
+  for (const key of Object.keys(remote)) {
+    if (key in local) continue;
+    const nickKey = streamerNickKey(key, remote[key]);
+    const twin = nickKey ? localByNick.get(nickKey) : undefined;
+    if (!twin || twin === key) continue;
+    delete remote[key];
+    skipped.push(key);
+  }
+  return skipped;
+}
 
 export function reconcileCloudSync(
   storage: Storage,
@@ -881,6 +970,8 @@ export function reconcileCloudSync(
 ): CloudReconcileResult {
   const localValues = collectSyncItemValues(storage);
   const remoteValues = collectSyncItemValuesFromEntries(payload.entries);
+  const skippedKeys = dropRemoteStreamerTwins(localValues, remoteValues);
+  const foldedFolderIds = foldRemoteFoldersByName(localValues, remoteValues, new Set(skippedKeys));
 
   const nextLedger: CloudLedger = { items: {}, deletions: {} };
   const mergedByKey: Record<string, Record<string, unknown>> = {};
@@ -969,6 +1060,6 @@ export function reconcileCloudSync(
   return {
     changed,
     ledger: nextLedger,
-    stats: { addedItems, removedItems, replacedItems, changedKeys, tombstones }
+    stats: { addedItems, removedItems, replacedItems, changedKeys, tombstones, skippedItems: skippedKeys.length, skippedKeys, foldedFolderIds }
   };
 }

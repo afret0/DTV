@@ -304,6 +304,9 @@ async function runCloudSyncPass(appVersion: string | null | undefined, reason: C
     const payload = parseLanSyncPayload(JSON.parse(remote));
     const cloudAt = Date.parse(payload.exportedAt);
     const merged = applyCloudPayload(payload);
+    if (merged.skippedKeys.length || merged.foldedFolderIds.length) {
+      cloudLog(`[cloud] skip, 云端的重复身份没有并入本机, 同昵称不同id的主播: ${merged.skippedKeys.join(", ") || "无"}, 按名字折进本机分组的云端分组: ${merged.foldedFolderIds.join(", ") || "无"}`);
+    }
     const nextFingerprint = configFingerprint();
     const seedLocal = seedLocalAt == null ? (Number.isFinite(cloudAt) ? cloudAt : now) : seedLocalAt;
     const localAt = merged.changed || localChanged || seedLocalAt == null ? now : seedLocal;

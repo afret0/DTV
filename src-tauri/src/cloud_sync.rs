@@ -132,7 +132,12 @@ async fn oss_get(cfg: &OssSettings) -> Result<Option<String>, String> {
         .map_err(|e| format!("OSS 下载失败: {e}"))?;
     let status = resp.status();
     if status.as_u16() == 404 {
-        return Ok(None);
+        let text = resp.text().await.unwrap_or_default();
+        // 对象不存在才是「云端还没有配置」；bucket 不存在/无权是配置错误，不能被当成空云端，否则每轮都会白传一次。
+        if text.contains("<Code>NoSuchKey</Code>") || text.trim().is_empty() {
+            return Ok(None);
+        }
+        return Err(format!("OSS 下载返回 404: {}", oss_err_msg(&text)));
     }
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
