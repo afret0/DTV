@@ -839,6 +839,28 @@ fn resolve_ratio(quality: Option<&str>) -> Option<i32> {
     None
 }
 
+fn resolve_room_ratio(quality: Option<&str>, available: &[i32], room_id: &str) -> Option<i32> {
+    let requested = match quality.map(|s| s.trim()).unwrap_or("") {
+        q if q.contains("标清") => available.first().copied().or(Some(2000)),
+        q if q.contains("高清") => available.last().copied().or(Some(4000)),
+        q if q.contains("原画") => None,
+        _ => resolve_ratio(quality),
+    };
+
+    if available.is_empty() && requested.is_some() {
+        crate::tl!(
+            "web",
+            "[huya] 房间未上报可用档位, 画质回退原画(猜的 ratio 取不到流) room={} quality={:?} requestedRatio={:?}",
+            room_id,
+            quality,
+            requested
+        );
+        return None;
+    }
+
+    requested
+}
+
 fn extract_available_bitrates(profile: &Value) -> Vec<i32> {
     let Some(data) = profile.get("data") else {
         return Vec::new();
@@ -908,7 +930,10 @@ fn pick_stream_url(
     Some((fake_url, candidate_index))
 }
 
-fn build_flv_tx_urls(base_url: &str, hd: i32, sd: i32) -> Vec<HuyaUnifiedStreamEntry> {
+fn build_flv_tx_urls(base_url: &str, available: &[i32]) -> Vec<HuyaUnifiedStreamEntry> {
+    let hd = available.last().copied();
+    let sd = available.first().copied();
+
     let mut entries = Vec::new();
     entries.push(HuyaUnifiedStreamEntry {
         quality: "原画".to_string(),
@@ -916,16 +941,16 @@ fn build_flv_tx_urls(base_url: &str, hd: i32, sd: i32) -> Vec<HuyaUnifiedStreamE
         url: base_url.to_string(),
     });
 
-    entries.push(HuyaUnifiedStreamEntry {
-        quality: "高清".to_string(),
-        bitRate: hd,
-        url: format!("{}&ratio={}", base_url, hd),
-    });
-    entries.push(HuyaUnifiedStreamEntry {
-        quality: "标清".to_string(),
-        bitRate: sd,
-        url: format!("{}&ratio={}", base_url, sd),
-    });
+    for (quality, bit_rate) in [("高清", hd), ("标清", sd)] {
+        entries.push(HuyaUnifiedStreamEntry {
+            quality: quality.to_string(),
+            bitRate: bit_rate.unwrap_or(0),
+            url: match bit_rate {
+                Some(ratio) => format!("{}&ratio={}", base_url, ratio),
+                None => base_url.to_string(),
+            },
+        });
+    }
 
     entries
 }
@@ -950,15 +975,7 @@ pub async fn get_huya_unified_cmd(
     };
 
     let available = extract_available_bitrates(&profile);
-    let hd = available.last().copied().unwrap_or(4000);
-    let sd = available.first().copied().unwrap_or(2000);
-
-    let ratio = match quality.as_deref().map(|s| s.trim()).unwrap_or("") {
-        q if q.contains("标清") => Some(sd),
-        q if q.contains("高清") => Some(hd),
-        q if q.contains("原画") => None,
-        _ => resolve_ratio(quality.as_deref()),
-    };
+    let ratio = resolve_room_ratio(quality.as_deref(), &available, &room_id);
     let preferred_line = normalize_huya_line(line.as_deref());
     let selection = pick_stream_url(&web_stream.candidates, ratio, preferred_line.as_deref());
     let selected_index = match selection {
@@ -1015,7 +1032,7 @@ pub async fn get_huya_unified_cmd(
         None => base_url.clone(),
     };
 
-    let tx_entries = build_flv_tx_urls(&base_url, hd, sd);
+    let tx_entries = build_flv_tx_urls(&base_url, &available);
     let is_live = detail.status || web_stream.is_live;
     println!(
         "[Huya] requested quality: {:?}, resolved ratio: {:?}, preferred line: {:?}, selected line: {:?}",
@@ -1069,14 +1086,7 @@ pub async fn fetch_huya_flv_url(
         return Err("huya: no candidates".to_string());
     }
     let available = extract_available_bitrates(&profile);
-    let hd = available.last().copied().unwrap_or(4000);
-    let sd = available.first().copied().unwrap_or(2000);
-    let ratio = match quality.map(|s| s.trim()).unwrap_or("") {
-        q if q.contains("标清") => Some(sd),
-        q if q.contains("高清") => Some(hd),
-        q if q.contains("原画") => None,
-        _ => resolve_ratio(quality),
-    };
+    let ratio = resolve_room_ratio(quality, &available, room_id);
     let preferred_line = normalize_huya_line(line);
     let selected_index = pick_stream_url(&candidates, ratio, preferred_line.as_deref())
         .map(|(_, idx)| idx)
@@ -1108,4 +1118,61 @@ pub async fn fetch_huya_flv_url(
         Some(r) => format!("{}&ratio={}", base_url, r),
         None => base_url,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rooms_without_reported_tiers_fall_back_to_origin_quality() {
+        let cases = [
+            ("高清", None),
+            ("标清", None),
+            ("原画", None),
+            ("蓝光", None),
+            ("", None),
+        ];
+        for (quality, expected) in cases {
+            let got = resolve_room_ratio(Some(quality), &[], "999");
+            assert_eq!(got, expected, "quality={quality:?}");
+        }
+        assert_eq!(resolve_room_ratio(None, &[], "999"), None);
+    }
+
+    #[test]
+    fn rooms_with_reported_tiers_keep_requested_quality() {
+        let available = vec![500, 2000, 4000];
+        assert_eq!(resolve_room_ratio(Some("高清"), &available, "999"), Some(4000));
+        assert_eq!(resolve_room_ratio(Some("标清"), &available, "999"), Some(500));
+        assert_eq!(resolve_room_ratio(Some("原画"), &available, "999"), None);
+        assert_eq!(resolve_room_ratio(Some("超清"), &available, "999"), Some(4000));
+        assert_eq!(resolve_room_ratio(None, &available, "999"), None);
+    }
+
+    #[test]
+    fn stream_list_shares_origin_url_when_room_reports_no_tiers() {
+        let base = "https://tx.flv/1234/src/5678.flv?wsSecret=x&wsTime=y";
+        let entries = build_flv_tx_urls(base, &[]);
+        assert_eq!(entries.len(), 3);
+        for entry in &entries {
+            assert_eq!(entry.url, base, "quality={:?}", entry.quality);
+            assert_eq!(entry.bitRate, 0);
+        }
+    }
+
+    #[test]
+    fn stream_list_maps_reported_tiers_to_ratio_urls() {
+        let base = "https://tx.flv/1234/src/5678.flv?wsSecret=x&wsTime=y";
+        let entries = build_flv_tx_urls(base, &[500, 2000]);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].quality, "原画");
+        assert_eq!(entries[0].url, base);
+        assert_eq!(entries[1].quality, "高清");
+        assert_eq!(entries[1].bitRate, 2000);
+        assert_eq!(entries[1].url, format!("{base}&ratio=2000"));
+        assert_eq!(entries[2].quality, "标清");
+        assert_eq!(entries[2].bitRate, 500);
+        assert_eq!(entries[2].url, format!("{base}&ratio=500"));
+    }
 }
