@@ -40,3 +40,6 @@ pnpm-debug.log*
 
 # Cloudflare Worker (local only)
 cf-worker-version/
+
+# 跨会话交接摘要（本地笔记，不进版本库）
+HANDOFF.md
