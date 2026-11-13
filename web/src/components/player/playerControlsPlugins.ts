@@ -29,6 +29,9 @@ export class VolumeControl extends Plugin {
   private handleIconDouble: ((event: Event) => void) | null = null;
   private rootEl: HTMLElement | null = null;
   private roomKey: string | null = null;
+  /** 房间 key 已换、音量还没落：等新流真正接上再落，避免旧直播被顶大一下。 */
+  private roomVolumePending = false;
+  private roomVolumeAppliedKey: string | null = null;
   private updateUIFn: ((volume: number) => void) | null = null;
   /** setRoomKey 程序化设置音量/静音会异步触发 volumechange（改 muted 也会
    * 触发一次）；这些事件绝不能回写存储，否则全局默认会被「路过」的直播间
@@ -37,28 +40,52 @@ export class VolumeControl extends Plugin {
   private appliedValue = 0;
   private saveLogTimer: ReturnType<typeof setTimeout> | null = null;
 
-  /** 切换到某个直播间：应用该房间记忆过的音量（没调过就用全局默认）。 */
+  /** 切换到某个直播间：只换记账用的 key（此刻拖滑块就该记到新房间），音量不动。
+   * 房间 key 一变就改音量会让还在响的旧直播被新房间的音量顶大一下，
+   * 所以音量推迟到 applyRoomVolume()（新流真正接上）再落。 */
   setRoomKey(roomKey: string | null) {
     if (this.roomKey === roomKey) {
       return;
     }
+    const previous = this.roomKey;
     this.roomKey = roomKey;
-    const stored = roomKey ? loadRoomVolume(roomKey) : null;
-    if (stored === null) {
+    this.roomVolumePending = roomKey !== null && roomKey !== this.roomVolumeAppliedKey;
+    invoke('frontend_log', {
+      msg: `[player] room volume bound [${previous ?? '-'}] -> [${roomKey ?? '-'}], 待新流起播后应用: ${this.roomVolumePending}`
+    }).catch(() => {});
+  }
+
+  /** 新流已经接上：应用该房间记忆过的音量（没调过就用全局默认）。 */
+  applyRoomVolume() {
+    if (!this.roomVolumePending) {
       return;
     }
-    if (stored > 0) {
-      this.previousVolume = stored;
+    const roomKey = this.roomKey;
+    this.roomVolumePending = false;
+    if (!roomKey) {
+      return;
+    }
+    this.roomVolumeAppliedKey = roomKey;
+    const stored = loadRoomVolume(roomKey);
+    const value = stored ?? loadStoredVolume();
+    if (value === null) {
+      invoke('frontend_log', {
+        msg: `[player] room volume skip [${roomKey}], 该房间与全局都没有记忆音量, 保持当前音量`
+      }).catch(() => {});
+      return;
+    }
+    if (value > 0) {
+      this.previousVolume = value;
     }
     this.applying = true;
-    this.appliedValue = stored;
-    this.player.volume = stored;
-    // 静音状态必须跟着房间记忆走：上一个房间静音留下的 muted=true 若不清掉，
+    this.appliedValue = value;
+    this.player.volume = value;
+    // 静音状态必须跟着应用的音量走：上一个房间静音留下的 muted=true 若不清掉，
     // 切到任何房间都没声音（用户只能靠拖滑块自救）。
-    this.player.muted = stored === 0;
-    this.updateUIFn?.(this.player.volume ?? stored);
+    this.player.muted = value === 0;
+    this.updateUIFn?.(this.player.volume ?? value);
     invoke('frontend_log', {
-      msg: `[player] room volume applied [${roomKey}] -> ${Math.round(stored * 100)}%`
+      msg: `[player] room volume applied [${roomKey}] -> ${Math.round(value * 100)}%, 来源: ${stored === null ? '全局默认' : '房间记忆'}`
     }).catch(() => {});
   }
 
@@ -278,6 +305,8 @@ export class VolumeControl extends Plugin {
     }
     this.updateUIFn = null;
     this.roomKey = null;
+    this.roomVolumePending = false;
+    this.roomVolumeAppliedKey = null;
     this.volumeIcon = null;
     this.slider = null;
     this.valueLabel = null;

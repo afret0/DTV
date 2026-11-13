@@ -107,6 +107,17 @@ function supportsMseType(mime: string) {
   }
 }
 
+/** 新流已经接上了：把音量插件切到这个房间，并落上它记忆的音量。
+ * 绑定与实际出声分开，切换途中旧直播不会被新房间的音量顶大一下。 */
+function applyRoomVolumeFor(plugin: any, roomKey: string) {
+  try {
+    plugin?.setRoomKey?.(roomKey);
+    plugin?.applyRoomVolume?.();
+  } catch {
+    // ignore
+  }
+}
+
 function maybeAppendHevcInstallHint(rawMessage: string) {
   const msg = String(rawMessage || "");
   const lower = msg.toLowerCase();
@@ -257,10 +268,10 @@ export function MainPlayer({
   const loadFailureCountRef = useRef(0);
   const lastLoadKeyRef = useRef<string | null>(null);
 
-  // 音量按直播间记忆：房间一变就要跟着换 key。软切换（switchURL）不重建播放器，
-  // 插件自己发现不了房间变了，于是上一个房间的 key 一直留着——新房间的记忆音量
-  // 用不上，而在新房间里调音量会写进上一个房间的 key（用户看到的就是「调了音量，
-  // 别的直播间也被覆盖」）。放在这里对四个平台的软切换/重建两条路径都生效。
+  // 音量按直播间记忆：房间一变就换 key，这样切换途中用户拖的滑块会记到新房间。
+  // 但此刻**不能改音量**——新流还没接上，正在响的还是旧直播，把新房间记忆的
+  // 音量压上去就是「旧声音突然放大一下再切过去」。真正的出声由
+  // applyRoomVolumeFor() 在新流接上时落（软切换/重建两条路径都有）。
   useEffect(() => {
     try {
       volumePluginRef.current?.setRoomKey?.(`${platform}/${roomId}`);
@@ -1165,12 +1176,8 @@ export function MainPlayer({
         position: POSITIONS.CONTROLS_LEFT,
         index: 3
       });
-      // 应用这个直播间记忆过的音量（没调过则保持全局默认）。
-      try {
-        volumePluginRef.current?.setRoomKey?.(`${platform}/${roomId}`);
-      } catch {
-        // ignore
-      }
+      // 播放器刚建好、还没出声：此刻就把这个直播间记忆的音量落上去（没调过用全局默认）。
+      applyRoomVolumeFor(volumePluginRef.current, `${platform}/${roomId}`);
 
       danmuTogglePluginRef.current = player.registerPlugin?.(DanmuToggleControl, {
         position: POSITIONS.CONTROLS_RIGHT,
@@ -1292,6 +1299,16 @@ export function MainPlayer({
 
       let loadFailed = false;
 
+      // 软切换后立刻落新房间的音量：switchURL 的 Promise 一 resolve 音频就可能已经出声，
+      // 再等弹幕后端起来才落，会留下一小段「新画面配旧房间音量」的窗口。
+      const softSwitchAndApplyVolume = async (nextUrl: string) => {
+        const ret = playerRef.current?.switchURL(nextUrl, { seamless: false });
+        if (ret && typeof (ret as any).then === "function") await ret;
+        if (isSessionActive(sessionId)) {
+          applyRoomVolumeFor(volumePluginRef.current, `${platform}/${roomId}`);
+        }
+      };
+
       setIsLoadingStream(true);
       setStreamError(null);
       setIsOfflineError(false);
@@ -1338,16 +1355,9 @@ export function MainPlayer({
             playbackKindRef.current === nextKind;
           if (canSoftSwitch) {
             try {
-              const ret = player.switchURL(streamUrl, { seamless: false });
-              if (ret && typeof (ret as any).then === "function") await ret;
+              await softSwitchAndApplyVolume(streamUrl);
               if (isSessionActive(sessionId)) {
                 playbackKindRef.current = nextKind;
-                // 软切换不重建播放器：音量插件需要跟着换房间记忆。
-                try {
-                  volumePluginRef.current?.setRoomKey?.(`${platform}/${roomId}`);
-                } catch {
-                  // ignore
-                }
                 try {
                   sourceBadgeRef.current?.updateLabel?.();
                 } catch {
@@ -1385,8 +1395,7 @@ export function MainPlayer({
             playbackKindRef.current === nextKind;
           if (canSoftSwitch) {
             try {
-              const ret = player.switchURL(resp.streamUrl, { seamless: false });
-              if (ret && typeof (ret as any).then === "function") await ret;
+              await softSwitchAndApplyVolume(resp.streamUrl);
               if (isSessionActive(sessionId)) {
                 playbackKindRef.current = nextKind;
                 await startDanmaku(sessionId, danmuOverlayRef.current, platform, danmakuBackendRoomId, danmakuFilterRoomId);
@@ -1422,8 +1431,7 @@ export function MainPlayer({
             playbackKindRef.current === nextKind;
           if (canSoftSwitch) {
             try {
-              const ret = player.switchURL(streamUrl, { seamless: false });
-              if (ret && typeof (ret as any).then === "function") await ret;
+              await softSwitchAndApplyVolume(streamUrl);
               if (isSessionActive(sessionId)) {
                 playbackKindRef.current = nextKind;
                 await startDanmaku(sessionId, danmuOverlayRef.current, platform, roomId);
@@ -1461,8 +1469,7 @@ export function MainPlayer({
             playbackKindRef.current === nextKind;
           if (canSoftSwitch) {
             try {
-              const ret = player.switchURL(streamUrl, { seamless: false });
-              if (ret && typeof (ret as any).then === "function") await ret;
+              await softSwitchAndApplyVolume(streamUrl);
               if (isSessionActive(sessionId)) {
                 playbackKindRef.current = nextKind;
                 await startDanmaku(sessionId, danmuOverlayRef.current, platform, roomId);
