@@ -43,8 +43,12 @@ shell 默认 `rustc` 是 Homebrew stable，而 `src-tauri/rust-toolchain.toml` �
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
-pnpm tauri build --bundles dmg
+./node_modules/.bin/tauri build --bundles dmg
 ```
+
+用仓库本地的 `node_modules/.bin/tauri`，别依赖 `pnpm`：本机 pnpm 走 corepack，缓存坏过
+（2026-11-19 报 `Cannot find module .../corepack/v1/pnpm/.../pnpm.cjs`）。
+tauri.conf.json 的 beforeBuildCommand 走 npm，不受 pnpm 影响。
 
 ### Android apk
 
@@ -55,7 +59,7 @@ export PATH="$HOME/.cargo/bin:$PATH"
 export ANDROID_HOME=$HOME/Library/Android/sdk
 export NDK_HOME=$HOME/Library/Android/sdk/ndk/27.0.11718014
 export BINDGEN_EXTRA_CLANG_ARGS="--sysroot=$NDK_HOME/toolchains/llvm/prebuilt/darwin-x86_64/sysroot"
-pnpm tauri android build --apk
+./node_modules/.bin/tauri android build --apk
 ```
 
 - 本机只装了 NDK `27.0.11718014`，别写别的版本号；缺 `BINDGEN_EXTRA_CLANG_ARGS` 会报 `stdio.h not found`。
@@ -79,6 +83,18 @@ $BT/apksigner sign --ks ~/.android/debug.keystore \
 `src-tauri/Cargo.toml` 的版本号**有意不动**（停在 3.1.73），不要去「顺手对齐」。
 
 提交信息格式：`<版本号>: <中文描述>`。
+
+## 任务完成后：自动提交 push + 出包（本仓库例外，2026-11-19 用户确认）
+
+全局规矩是「每次 commit 必须逐次确认」（2026-11-12 铁律）；**本仓库例外**：用户已常设授权，
+任务完成后**自动 commit + 自动 push，不再逐次询问**，并构建最新 dmg 与 apk。
+
+- 前提不变：改动本身要先经用户同意（未经同意不动代码）；只提交本轮范围内的改动。
+- 顺序沿用全局流程：验证 → 构建 dmg → 构建 apk（串行）→ 拷产物到 `~/Downloads` → commit → push。
+  纯文档 / instructions 改动也出包；这类改动不算用户可感知，不 bump 版本号。
+- commit message 沿用 `<版本号>: <中文描述>` + Copilot trailer；push 到 origin 当前分支。
+- 构建或验证失败：不 commit 不 push，先报告失败原因。push 遇远程更新 / hooks 拦截：停下报告，不 force、不 amend。
+- 用户当轮明确说「不要构建 / 不要提交 / 不要 push」时以当轮指示为准；只读任务不触发本流程。
 
 ## 播放器音量语义（改这块前先读）
 
@@ -104,6 +120,29 @@ $BT/apksigner sign --ks ~/.android/debug.keystore \
 - 切房窗口内拖滑块存到**新**房间；`persistVolume` 仅在 volume > 0 时写全局，房间记忆可以存 0。
 - 软切（`player.switchURL`）条件：同播放类型（hls/flv）且 `danmuOverlayRef.current` 存在；
   否则走 `destroyPlayer()` + `mountPlayer()`。软切时播放器与所有插件存活。
+
+## 虎牙断流自愈（3.1.84 起，改这块前先读）
+
+三层机制，全在既有看门狗体系内，别另起炉灶：
+
+- **代理自动换线**（`proxy.rs` + `huya/stream_url.rs`）：重签仍被拒（fresh 判定 =
+  `huya_sign_age_ms() < 240s`）或短命会话（`session_bytes>0 && lived<60s`）→
+  `fetch_huya_flv_url_rotating` 按候选序 tx→al→hs 循环换线。生效线路存
+  `StreamUrlStore.huya_fallback_line`，**不写用户偏好**（localStorage 线路偏好不动）；
+  `set_stream_url_cmd`（切房/切画质/手动换线）清空它回到偏好线路。换线成功发
+  Tauri 事件 `huya-line-fallback` `{room, line}`，前端只同步徽标。
+- **签名年龄有两套戳，别混用**：`LAST_SIGN_MS`（全局）被 `commit_new_source` 重置，
+  量不出 URL 真实年龄；`HUYA_LAST_SIGN_MS` 只在虎牙真签名时写（refresh 成功 +
+  `set_stream_url_cmd` platform=huya），换线触发判定只认它。
+- **前端浅缓冲垫底**（MainPlayer 看门狗 effect 内）：`timeupdate` 捕获监听（document
+  capture，免逐元素 attach、重载后立即生效），虎牙缓冲 <4s 时 `playbackRate=0.95`
+  攒垫，≥4s 恢复 1.0；连续慢放 120s 封顶，缓冲达标一次后才重新武装。
+  xgplayer 的 playbackRate 插件是关的（`playbackRate: false`），别打开。
+- **恢复提速**：`ended` 捕获监听即刻重载（与重播层轮询共享 8s 冷却 + 6 次预算，
+  `playerIsLive === false` 不触发）；虎牙 `readyState<2`（无数据）冻结判定 2 样本
+  （10s），其余仍 3 样本（15s）。
+- **事件同步线路不能触发重载**：`proxyLineSyncRef` 存同步时的画质快照，
+  `currentLine` 变化的 debounce effect 里只有画质没变才吞掉重载。
 
 ## 云同步语义（改这块前先读）
 

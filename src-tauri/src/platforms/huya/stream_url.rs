@@ -1079,6 +1079,44 @@ pub async fn fetch_huya_flv_url(
     quality: Option<&str>,
     line: Option<&str>,
 ) -> Result<String, String> {
+    fetch_huya_flv_url_inner(follow_http, room_id, quality, line, false)
+        .await
+        .map(|(url, _, _)| url)
+}
+
+pub async fn fetch_huya_flv_url_rotating(
+    follow_http: &crate::platforms::common::FollowHttpClient,
+    room_id: &str,
+    quality: Option<&str>,
+    current_line: Option<&str>,
+) -> Result<(String, String, bool), String> {
+    fetch_huya_flv_url_inner(follow_http, room_id, quality, current_line, true).await
+}
+
+fn rotated_candidate_index(
+    candidates: &[WebStreamCandidate],
+    preferred_cdn: Option<&str>,
+) -> Option<(usize, usize)> {
+    if candidates.is_empty() {
+        return None;
+    }
+    let base = preferred_cdn
+        .and_then(|target| {
+            candidates
+                .iter()
+                .position(|c| c.cdn.eq_ignore_ascii_case(target))
+        })
+        .unwrap_or(0);
+    Some(((base + 1) % candidates.len(), base))
+}
+
+async fn fetch_huya_flv_url_inner(
+    follow_http: &crate::platforms::common::FollowHttpClient,
+    room_id: &str,
+    quality: Option<&str>,
+    line: Option<&str>,
+    rotate: bool,
+) -> Result<(String, String, bool), String> {
     let client = &follow_http.0.inner;
     let profile = fetch_profile_room(client, room_id).await.map_err(|e| e.to_string())?;
     let candidates = extract_stream_candidates(&profile)?;
@@ -1088,9 +1126,17 @@ pub async fn fetch_huya_flv_url(
     let available = extract_available_bitrates(&profile);
     let ratio = resolve_room_ratio(quality, &available, room_id);
     let preferred_line = normalize_huya_line(line);
-    let selected_index = pick_stream_url(&candidates, ratio, preferred_line.as_deref())
-        .map(|(_, idx)| idx)
-        .ok_or_else(|| "huya: pick failed".to_string())?;
+    let (selected_index, rotated_from) = if rotate {
+        let (next, base) = rotated_candidate_index(&candidates, preferred_line.as_deref())
+            .ok_or_else(|| "huya: pick failed".to_string())?;
+        let changed = !candidates[next].cdn.eq_ignore_ascii_case(&candidates[base].cdn);
+        (next, changed.then(|| candidates[base].cdn.to_ascii_lowercase()))
+    } else {
+        let idx = pick_stream_url(&candidates, ratio, preferred_line.as_deref())
+            .map(|(_, idx)| idx)
+            .ok_or_else(|| "huya: pick failed".to_string())?;
+        (idx, None)
+    };
     let candidate = candidates
         .get(selected_index)
         .ok_or_else(|| "huya: candidate missing".to_string())?;
@@ -1114,15 +1160,52 @@ pub async fn fetch_huya_flv_url(
         candidate.cdn,
         crate::platforms::common::platform_cookie::is_logged_in("huya")
     );
-    Ok(match ratio {
+    if let Some(from) = rotated_from.as_deref() {
+        crate::tl!(
+            "web",
+            "[huya] done, 断流自动换线, room={} line: {} -> {}",
+            room_id,
+            from,
+            candidate.cdn.to_ascii_lowercase()
+        );
+    }
+    let url = match ratio {
         Some(r) => format!("{}&ratio={}", base_url, r),
         None => base_url,
-    })
+    };
+    Ok((url, candidate.cdn.to_ascii_lowercase(), rotated_from.is_some()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn candidate(cdn: &str) -> WebStreamCandidate {
+        WebStreamCandidate {
+            flv_url: format!("https://{cdn}.flv.huya.com/src"),
+            stream_name: "s".to_string(),
+            presenter_uid: 1,
+            cdn: cdn.to_string(),
+        }
+    }
+
+    #[test]
+    fn line_rotation_cycles_to_the_next_cdn_and_wraps() {
+        let candidates = vec![candidate("TX"), candidate("AL"), candidate("HS")];
+        assert_eq!(rotated_candidate_index(&candidates, Some("tx")), Some((1, 0)));
+        assert_eq!(rotated_candidate_index(&candidates, Some("al")), Some((2, 1)));
+        assert_eq!(rotated_candidate_index(&candidates, Some("hs")), Some((0, 2)));
+        assert_eq!(rotated_candidate_index(&candidates, None), Some((1, 0)));
+        assert_eq!(rotated_candidate_index(&candidates, Some("ws")), Some((1, 0)));
+    }
+
+    #[test]
+    fn line_rotation_with_a_single_cdn_stays_on_it() {
+        let candidates = vec![candidate("TX")];
+        assert_eq!(rotated_candidate_index(&candidates, Some("tx")), Some((0, 0)));
+        assert_eq!(rotated_candidate_index(&candidates, None), Some((0, 0)));
+        assert!(rotated_candidate_index(&[], Some("tx")).is_none());
+    }
 
     #[test]
     fn rooms_without_reported_tiers_fall_back_to_origin_quality() {

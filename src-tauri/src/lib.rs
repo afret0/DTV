@@ -44,6 +44,7 @@ pub struct StreamUrlStore {
     pub room_id: Arc<Mutex<Option<String>>>,
     pub quality: Arc<Mutex<Option<String>>>,
     pub line: Arc<Mutex<Option<String>>>,
+    pub huya_fallback_line: Arc<Mutex<Option<String>>>,
     pub huya_follow_http: Arc<Mutex<Option<crate::platforms::common::FollowHttpClient>>>,
     pub generation: Arc<std::sync::atomic::AtomicU64>,
 }
@@ -180,10 +181,14 @@ async fn set_stream_url_cmd(
     // Single entry point for "the source changed": bumps the generation so the
     // pump switches immediately, stamps the sign time and invalidates the primer.
     crate::proxy::commit_new_source(&state);
+    if platform.as_deref() == Some("huya") {
+        crate::proxy::note_huya_sign_now();
+    }
     *state.platform.lock().unwrap() = platform;
     *state.room_id.lock().unwrap() = room_id;
     *state.quality.lock().unwrap() = quality;
     *state.line.lock().unwrap() = line;
+    *state.huya_fallback_line.lock().unwrap() = None;
     Ok(())
 }
 

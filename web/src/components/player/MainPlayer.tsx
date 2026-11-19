@@ -330,6 +330,9 @@ export function MainPlayer({
   currentQualityRef.current = currentQuality;
   currentLineRef.current = currentLine;
   lineOptionsRef.current = lineOptions;
+  const proxyLineSyncRef = useRef<string | null>(null);
+  const playerIsLiveRef = useRef(playerIsLive);
+  playerIsLiveRef.current = playerIsLive;
 
   const [isDanmuEnabled, setIsDanmuEnabled] = useState(() => {
     if (typeof window === "undefined") return true;
@@ -1566,6 +1569,81 @@ export function MainPlayer({
     let lastReplayReloadAt = 0;
     let replayReloads = 0;
     let lastReplayWindowAt = Date.now();
+
+    let cushionEl: HTMLVideoElement | null = null;
+    let cushionSlowSince = 0;
+    let cushionCapped = false;
+    const CUSHION_TARGET_MS = 4000;
+    const CUSHION_MAX_SLOW_MS = 120_000;
+    const restoreCushionRate = () => {
+      if (cushionEl && cushionEl.playbackRate !== 1) cushionEl.playbackRate = 1;
+    };
+    const isPlayerVideo = (t: EventTarget | null): t is HTMLVideoElement =>
+      t instanceof HTMLVideoElement && !!t.closest(".xgplayer");
+    const onEndedCapture = (ev: Event) => {
+      if (platform !== Platform.HUYA) return;
+      if (!isPlayerVideo(ev.target)) return;
+      if (playerIsLiveRef.current === false) return;
+      if (Date.now() - lastReplayReloadAt <= 8000 || replayReloads >= 6) return;
+      lastReplayReloadAt = Date.now();
+      replayReloads++;
+      invoke("frontend_log", {
+        msg: `[player] huya LIVE video ended [${platform}/${roomId}] -> immediate reload (${replayReloads}/6)`
+      }).catch(() => {});
+      void reloadStreamRef.current?.("refresh");
+    };
+    const onTimeUpdateCapture = (ev: Event) => {
+      if (platform !== Platform.HUYA) return;
+      const el = ev.target;
+      if (!isPlayerVideo(el)) return;
+      if (el !== cushionEl) {
+        cushionEl = el;
+        cushionSlowSince = 0;
+        cushionCapped = false;
+      }
+      if (el.paused || el.ended || playerIsLiveRef.current === false) {
+        if (cushionSlowSince) {
+          cushionSlowSince = 0;
+          restoreCushionRate();
+        }
+        return;
+      }
+      let aheadMs = 0;
+      try {
+        const b = el.buffered;
+        if (b.length) aheadMs = Math.max(0, (b.end(b.length - 1) - el.currentTime) * 1000);
+      } catch {}
+      if (aheadMs >= CUSHION_TARGET_MS) {
+        cushionCapped = false;
+        if (cushionSlowSince) {
+          cushionSlowSince = 0;
+          restoreCushionRate();
+          invoke("frontend_log", {
+            msg: `[player] huya cushion filled ahead=${Math.round(aheadMs)}ms -> rate 1.0`
+          }).catch(() => {});
+        }
+        return;
+      }
+      if (cushionCapped) return;
+      const now = Date.now();
+      if (!cushionSlowSince) {
+        cushionSlowSince = now;
+        el.playbackRate = 0.95;
+        invoke("frontend_log", {
+          msg: `[player] huya shallow buffer ahead=${Math.round(aheadMs)}ms < ${CUSHION_TARGET_MS}ms -> rate 0.95`
+        }).catch(() => {});
+      } else if (now - cushionSlowSince >= CUSHION_MAX_SLOW_MS) {
+        cushionCapped = true;
+        cushionSlowSince = 0;
+        restoreCushionRate();
+        invoke("frontend_log", {
+          msg: `[player] huya cushion slow cap ${CUSHION_MAX_SLOW_MS / 1000}s reached ahead=${Math.round(aheadMs)}ms -> rate 1.0`
+        }).catch(() => {});
+      }
+    };
+    document.addEventListener("ended", onEndedCapture, true);
+    document.addEventListener("timeupdate", onTimeUpdateCapture, true);
+
     const id = window.setInterval(() => {
       const player: any = playerRef.current;
       const video: HTMLVideoElement | null =
@@ -1628,7 +1706,8 @@ export function MainPlayer({
 
       const canRecover =
         stallRecoveries < MAX_BURST || Date.now() - lastRecoveryAt >= RETRY_COOLDOWN_MS;
-      if (staleSamples >= 3 && canRecover) {
+      const needSamples = platform === Platform.HUYA && video.readyState < 2 ? 2 : 3;
+      if (staleSamples >= needSamples && canRecover) {
         // Three consecutive frozen samples (~15s): describe the buffered state
         // first - this is the evidence that distinguishes "proxy stopped
         // feeding" from "player has a hole it cannot play through".
@@ -1661,7 +1740,7 @@ export function MainPlayer({
           }
         })();
         invoke("frontend_log", {
-          msg: `[player] STALL detected [${platform}/${roomId}] time=${cur.toFixed(1)} buffered=[${buf}] holeAhead=${holeAhead} readyState=${video.readyState} networkState=${video.networkState} recovery=${stallRecoveries} (burst=${MAX_BURST}) -> reloading`
+          msg: `[player] STALL detected [${platform}/${roomId}] time=${cur.toFixed(1)} buffered=[${buf}] holeAhead=${holeAhead} readyState=${video.readyState} networkState=${video.networkState} needSamples=${needSamples} recovery=${stallRecoveries} (burst=${MAX_BURST}) -> reloading`
         }).catch(() => {});
         void reloadStreamRef.current?.("refresh");
         return;
@@ -1679,7 +1758,38 @@ export function MainPlayer({
         }).catch(() => {});
       }
     }, 5000);
-    return () => window.clearInterval(id);
+    return () => {
+      window.clearInterval(id);
+      document.removeEventListener("ended", onEndedCapture, true);
+      document.removeEventListener("timeupdate", onTimeUpdateCapture, true);
+      restoreCushionRate();
+    };
+  }, [platform, roomId]);
+
+  useEffect(() => {
+    if (platform !== Platform.HUYA) return;
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen<{ room: string; line: string }>("huya-line-fallback", (event) => {
+      if (disposed) return;
+      const { room, line } = event.payload ?? { room: "", line: "" };
+      if (String(room) !== roomId) return;
+      if (!lineOptionsRef.current.some((o) => o.key === line)) return;
+      invoke("frontend_log", {
+        msg: `[player] proxy auto-switched huya line [${platform}/${roomId}] -> ${line} (badge sync only, no reload)`
+      }).catch(() => {});
+      if (currentLineRef.current !== line) {
+        proxyLineSyncRef.current = currentQualityRef.current;
+        setCurrentLine(line);
+      }
+    }).then((fn) => {
+      if (disposed) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
   }, [platform, roomId]);
 
 
@@ -1765,6 +1875,11 @@ export function MainPlayer({
     if (!qualityReloadArmedRef.current) {
       qualityReloadArmedRef.current = true;
       return;
+    }
+    if (proxyLineSyncRef.current !== null) {
+      const qualityAtSync = proxyLineSyncRef.current;
+      proxyLineSyncRef.current = null;
+      if (qualityAtSync === currentQuality) return;
     }
     const id = window.setTimeout(() => void reloadStream("quality"), 80);
     return () => window.clearTimeout(id);

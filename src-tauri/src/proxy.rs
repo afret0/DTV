@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use crate::flv_relay;
 use tokio::sync::broadcast;
 use std::time::Duration;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, State};
 
 #[derive(Default)]
 pub struct ProxyServerHandle(pub Arc<StdMutex<Option<ServerHandle>>>);
@@ -390,6 +390,7 @@ impl Primer {
 static PUMP: OnceLock<StdMutex<Option<(std::sync::Weak<StdMutex<String>>, Arc<SharedPump>)>>> =
     OnceLock::new();
 static PUMP_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static PROXY_APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
 
 fn pump_slot() -> &'static StdMutex<Option<(std::sync::Weak<StdMutex<String>>, Arc<SharedPump>)>> {
     PUMP.get_or_init(|| StdMutex::new(None))
@@ -452,6 +453,7 @@ async fn refresh_store_url(
     store: &StreamUrlStore,
     expect_gen: u64,
     cancelled: &AtomicBool,
+    rotate_line: bool,
 ) -> bool {
     // Stale refresh guard: if the source changed (room/platform switch) or the
     // pump was cancelled while we were re-signing, DO NOT write the freshly
@@ -545,15 +547,28 @@ async fn refresh_store_url(
         Some("huya") => {
             let room = store.room_id.lock().unwrap().clone();
             let quality = store.quality.lock().unwrap().clone();
-            let line = store.line.lock().unwrap().clone();
+            let line = store
+                .huya_fallback_line
+                .lock()
+                .unwrap()
+                .clone()
+                .or_else(|| store.line.lock().unwrap().clone());
             let client = store.huya_follow_http.lock().unwrap().clone();
             if let (Some(room), Some(client)) = (room, client) {
-                match crate::platforms::huya::stream_url::fetch_huya_flv_url(
-                    &client, &room, quality.as_deref(), line.as_deref(),
-                )
-                .await
-                {
-                    Ok(fresh) => {
+                let result = if rotate_line {
+                    crate::platforms::huya::stream_url::fetch_huya_flv_url_rotating(
+                        &client, &room, quality.as_deref(), line.as_deref(),
+                    )
+                    .await
+                } else {
+                    crate::platforms::huya::stream_url::fetch_huya_flv_url(
+                        &client, &room, quality.as_deref(), line.as_deref(),
+                    )
+                    .await
+                    .map(|url| (url, String::new(), false))
+                };
+                match result {
+                    Ok((fresh, cdn, rotated)) => {
                         if stale() {
                             crate::tl!("proxy", "[proxy] dropped stale Huya refresh for room {}", room);
                             return false;
@@ -561,6 +576,22 @@ async fn refresh_store_url(
                         crate::tl!("proxy", "[proxy] refreshed Huya URL for room {}", room);
                         *store.url.lock().unwrap() = fresh;
                         note_store_sign_now();
+                        note_huya_sign_now();
+                        if rotated {
+                            *store.huya_fallback_line.lock().unwrap() = Some(cdn.clone());
+                            crate::tl!(
+                                "proxy",
+                                "hit, 虎牙断流自动换线已生效, room: {}, 生效线路: {}, 用户偏好未改",
+                                room,
+                                cdn
+                            );
+                            if let Some(app) = PROXY_APP_HANDLE.get() {
+                                let _ = app.emit(
+                                    "huya-line-fallback",
+                                    serde_json::json!({ "room": room, "line": cdn }),
+                                );
+                            }
+                        }
                         true
                     }
                     Err(e) => {
@@ -1866,12 +1897,22 @@ fn ensure_pump(store: StreamUrlStore) {
             // stored URL is old or the CDN actively rejected it.
             let age = sign_age_ms();
             let natural_expiry = lived >= Duration::from_secs(240);
-            if rejected || natural_expiry || age >= 240_000 {
-                crate::tl!("proxy", 
-                    "[proxy] pump #{} re-signing upstream (rejected={} lived={:?} url_age_ms={})",
-                    pump_id, rejected, lived, age
+            let huya_rotate = store.platform.lock().unwrap().as_deref() == Some("huya")
+                && CLIENT_COUNT.load(Ordering::Relaxed) > 0
+                && ((rejected && huya_sign_age_ms() < 240_000)
+                    || (!rejected && session_bytes > 0 && lived < Duration::from_secs(60)));
+            if huya_rotate {
+                crate::tl!("proxy",
+                    "[proxy] hit, 虎牙触发换线判定, pump #{} rejected={} huya_sign_age_ms={} lived={:?} session_bytes={}",
+                    pump_id, rejected, huya_sign_age_ms(), lived, session_bytes
                 );
-                refresh_store_url(&store, gen_at_connect, &p.cancelled).await;
+            }
+            if rejected || natural_expiry || age >= 240_000 || huya_rotate {
+                crate::tl!("proxy", 
+                    "[proxy] pump #{} re-signing upstream (rejected={} lived={:?} url_age_ms={} rotate_line={})",
+                    pump_id, rejected, lived, age, huya_rotate
+                );
+                refresh_store_url(&store, gen_at_connect, &p.cancelled, huya_rotate).await;
             } else {
                 crate::tl!("proxy", 
                     "[proxy] pump #{} reconnecting with fresh stored URL (age={}ms lived={:?})",
@@ -2009,6 +2050,28 @@ pub fn note_store_sign_now() {
 
 fn sign_age_ms() -> u64 {
     let last = LAST_SIGN_MS.load(Ordering::SeqCst);
+    if last == 0 {
+        return u64::MAX;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    now.saturating_sub(last)
+}
+
+static HUYA_LAST_SIGN_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn note_huya_sign_now() {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    HUYA_LAST_SIGN_MS.store(ms, Ordering::SeqCst);
+}
+
+fn huya_sign_age_ms() -> u64 {
+    let last = HUYA_LAST_SIGN_MS.load(Ordering::SeqCst);
     if last == 0 {
         return u64::MAX;
     }
@@ -2681,10 +2744,11 @@ pub async fn start_proxy_inner(
 
 #[tauri::command]
 pub async fn start_proxy(
-    _app_handle: AppHandle,
+    app_handle: AppHandle,
     server_handle_state: State<'_, ProxyServerHandle>,
     stream_url_store: State<'_, StreamUrlStore>,
 ) -> Result<String, String> {
+    let _ = PROXY_APP_HANDLE.set(app_handle);
     start_proxy_inner(server_handle_state.0.clone(), stream_url_store.inner().clone()).await
 }
 
@@ -2734,9 +2798,10 @@ pub async fn stop_proxy(
 
 #[tauri::command]
 pub async fn start_static_proxy_server(
-    _app_handle: AppHandle,
+    app_handle: AppHandle,
     stream_url_store: State<'_, StreamUrlStore>,
 ) -> Result<String, String> {
+    let _ = PROXY_APP_HANDLE.set(app_handle);
     let port: u16 = 34721;
     if TcpStream::connect(("127.0.0.1", port)).is_ok() {
         return Ok(format!("http://127.0.0.1:{}", port));
