@@ -144,6 +144,22 @@ $BT/apksigner sign --ks ~/.android/debug.keystore \
 - **事件同步线路不能触发重载**：`proxyLineSyncRef` 存同步时的画质快照，
   `currentLine` 变化的 debounce effect 里只有画质没变才吞掉重载。
 
+## 播放器自愈监听（3.1.85 起，改这块前先读）
+
+- `error` / `waiting` / `ended` 自愈监听注册在 `mountPlayer` 里，但**软切换
+  （`switchURL`）不重建播放器**，监听会比挂载会话活得久；`reloadStream` 每次
+  ++session。3.1.85 前这些监听用挂载期 `isSessionActive(sessionId)` 守卫 →
+  第一次软切换 reload 后全部失效：解码错误（5103 / MediaError 3）只能等 15s
+  冻结看门狗，黑屏十几秒（抖音 258275062804 真机复现：首次 2s 自愈、二次 18s）。
+- 现在守卫是 `disposedRef.current || playerRef.current !== player`（跟随存活的
+  播放器实例），日志标签用 `streamLabelRef.current`（先例：`playing` 监听）。
+  **别改回 sessionId 守卫**；新加播放器事件自愈监听照此写。
+- 去抖/预算（decode 8s、ended 3s、waiting nudge 8s、MAX_AUTO_RECONNECT）是
+  mount 闭包局部量，重挂载自然重置；`autoReconnectTimerRef` 是组件级共享，保持现状。
+- xgplayer replay 覆盖层只在 `ENDED` 显示；解码错误不触发 ended，看门狗的重播层
+  轮询救不了它，只能靠 decode 自愈或冻结判定——所以 decode 监听失效的代价是整段
+  15s+ 黑屏。
+
 ## 云同步语义（改这块前先读）
 
 - **条目级增量合并**：local / remote / prevItems 按 id 求并集，胜者按 ledger 时间戳。

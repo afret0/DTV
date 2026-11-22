@@ -1058,7 +1058,10 @@ export function MainPlayer({
           invoke("frontend_log", {
             msg: `player error event: code=${err?.errorCode} type=${err?.errorType} msg=${err?.message} mediaErrorCode=${me?.code ?? "n/a"} mediaErrorMsg=${me?.message ?? "n/a"} currentTime=${err?.currentTime?.toFixed?.(1)} readyState=${err?.readyState} networkState=${err?.networkState}`
           }).catch(() => {});
-          if (!isSessionActive(sessionId)) return;
+          const { platform: p, roomId: r } = streamLabelRef.current;
+          // 软切换不重建播放器，这些监听会比挂载会话活得久：只跟随当前存活的
+          // 播放器实例，绑旧 sessionId 会让 reload 一次后全部自愈失效。
+          if (disposedRef.current || playerRef.current !== player) return;
           const errMsg = `${err?.message ?? ""}`;
           if (
             errMsg.includes("addSourceBuffer") &&
@@ -1081,7 +1084,7 @@ export function MainPlayer({
           if (isDecodeError) {
             if (Date.now() - lastDecodeReloadAt < 8000) return;
             lastDecodeReloadAt = Date.now();
-            invoke("frontend_log", { msg: `player decode error -> forced reload [${platform}/${roomId}]` }).catch(() => {});
+            invoke("frontend_log", { msg: `player decode error -> forced reload [${p}/${r}]` }).catch(() => {});
             if (autoReconnectTimerRef.current) clearTimeout(autoReconnectTimerRef.current);
             autoReconnectTimerRef.current = setTimeout(() => {
               autoReconnectTimerRef.current = null;
@@ -1104,7 +1107,8 @@ export function MainPlayer({
         let waitingTimer: ReturnType<typeof setTimeout> | null = null;
         let lastRenewNudgeAt = 0;
         player.on?.("waiting", () => {
-          if (!isSessionActive(sessionId)) return;
+          const { platform: p, roomId: r } = streamLabelRef.current;
+          if (disposedRef.current || playerRef.current !== player) return;
           // 转圈 = 播放器缓冲空了。先让代理无缝换一条上游（不断播放位置、不丢
           // 弹幕），8s 去抖；只有换线后还卡才走整体 reload。
           // 起播阶段的 waiting 是正常首缓冲（currentTime 还很小），不能换线。
@@ -1116,13 +1120,13 @@ export function MainPlayer({
             lastRenewNudgeAt = Date.now();
             invoke("proxy_renew_upstream").catch(() => {});
             invoke("frontend_log", {
-              msg: `[player] waiting (spinner) [${platform}/${roomId}] -> asked proxy to rotate upstream`
+              msg: `[player] waiting (spinner) [${p}/${r}] -> asked proxy to rotate upstream`
             }).catch(() => {});
           }
           if (reconnectAttemptRef.current >= MAX_AUTO_RECONNECT) return;
           if (waitingTimer) return;
           waitingTimer = setTimeout(() => {
-            if (!isSessionActive(sessionId)) return;
+            if (disposedRef.current || playerRef.current !== player) return;
             if (reconnectAttemptRef.current >= MAX_AUTO_RECONNECT) return;
             reconnectAttemptRef.current++;
             console.log(`[Player] Stream stalled (waiting too long), auto-reconnecting (attempt ${reconnectAttemptRef.current}/${MAX_AUTO_RECONNECT})`);
@@ -1134,13 +1138,14 @@ export function MainPlayer({
         // 不要等 15s 的看门狗 —— 那样用户会看到十几秒的定格画面。
         let lastEndedReloadAt = 0;
         player.on?.("ended", () => {
-          if (!isSessionActive(sessionId)) return;
+          const { platform: p, roomId: r } = streamLabelRef.current;
+          if (disposedRef.current || playerRef.current !== player) return;
           // 软切换 URL 时旧流也会 ended；3s 去抖避免自己触发连环重签
           // （斗鱼的新签名会让旧连接立刻断开，反复重签反而把播放搞崩）。
           if (Date.now() - lastEndedReloadAt < 3000) return;
           lastEndedReloadAt = Date.now();
           invoke("frontend_log", {
-            msg: `player ENDED on a live stream [${platform}/${roomId}] -> reloading immediately`
+            msg: `player ENDED on a live stream [${p}/${r}] -> reloading immediately`
           }).catch(() => {});
           if (autoReconnectTimerRef.current) clearTimeout(autoReconnectTimerRef.current);
           autoReconnectTimerRef.current = setTimeout(() => {
