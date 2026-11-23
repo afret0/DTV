@@ -131,6 +131,15 @@ $BT/apksigner sign --ks ~/.android/debug.keystore \
   `StreamUrlStore.huya_fallback_line`，**不写用户偏好**（localStorage 线路偏好不动）；
   `set_stream_url_cmd`（切房/切画质/手动换线）清空它回到偏好线路。换线成功发
   Tauri 事件 `huya-line-fallback` `{room, line}`，前端只同步徽标。
+- **静默断流即重载+换线（3.1.86 起）**：虎牙上游 8s 零字节（`UPSTREAM_SILENCE_TIMEOUT`）
+  时，pump 在 silent 分支里**先** `refresh_store_url(rotate=true)` 换线重签、发
+  `huya-upstream-lost` `{room, line}`（line=生效线路，换线失败也发、留在原线），
+  **再** `commit_new_source` bump gen——顺序不能反，refresh 的 stale 守卫按当前
+  gen 校验，先 bump 会把换线结果当切房丢弃。前端收到事件立即
+  `reloadStream("refresh", { line })`（8s 冷却 + 共享 `reconnectAttemptRef` 预算，
+  `playerIsLive === false` 不触发）。背景：gen bump 只在 pump 重连后**广播出
+  新 gen 字节**时才切断客户端响应；CDN 死透时重连也拿不到字节，播放器永远等不到
+  ended，只能靠 15s waiting 计时器（2026-11-23 实测用户手点刷新才 5s 恢复）。
 - **签名年龄有两套戳，别混用**：`LAST_SIGN_MS`（全局）被 `commit_new_source` 重置，
   量不出 URL 真实年龄；`HUYA_LAST_SIGN_MS` 只在虎牙真签名时写（refresh 成功 +
   `set_stream_url_cmd` platform=huya），换线触发判定只认它。

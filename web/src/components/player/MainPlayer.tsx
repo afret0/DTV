@@ -1791,9 +1791,29 @@ export function MainPlayer({
       if (disposed) fn();
       else unlisten = fn;
     });
+    let unlistenLost: (() => void) | undefined;
+    let lastLostReloadAt = 0;
+    void listen<{ room: string; line: string | null }>("huya-upstream-lost", (event) => {
+      if (disposed) return;
+      const { room, line } = event.payload ?? { room: "", line: null };
+      if (String(room) !== roomId) return;
+      if (playerIsLiveRef.current === false) return;
+      if (Date.now() - lastLostReloadAt < 8000) return;
+      if (reconnectAttemptRef.current >= MAX_AUTO_RECONNECT) return;
+      lastLostReloadAt = Date.now();
+      reconnectAttemptRef.current++;
+      invoke("frontend_log", {
+        msg: `[player] huya upstream lost [${platform}/${roomId}] -> immediate reload (line=${line ?? "auto"})`
+      }).catch(() => {});
+      void reloadStreamRef.current?.("refresh", { line: line ?? null });
+    }).then((fn) => {
+      if (disposed) fn();
+      else unlistenLost = fn;
+    });
     return () => {
       disposed = true;
       unlisten?.();
+      unlistenLost?.();
     };
   }, [platform, roomId]);
 

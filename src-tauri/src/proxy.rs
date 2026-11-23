@@ -1643,6 +1643,41 @@ fn ensure_pump(store: StreamUrlStore) {
                             // bump gen 让客户端带新流 primer 重连 = 干净换台（~1s）。
                             // 自然 EOF（下播/地址到期）不 bump，保持原有重连语义。
                             if silent && CLIENT_COUNT.load(Ordering::Relaxed) > 0 {
+                                if store.platform.lock().unwrap().as_deref() == Some("huya") {
+                                    let room = store.room_id.lock().unwrap().clone();
+                                    crate::tl!(
+                                        "proxy",
+                                        "pump #{} hit, 虎牙上游静默断流, 自动换线并通知前端立即重载, room: {:?}, lived {:?}, session_bytes: {}",
+                                        pump_id, room, connected_at.elapsed(), session_bytes
+                                    );
+                                    // 换线重签必须在 bump gen 之前：refresh_store_url 的 stale
+                                    // 守卫按当前 gen 校验，先 bump 会把换线结果当切房丢弃。
+                                    let rotated =
+                                        refresh_store_url(&store, gen_at_connect, &p.cancelled, true).await;
+                                    if !p.cancelled.load(Ordering::SeqCst)
+                                        && store.generation.load(Ordering::SeqCst) == gen_at_connect
+                                    {
+                                        let line = store
+                                            .huya_fallback_line
+                                            .lock()
+                                            .unwrap()
+                                            .clone()
+                                            .or_else(|| store.line.lock().unwrap().clone());
+                                        if let (Some(app), Some(room_id)) =
+                                            (PROXY_APP_HANDLE.get(), room.as_deref())
+                                        {
+                                            crate::tl!(
+                                                "proxy",
+                                                "pump #{} done, 虎牙断流重载事件已发出, room: {}, 重载线路: {:?}, rotated: {}",
+                                                pump_id, room_id, line, rotated
+                                            );
+                                            let _ = app.emit(
+                                                "huya-upstream-lost",
+                                                serde_json::json!({ "room": room_id, "line": line }),
+                                            );
+                                        }
+                                    }
+                                }
                                 crate::tl!(
                                     "proxy",
                                     "pump #{} non-renewable platform upstream died silently -> clean channel change (gen bump)",
