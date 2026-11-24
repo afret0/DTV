@@ -1039,8 +1039,11 @@
   position: fixed;
   z-index: 1002;
   min-width: 140px;
+  max-width: 240px;
+  max-height: min(320px, 60vh);
+  overflow-y: auto;
   border-radius: 14px;
-  overflow: hidden;
+  overflow-x: hidden;
   background: rgba(28, 32, 34, 0.92);
   border: 1px solid rgba(255, 255, 255, 0.12);
   box-shadow:
@@ -1055,8 +1058,12 @@
 }
 
 .menuItem {
+  display: block;
   width: 100%;
   text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   padding: 10px 12px;
   font-size: var(--text-sm);
   font-weight: var(--weight-bold);

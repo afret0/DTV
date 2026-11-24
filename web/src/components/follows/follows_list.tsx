@@ -7,7 +7,7 @@ import { AnimatePresence, m, useMotionValue, useSpring } from "framer-motion";
 import { Check, ChevronDown, Folder, FolderPlus, ListCollapse, RotateCw, Users, X } from "lucide-react";
 import { createPortal } from "react-dom";
 
-import styles from "./FollowsList.module.css";
+import styles from "./follows_list.module.css";
 import { Platform as PlatformEnum } from "@/platforms/common/types";
 import { useFollow, type FollowListItem, type FollowedStreamer, type Platform as FollowPlatform } from "@/state/follow/FollowProvider";
 import { useImageProxy } from "@/hooks/useImageProxy";
@@ -135,6 +135,7 @@ export function FollowsList() {
   const [folderNameModal, setFolderNameModal] = useState<{ open: boolean; mode: "create" | "rename"; folderId: string | null }>({ open: false, mode: "create", folderId: null });
   const [folderNameInput, setFolderNameInput] = useState("");
   const [folderMenu, setFolderMenu] = useState<{ open: boolean; x: number; y: number; folderId: string | null }>({ open: false, x: 0, y: 0, folderId: null });
+  const [streamerMenu, setStreamerMenu] = useState<{ open: boolean; x: number; y: number; streamerKey: string | null; sourceFolderId: string | null }>({ open: false, x: 0, y: 0, streamerKey: null, sourceFolderId: null });
   const [folderDeleteConfirm, setFolderDeleteConfirm] = useState<{ open: boolean; folderId: string | null }>({ open: false, folderId: null });
   const portalTarget = typeof document !== "undefined" ? document.body : null;
 
@@ -465,6 +466,7 @@ export function FollowsList() {
     (payload: { type: "folder" | "streamer"; index: number; streamerKey?: string; fromFolder?: boolean; sourceFolderId?: string | null }, e: React.MouseEvent) => {
       if (e.button !== 0) return;
       if (folderMenu.open) setFolderMenu((m) => ({ ...m, open: false }));
+      if (streamerMenu.open) setStreamerMenu((m) => ({ ...m, open: false }));
       if (folderNameModal.open) return;
 
       cancelPendingDrag();
@@ -480,7 +482,7 @@ export function FollowsList() {
       document.addEventListener("mousemove", handlePrepMove as any);
       document.addEventListener("mouseup", handlePrepUp as any);
     },
-    [cancelPendingDrag, folderMenu.open, folderNameModal.open, resetDragUi, follow]
+    [cancelPendingDrag, folderMenu.open, streamerMenu.open, folderNameModal.open, resetDragUi, follow]
   );
 
   const handleStreamerClick = useCallback(
@@ -685,6 +687,11 @@ export function FollowsList() {
           tabIndex={0}
           aria-busy={isSwitching}
           onClick={() => handleStreamerClick(s.platform, s.id)}
+          onContextMenu={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            setStreamerMenu({ open: true, x: e.clientX, y: e.clientY, streamerKey: dragKey, sourceFolderId: opts.sourceFolderId ?? null });
+          }}
         >
           <span className={styles.avatarWrap} aria-hidden="true">
             <span className={styles.avatar}>
@@ -1096,6 +1103,57 @@ export function FollowsList() {
               >
                 删除
               </button>
+            </m.div>
+          </m.div>
+        ) : null}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {streamerMenu.open ? (
+          <m.div
+            className={styles.menuBackdrop}
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            onMouseDown={() => setStreamerMenu((m) => ({ ...m, open: false }))}
+          >
+            <m.div
+              className={styles.contextMenu}
+              style={{ left: streamerMenu.x, top: streamerMenu.y }}
+              initial={{ opacity: 0, scale: 0.98, y: 4 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.98, y: 4 }}
+              transition={{ duration: 0.14, ease: [0.16, 1, 0.3, 1] }}
+              onMouseDown={(e) => e.stopPropagation()}
+            >
+              {follow.folders
+                .filter((f) => f.id !== streamerMenu.sourceFolderId)
+                .map((f) => (
+                  <button
+                    key={f.id}
+                    type="button"
+                    className={styles.menuItem}
+                    title={f.name}
+                    onClick={() => {
+                      if (streamerMenu.streamerKey) follow.moveStreamerToFolder(streamerMenu.streamerKey, f.id);
+                      setStreamerMenu((m) => ({ ...m, open: false }));
+                    }}
+                  >
+                    {f.name}
+                  </button>
+                ))}
+              {streamerMenu.sourceFolderId ? (
+                <button
+                  type="button"
+                  className={styles.menuItem}
+                  onClick={() => {
+                    if (streamerMenu.streamerKey && streamerMenu.sourceFolderId) follow.removeStreamerFromFolderByKey(streamerMenu.streamerKey, streamerMenu.sourceFolderId);
+                    setStreamerMenu((m) => ({ ...m, open: false }));
+                  }}
+                >
+                  移回主列表
+                </button>
+              ) : null}
             </m.div>
           </m.div>
         ) : null}
