@@ -186,6 +186,12 @@ $BT/apksigner sign --ks ~/.android/debug.keystore \
   文件夹拖拽只能在文件夹区间内排序，主播不能拖到文件夹上方。
 - 主播松手语义：落在别的文件夹上 → `moveStreamerToFolder`（自动从源文件夹移除）；
   落在所有文件夹外且距起点 ≥8px → `removeStreamerFromFolderByKey` 回顶层。
+- **3.1.88 起右键菜单也能移动**（用户嫌拖动不直观）：全部主播行 `onContextMenu` →
+  `streamerMenu`（样式/交互照抄 folderMenu），菜单项 = 其它文件夹名 + 「移回主列表」
+  （仅文件夹内主播显示；文案沿用删除文件夹提示的「主列表」）。
+- 既有层级坑（folderMenu 同样，未修）：菜单 backdrop 在 sidebar 的 stacking context
+  内（z1001/1002 只在该上下文内有效），播放器 overlay（portal，z500）会盖住右半屏，
+  开着播放器时点右侧点不到遮罩；sidebar 区域内点击正常关闭。
 - 已知既有坑（未修，动这块时留意）：`resetDragUi` / `cancelPendingDrag` 是
   `useCallback([])`，捕获的是首次渲染的 handler 引用，`removeEventListener`
   基本移不掉后来加的监听器（泄漏累积；多次拖拽实测功能仍正确，因 handler 都读 ref）。
