@@ -1,6 +1,7 @@
 pub mod danmu;
 pub mod douyin_danmu_listener;
 pub mod douyin_streamer_detail;
+pub mod flv_probe;
 pub mod douyin_streamer_info;
 pub mod douyin_streamer_list;
 pub mod models;

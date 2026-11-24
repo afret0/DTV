@@ -560,49 +560,101 @@ fn extract_origin_flv_candidates_from_html(html: &str) -> Vec<String> {
     out
 }
 
-async fn pick_live_origin_flv(http_client: &HttpClient, candidates: Vec<String>) -> Option<String> {
-    const ORIGIN_PROBE_LIMIT: usize = 3;
-    const ORIGIN_PROBE_BYTES: usize = 48 * 1024;
+struct OriginProbe {
+    url: String,
+    magic_ok: bool,
+    dims: Option<(u32, u32)>,
+}
+
+async fn probe_origin_candidate(http_client: &HttpClient, url: String) -> OriginProbe {
+    const ORIGIN_PROBE_BYTES: usize = 96 * 1024;
     const ORIGIN_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-    for url in candidates.iter().take(ORIGIN_PROBE_LIMIT) {
-        let tpl = douyin_template_of(url);
-        let probe = async {
-            let mut resp = http_client.get_with_cookies(url).await?;
-            let mut buf: Vec<u8> = Vec::new();
-            while buf.len() < ORIGIN_PROBE_BYTES {
-                match resp.chunk().await {
-                    Ok(Some(chunk)) => buf.extend_from_slice(&chunk),
-                    Ok(None) => break,
-                    Err(err) => return Err::<(), String>(err.to_string()),
-                }
+    let probe = async {
+        let mut resp = http_client.get_with_cookies(&url).await?;
+        let mut buf: Vec<u8> = Vec::new();
+        while buf.len() < ORIGIN_PROBE_BYTES {
+            match resp.chunk().await {
+                Ok(Some(chunk)) => buf.extend_from_slice(&chunk),
+                Ok(None) => break,
+                Err(err) => return Err::<Vec<u8>, String>(err.to_string()),
             }
-            if buf.len() >= 3 && &buf[0..3] == b"FLV" {
-                Ok(())
-            } else {
-                Err(format!("not an FLV body, got {} bytes", buf.len()))
-            }
-        };
-        match tokio::time::timeout(ORIGIN_PROBE_TIMEOUT, probe).await {
-            Ok(Ok(())) => {
-                println!(
-                    "[Douyin Stream Detail] origin template '{}' verified, using it",
-                    tpl
-                );
-                return Some(url.clone());
-            }
-            Ok(Err(err)) => println!(
-                "[Douyin Stream Detail] origin template '{}' rejected: {}",
-                tpl, err
-            ),
-            Err(_) => println!(
-                "[Douyin Stream Detail] origin template '{}' probe timed out",
-                tpl
-            ),
         }
+        Ok(buf)
+    };
+    match tokio::time::timeout(ORIGIN_PROBE_TIMEOUT, probe).await {
+        Ok(Ok(buf)) => {
+            let magic_ok = buf.len() >= 3 && &buf[0..3] == b"FLV";
+            let dims = crate::platforms::douyin::flv_probe::flv_h264_dimensions(&buf);
+            OriginProbe { url, magic_ok, dims }
+        }
+        Ok(Err(err)) => {
+            println!(
+                "[Douyin Stream Detail] origin probe rejected, template: {}, err: {}",
+                douyin_template_of(&url),
+                err
+            );
+            OriginProbe { url, magic_ok: false, dims: None }
+        }
+        Err(_) => {
+            println!(
+                "[Douyin Stream Detail] origin probe timed out, template: {}",
+                douyin_template_of(&url)
+            );
+            OriginProbe { url, magic_ok: false, dims: None }
+        }
+    }
+}
+
+/// 页面元数据与模板名都不可信（现场：plain origin 是竖屏合成且饿死、
+/// _Thirdgame 在别的房间也是合成源），所以并行验活前几个候选，解析 FLV 里
+/// H264 SPS 的真实宽高，横屏优先；横屏只给低清模板时沿用旧先例回退合成高清。
+async fn pick_live_origin_flv(http_client: &HttpClient, candidates: Vec<String>) -> Option<String> {
+    const ORIGIN_PROBE_COUNT: usize = 4;
+    if candidates.is_empty() {
+        return None;
+    }
+    let probes: Vec<OriginProbe> = futures_util::future::join_all(
+        candidates
+            .iter()
+            .take(ORIGIN_PROBE_COUNT)
+            .cloned()
+            .map(|url| probe_origin_candidate(http_client, url)),
+    )
+    .await;
+    for probe in &probes {
+        println!(
+            "[Douyin Stream Detail] origin probe, template: {}, magic: {}, dims: {:?}",
+            douyin_template_of(&probe.url),
+            probe.magic_ok,
+            probe.dims
+        );
+    }
+    let tier = |url: &str| -> u8 {
+        let landscape = match probes.iter().find(|p| p.url == *url).and_then(|p| p.dims) {
+            Some((w, h)) => w > h,
+            None => return 3,
+        };
+        let high_def = douyin_template_rank(&douyin_template_of(url)) >= DOUYIN_HIGH_DEF_RANK;
+        match (landscape, high_def) {
+            (true, true) => 0,
+            (false, true) => 1,
+            (true, false) => 2,
+            (false, false) => 3,
+        }
+    };
+    let mut ranked: Vec<&OriginProbe> = probes.iter().filter(|p| p.magic_ok).collect();
+    ranked.sort_by_key(|p| tier(&p.url));
+    if let Some(best) = ranked.first() {
+        println!(
+            "[Douyin Stream Detail] origin picked by measured orientation, template: {}, tier: {}",
+            douyin_template_of(&best.url),
+            tier(&best.url)
+        );
+        return Some(best.url.clone());
     }
     println!(
         "[Douyin Stream Detail] no origin template verified, falling back to first candidate (template '{}')",
-        douyin_template_of(candidates.first()?)
+        douyin_template_of(&candidates[0])
     );
     candidates.first().cloned()
 }
@@ -845,6 +897,108 @@ mod douyin_page_extract_tests {
             "must skip the 302 template, got {}",
             picked
         );
+    }
+
+    /// 页面把竖屏合成源排在第一（且只发 FLV 头就饿死）、横屏 or4 排第二时，
+    /// 必须按实测朝向选横屏，而不是按候选顺序拿饿死的竖屏。
+    #[tokio::test]
+    async fn parallel_probes_prefer_measured_landscape() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let landscape_body = {
+                let sps_hex = "2764002aac131aa0780227e59b808080a0000003002000000f01e2c4d4";
+                let sps: Vec<u8> = (0..sps_hex.len())
+                    .step_by(2)
+                    .map(|i| u8::from_str_radix(&sps_hex[i..i + 2], 16).unwrap())
+                    .collect();
+                let mut rec = vec![0x17, 0, 0, 0, 0, 1, sps[1], sps[2], sps[3], 0xfd, 0xe1];
+                rec.extend_from_slice(&(sps.len() as u16).to_be_bytes());
+                rec.extend_from_slice(&sps);
+                rec.push(0);
+                let mut flv = vec![b'F', b'L', b'V', 1, 5, 0, 0, 0, 9, 0, 0, 0, 0];
+                flv.push(9);
+                flv.extend_from_slice(&[(rec.len() >> 16) as u8, (rec.len() >> 8) as u8, rec.len() as u8]);
+                flv.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0]);
+                flv.extend_from_slice(&rec);
+                flv.extend_from_slice(&((11 + rec.len()) as u32).to_be_bytes());
+                flv.resize(64 * 1024, 0);
+                flv
+            };
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let body = landscape_body.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: video/x-flv\r\nContent-Length: {}\r\n\r\n",
+                        if req.contains("/portrait/") { 9 } else { body.len() }
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    if req.contains("/portrait/") {
+                        let _ = sock.write_all(b"FLV\x01\x05\x00\x00\x00\x09").await;
+                        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    } else {
+                        let _ = sock.write_all(&body).await;
+                    }
+                });
+            }
+        });
+        let client = HttpClient::new_direct_connection().expect("client");
+        let candidates = vec![
+            format!("http://127.0.0.1:{}/portrait/stream-9_uhd.flv", port),
+            format!("http://127.0.0.1:{}/game/stream-9_or4.flv", port),
+        ];
+        let picked = pick_live_origin_flv(&client, candidates)
+            .await
+            .expect("must pick the landscape source");
+        assert!(
+            picked.contains("/game/"),
+            "measured landscape must win over starved portrait, got {}",
+            picked
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "needs live network"]
+    async fn live_douyin_origin_orientation_pick() {
+        let client = HttpClient::new_direct_connection().expect("client");
+        for room in ["864599529401", "108335413560"] {
+            let url = format!("https://live.douyin.com/{}", room);
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                reqwest::header::USER_AGENT,
+                reqwest::header::HeaderValue::from_static(
+                    crate::platforms::douyin::web_api::DEFAULT_USER_AGENT,
+                ),
+            );
+            headers.insert(
+                reqwest::header::REFERER,
+                reqwest::header::HeaderValue::from_str(&url).expect("referer"),
+            );
+            let html = match client.get_text_with_headers(&url, Some(headers)).await {
+                Ok(h) => h,
+                Err(err) => {
+                    println!("[orientation pick] room {} page fetch failed: {}", room, err);
+                    continue;
+                }
+            };
+            let candidates = extract_origin_flv_candidates_from_html(&html);
+            let picked = pick_live_origin_flv(&client, candidates).await;
+            println!(
+                "[orientation pick] room {} picked: {:?}",
+                room,
+                picked.as_deref().map(douyin_template_of)
+            );
+        }
     }
 
     #[test]

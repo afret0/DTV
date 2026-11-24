@@ -23,6 +23,7 @@ Tauri 2 桌面 + Android 直播聚合播放器，支持 斗鱼 / 虎牙 / 抖音
 | `web/src/platforms/` | 各平台取流与画质 |
 | `src-tauri/src/proxy.rs`、`flv_relay.rs` | 本地代理与 FLV 中继 |
 | `src-tauri/src/cloud_sync.rs` | OSS / WebDAV 读写 |
+| `src-tauri/src/platforms/douyin/flv_probe.rs` | FLV walk + H264 SPS 真宽高解析（选流实测朝向） |
 
 ## 验证命令（别用错）
 
@@ -223,6 +224,24 @@ $BT/apksigner sign --ks ~/.android/debug.keystore \
   封面/头像指向 dev server 的临时 svg（验证完删掉）。init script 里
   `document.documentElement` 早期可能为 null，要判空。mock 下关注列表刷新会把
   LIVE 降级 UNKNOWN，测直播点样式需手动换 className。
+
+## 抖音选流：只信实测朝向（3.1.90 起，改这块前先读）
+
+- **页面元数据、模板名、FLV magic 三个信号都不可信**（2026-11-24 真机取证）：
+  864599529401 的 plain origin 页面声称 1920x1080、实际是竖屏合成且 CDN 饿死
+  （裸 GET 0 字节但 magic 能过）；108335413560 的 `_Thirdgame…uhd` 在别的时段也是合成源。
+  bytevc1（h265/enhanced FLV）源没有 H264 SPS，dims 解析为 None。
+- **选流 = 并行验活前 4 候选 + SPS 真宽高**（`flv_probe.rs` + `pick_live_origin_flv`）：
+  96KB / 3s 每候选，`futures_util::join_all` 并行；tier = 实测横屏+高清(0) > 实测竖屏+高清(1)
+  > 实测横屏+低清(2) > 其余/None(3)。横屏只给低清模板时回退合成高清（511309230149 先例）。
+  全部验不活才回退第一候选。**别改回「顺序探活只查 FLV magic」**——饿死竖屏源会赢。
+- SPS 解析按 H264 规范位序（high profile 扩展 / scaling list 跳过 / crop / 场编码），
+  单测用真实 or4 SPS（1920x1080）与本地编码竖屏 SPS（1080x1920）钉死；
+  注意 coded 尺寸含 padding，crop 必须减（or4 coded 1912x1068 → 显示 1920x1080 是容器口径，
+  朝向判定不受影响）。
+- 取证配方：CDN 对裸 curl 饿流，用 `ffmpeg -v error -i URL -t 0.2 -c copy -f flv -`
+  管道截 96KB 拿 AVC seq header；`println!` 诊断不在 DTV-live.log（stdout 不采集），
+  真机选流结论用 `cargo test --lib live_douyin_origin_orientation_pick -- --ignored --nocapture`。
 
 ## 云同步语义（改这块前先读）
 
