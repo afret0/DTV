@@ -4,7 +4,7 @@ import React, { useCallback, useEffect, useState } from "react";
 import { CloudDownload, CloudUpload, PlugZap } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 
-import styles from "./Navbar.module.css";
+import styles from "./navbar.module.css";
 import {
   cloudSyncPull,
   cloudSyncPush,

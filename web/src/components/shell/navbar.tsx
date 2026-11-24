@@ -7,8 +7,8 @@ import { ChevronDown, Cloud, ExternalLink, LayoutGrid, MonitorSmartphone, Moon, 
 import { usePathname } from "next/navigation";
 import { invoke } from "@tauri-apps/api/core";
 
-import styles from "./Navbar.module.css";
-import { LanSyncModal } from "./LanSyncModal";
+import styles from "./navbar.module.css";
+import { LanSyncModal } from "./lan_sync_modal";
 import { autoCloudSyncTick, startCloudSyncChangeWatcher } from "@/services/cloudSync";
 import { searchAnchors, type SearchAnchorResult, type SearchPlatform } from "@/services/search";
 import { usePlayerUi } from "@/state/playerUi/PlayerUiProvider";

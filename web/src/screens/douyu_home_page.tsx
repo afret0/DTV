@@ -6,7 +6,7 @@ import { m } from "framer-motion";
 
 import { CommonCategory } from "@/components/categories/CommonCategory";
 import { PlatformCookieControls } from "@/components/common/PlatformCookieControls";
-import { CommonStreamerList } from "@/components/streamers/CommonStreamerList";
+import { CommonStreamerList } from "@/components/streamers/common_streamer_list";
 import type { Category1 } from "@/platforms/common/categoryTypes";
 import type { CategorySelectedEvent } from "@/platforms/common/categoryTypes";
 import type { CommonPlatformCategory } from "@/platforms/common/types";

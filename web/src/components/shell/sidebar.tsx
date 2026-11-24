@@ -1,7 +1,7 @@
 "use client";
 
 import React from "react";
-import styles from "./Sidebar.module.css";
+import styles from "./sidebar.module.css";
 import { FollowsList } from "@/components/follows/follows_list";
 
 export function Sidebar({

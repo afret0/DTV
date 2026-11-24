@@ -12,6 +12,8 @@
   min-height: 0;
   position: relative;
   background-color: var(--bg-primary);
+  background-image: var(--page-mesh);
+  background-attachment: local;
   transition: none;
 }
 

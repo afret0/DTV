@@ -4,7 +4,7 @@ import React, { useEffect, useMemo, useState } from "react";
 import { m } from "framer-motion";
 
 import styles from "./CustomHomePage.module.css";
-import { CommonStreamerList } from "@/components/streamers/CommonStreamerList";
+import { CommonStreamerList } from "@/components/streamers/common_streamer_list";
 import { useCustomCategories, type CustomCategoryEntry } from "@/state/customCategories/CustomCategoriesProvider";
 import { douyinCategoriesData } from "@/platforms/douyin/douyinCategoriesData";
 import { huyaCategoriesData } from "@/platforms/huya/huyaCategoriesData";

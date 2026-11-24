@@ -1,6 +1,6 @@
 "use client";
 
-import { DouyinHomePage } from "@/screens/DouyinHomePage";
+import { DouyinHomePage } from "@/screens/douyin_home_page";
 
 export default function Page() {
   return <DouyinHomePage />;

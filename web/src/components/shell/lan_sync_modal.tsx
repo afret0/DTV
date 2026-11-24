@@ -6,9 +6,9 @@ import { Cloud, Download, Upload, X } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { QRCodeCanvas } from "qrcode.react";
 
-import styles from "./Navbar.module.css";
+import styles from "./navbar.module.css";
 import { applyIncrementalLanSyncImport, createLanSyncPayload, parseLanSyncManifest, parseLanSyncPayload } from "@/services/lanSync";
-import { CloudSyncPanel } from "./CloudSyncModal";
+import { CloudSyncPanel } from "./cloud_sync_modal";
 
 type ServerInfo = { port: number; hosts: string[]; token: string };
 type DiscoveredPeer = { name: string; host: string; port: number; token?: string | null; baseUrl: string };

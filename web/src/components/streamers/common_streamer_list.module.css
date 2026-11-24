@@ -75,7 +75,7 @@
 }
 
 .cardOuter:focus-visible {
-  box-shadow: 0 0 0 2px rgba(52, 211, 153, 0.55);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent-emphasis) 55%, transparent);
 }
 
 .card {
@@ -95,6 +95,25 @@
   border-radius: var(--card-radius);
   overflow: hidden;
   background: var(--bg-tertiary);
+}
+
+:global(:root[data-theme="dark"]) .preview {
+  transition: box-shadow 0.26s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+:global(:root[data-theme="dark"][data-scrolling="1"]) .preview {
+  transition: none;
+}
+
+:global(:root[data-theme="dark"]) .cardOuter:hover .preview {
+  box-shadow:
+    inset 0 0 0 1px rgba(224, 102, 106, 0.45),
+    0 12px 28px -10px rgba(0, 0, 0, 0.7),
+    0 18px 40px -14px rgba(193, 76, 80, 0.26);
+}
+
+:global(:root[data-theme="dark"]) .cardOuter:hover .avatarImg {
+  border-color: rgba(224, 102, 106, 0.55);
 }
 
 .imageWrapper {
@@ -156,6 +175,13 @@
   will-change: transform, opacity;
 }
 
+:global(:root[data-theme="dark"]) .playButton {
+  box-shadow:
+    0 10px 30px rgba(0, 0, 0, 0.45),
+    0 0 0 1px rgba(255, 255, 255, 0.08) inset,
+    0 0 32px rgba(193, 76, 80, 0.35);
+}
+
 .playButton::before {
   content: "";
   position: absolute;
@@ -189,8 +215,9 @@
   width: 10px;
   height: 10px;
   border-radius: 999px;
-  background: var(--success);
-  box-shadow: 0 0 10px color-mix(in srgb, var(--success) 70%, transparent);
+  background: var(--live-dot-color, var(--success));
+  box-shadow: var(--live-dot-glow, 0 0 10px color-mix(in srgb, var(--success) 70%, transparent));
+  animation: var(--live-dot-animation, none);
 }
 
 .viewerPill {

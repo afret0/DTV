@@ -196,6 +196,34 @@ $BT/apksigner sign --ks ~/.android/debug.keystore \
   `useCallback([])`，捕获的是首次渲染的 handler 引用，`removeEventListener`
   基本移不掉后来加的监听器（泄漏累积；多次拖拽实测功能仍正确，因 handler 都读 ref）。
 
+## 双主题 UI token（3.1.89 起，改样式前先读）
+
+暗色 = 深黑影院 + 玻璃拟态，强调色**落栗 `#c14c50`**（用户指定，别叫玫红）；
+浅色保持原绿 `#22c55e`，**用户要求浅色一个像素都不变**。
+
+- **CSS 约定：默认值就是暗色样式**，浅色靠 `:global(:root[data-theme="light"])`
+  （CSS modules）或 `:root[data-theme="light"]`（普通 css）覆盖回原值。改样式只有三种安全姿势：
+  ① 该属性已有 light 覆盖 → 默认段随便改；② 共享属性 → 加 dark-only 选择器
+  `:global(:root[data-theme="dark"])`；③ token 化且 light 侧回退值 = 原硬编码值。
+  直接改共享硬编码行 = 浅色回归。
+- token 心脏在 `web/src/app/legacy_global.css`：`--accent`（暗 #c14c50 / 浅 #22c55e）、
+  `--accent-emphasis`（暗 #e0666a / 浅 #34d399=原 switchChip 绿）、`--live-dot-color/-glow/-animation`、
+  `--accent-glass-bg/-border(-hover)`（follow 按钮）、`--status-glass-bg/-border`+`--status-on-glass`
+  （topbar 已关注态）。**浅色段有意不定义 `--live-dot-*`**：让 follows 点回退 #10b981、
+  观看卡片点回退 var(--success)，两处原值不同，定义了必炸一处。
+- 成功语义绿（`--success`、CastDialog、LAN 导出成功提示、cookie-configured）**不是强调色**，别顺手改。
+  播放器进度条 `--player-accent` 是白灰 #e5e7eb，也不是强调色。
+- 暗色专属效果：卡片 hover 落栗描边+氛围光、直播点 `dtv-live-pulse` 2.4s 脉冲
+  （reduced-motion 关闭）、文件夹 blur(18px) 玻璃、`--page-mesh` 页面氛围渐变。
+  滚动容器 `data-scrolling=1` 时禁 hover 阴影过渡（性能）。
+- **浏览器验证配方**（无 Tauri 后端时）：dev server + Playwright `addInitScript` 塞
+  `window.__TAURI_INTERNALS__ = { invoke, transformCallback: () => 1, metadata: {...} }`；
+  invoke mock：`start_static_proxy_server` → `location.origin`（proxify 对 localhost 直通）、
+  `fetch_categories`/`fetch_live_list*` → 假数据、`plugin:event|listen` → 1、其余 null。
+  封面/头像指向 dev server 的临时 svg（验证完删掉）。init script 里
+  `document.documentElement` 早期可能为 null，要判空。mock 下关注列表刷新会把
+  LIVE 降级 UNKNOWN，测直播点样式需手动换 className。
+
 ## 云同步语义（改这块前先读）
 
 - **条目级增量合并**：local / remote / prevItems 按 id 求并集，胜者按 ledger 时间戳。

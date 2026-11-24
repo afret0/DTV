@@ -4,7 +4,7 @@ import React, { useMemo, useState } from "react";
 import { m } from "framer-motion";
 
 import { CommonCategory } from "@/components/categories/CommonCategory";
-import { CommonStreamerList } from "@/components/streamers/CommonStreamerList";
+import { CommonStreamerList } from "@/components/streamers/common_streamer_list";
 import { douyinCategoriesData } from "@/platforms/douyin/douyinCategoriesData";
 import type { CategorySelectedEvent } from "@/platforms/common/categoryTypes";
 import { useCustomCategories } from "@/state/customCategories/CustomCategoriesProvider";

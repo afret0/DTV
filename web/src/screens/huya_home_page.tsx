@@ -5,7 +5,7 @@ import { m } from "framer-motion";
 
 import { CommonCategory } from "@/components/categories/CommonCategory";
 import { PlatformCookieControls } from "@/components/common/PlatformCookieControls";
-import { CommonStreamerList } from "@/components/streamers/CommonStreamerList";
+import { CommonStreamerList } from "@/components/streamers/common_streamer_list";
 import { huyaCategoriesData } from "@/platforms/huya/huyaCategoriesData";
 import type { CategorySelectedEvent } from "@/platforms/common/categoryTypes";
 import { useCustomCategories } from "@/state/customCategories/CustomCategoriesProvider";

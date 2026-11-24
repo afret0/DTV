@@ -5,7 +5,7 @@ import { Card, Skeleton, Spinner } from "@heroui/react";
 import { AnimatePresence, m, type Variants } from "framer-motion";
 import { Play, Users } from "lucide-react";
 
-import styles from "./CommonStreamerList.module.css";
+import styles from "./common_streamer_list.module.css";
 import { SmoothImage } from "@/components/common/SmoothImage";
 import type { CategorySelectedEvent } from "@/platforms/common/categoryTypes";
 import type { CommonStreamer } from "@/platforms/common/streamerTypes";

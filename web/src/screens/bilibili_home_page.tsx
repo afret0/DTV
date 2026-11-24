@@ -5,7 +5,7 @@ import { m } from "framer-motion";
 
 import { CommonCategory } from "@/components/categories/CommonCategory";
 import { BilibiliCookieControls } from "@/components/bilibili/BilibiliCookieControls";
-import { CommonStreamerList } from "@/components/streamers/CommonStreamerList";
+import { CommonStreamerList } from "@/components/streamers/common_streamer_list";
 import { biliCategoriesData } from "@/platforms/bilibili/biliCategoriesData";
 import type { CategorySelectedEvent } from "@/platforms/common/categoryTypes";
 import { useCustomCategories } from "@/state/customCategories/CustomCategoriesProvider";
