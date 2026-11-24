@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 
 import "./globals.css";
 import { Providers } from "@/components/providers/Providers";
-import { AppShell } from "@/components/shell/AppShell";
+import { AppShell } from "@/components/shell/app_shell";
 import { MotionProvider } from "@/components/motion/MotionProvider";
 import { TauriIndexHtmlFix } from "@/components/app/TauriIndexHtmlFix";
 

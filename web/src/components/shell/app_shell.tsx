@@ -6,7 +6,7 @@ import { AnimatePresence, m } from "framer-motion";
 import { Spinner } from "@heroui/react";
 
 import styles from "./AppShell.module.css";
-import { Sidebar } from "@/components/shell/Sidebar";
+import { Sidebar } from "@/components/shell/sidebar";
 import { Navbar } from "@/components/shell/Navbar";
 import { useTheme } from "@/state/theme/ThemeProvider";
 import { usePlayerUi } from "@/state/playerUi/PlayerUiProvider";

@@ -669,11 +669,13 @@ export function FollowsList() {
         onMouseLeave={inFolder ? () => opts.onLeave?.() : undefined}
         onMouseDown={
           dragEnabled
-            ? (e) =>
+            ? (e) => {
+                e.stopPropagation();
                 prepareDrag(
                   { type: "streamer", index: opts.index, streamerKey: dragKey, fromFolder: !!opts.fromFolder, sourceFolderId: opts.sourceFolderId ?? null },
                   e
-                )
+                );
+              }
             : undefined
         }
       >
