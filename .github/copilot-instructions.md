@@ -243,6 +243,19 @@ $BT/apksigner sign --ks ~/.android/debug.keystore \
   管道截 96KB 拿 AVC seq header；`println!` 诊断不在 DTV-live.log（stdout 不采集），
   真机选流结论用 `cargo test --lib live_douyin_origin_orientation_pick -- --ignored --nocapture`。
 
+## 应用图标重生成（3.1.91 起）
+
+- 源图 `images/icon.png`（1024 RGBA，透明圆角，画幅内留白 ~7%，像素风小电视）。
+- 桌面：`./node_modules/.bin/tauri icon images/icon.png` 会**多生成**仓库不收录的
+  Square*/StoreLogo/64x64/icon.png/ios/，生成后删掉，只保留原六件套
+  （32/128/128@2x/512/icns/ico）；**512x512 它不生成**，用 Pillow 从源图 LANCZOS 补。
+- Android：`src-tauri/gen/android/` 整体 gitignore，mipmap 不入库；本机出包前从源图
+  直接 LANCZOS 缩放替换 `ic_launcher`/`ic_launcher_round`/`ic_launcher_foreground`
+  （48/72/96/144/192，foreground 108..432；round 沿用现状不做圆形裁切）。
+- 核验：dmg 挂载后比 `DTV.app/Contents/Resources/*.icns` md5；apk 内资源名被 AAPT2
+  混淆且 PNG 重压（md5 必不同），抽 192px png 目检像素。
+- Pillow 用 `~/.copilot/tools/imgenv/bin/python`（系统 python3 是 PEP668 受管环境）。
+
 ## 云同步语义（改这块前先读）
 
 - **条目级增量合并**：local / remote / prevItems 按 id 求并集，胜者按 ledger 时间戳。
