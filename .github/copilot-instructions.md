@@ -7,7 +7,7 @@
 
 Tauri 2 桌面 + Android 直播聚合播放器，支持 斗鱼 / 虎牙 / 抖音 / B站。
 
-- 前端 `web/`：React + TS + Vite + xgplayer
+- 前端 `web/`：React + TS + Next.js（`output: "export"` 静态导出，dev 端口 2896）+ xgplayer；根目录 `vite.config.ts` 是历史遗留，别被它误导
 - 后端 `src-tauri/src/`：Rust
 - npm scripts 都转发到 `web/`（`dev` / `build` / `preview` / `tauri`）
 
@@ -32,6 +32,9 @@ Tauri 2 桌面 + Android 直播聚合播放器，支持 斗鱼 / 虎牙 / 抖音
 - 前端构建：`npm -C web run build`
 - Rust：`cargo test --lib <filter>`，并发 flaky 时加 `-- --test-threads=1`
 - 仓库**没有 ESLint 配置 / lint script**，web 侧没有可用的格式化检查，不要凭空造一个。
+- web 侧无测试框架；UI 交互回归用浏览器实测：`npm -C web run dev`（2896）+ 往 localStorage
+  种 `followedStreamers` / `followFolders` / `followListOrder` 三个键后刷新 + Playwright
+  mouse.down/move/up 模拟。Tauri `invoke` 在纯浏览器里必报错，但列表渲染与拖拽不依赖它。
 
 ## 构建工具链（最容易翻车）
 
@@ -168,6 +171,24 @@ $BT/apksigner sign --ks ~/.android/debug.keystore \
 - xgplayer replay 覆盖层只在 `ENDED` 显示；解码错误不触发 ended，看门狗的重播层
   轮询救不了它，只能靠 decode 自愈或冻结判定——所以 decode 监听失效的代价是整段
   15s+ 黑屏。
+
+## 关注列表拖拽（3.1.87 起，改这块前先读）
+
+文件在 `web/src/components/follows/follows_list.tsx`（3.1.87 从 FollowsList.tsx 改名，
+同批 sidebar.tsx / app_shell.tsx）。拖拽是纯 mouse 事件状态机，不是 HTML5 DnD：
+`prepareDrag`（mousedown）→ 按住 150ms 或移动 ≥8px → `beginDrag` → mouseup 结算。
+
+- **主播行的 mousedown 必须 `e.stopPropagation()`**：文件夹整体容器上也绑了
+  `onMouseDown=prepareDrag(folder)`，不停冒泡时行的 pending 流拖拽会被
+  `cancelPendingDrag()` 取消并覆盖成「拖整个文件夹」——表现就是文件夹内主播
+  「拖了没反应」。此坑从 2026-04 web UI 迁移起就有，3.1.87 才修。
+- `listOrder` 恒为**文件夹在前、顶层主播在后**（`normalizeListOrder` 强制）；
+  文件夹拖拽只能在文件夹区间内排序，主播不能拖到文件夹上方。
+- 主播松手语义：落在别的文件夹上 → `moveStreamerToFolder`（自动从源文件夹移除）；
+  落在所有文件夹外且距起点 ≥8px → `removeStreamerFromFolderByKey` 回顶层。
+- 已知既有坑（未修，动这块时留意）：`resetDragUi` / `cancelPendingDrag` 是
+  `useCallback([])`，捕获的是首次渲染的 handler 引用，`removeEventListener`
+  基本移不掉后来加的监听器（泄漏累积；多次拖拽实测功能仍正确，因 handler 都读 ref）。
 
 ## 云同步语义（改这块前先读）
 
